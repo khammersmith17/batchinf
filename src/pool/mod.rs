@@ -7,14 +7,38 @@ pub(crate) enum FunnelMessage<Input, Output, Error> {
     Exit,
 }
 
-struct WorkerRef<Input, Output, Error> {
+pub(crate) struct WorkerRef<Input, Output, Error>
+where
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+    Error: Send + Sync + 'static,
+{
     state: WorkerState,
     worker_queue: Sender<(Input, OneshotSender<Result<Output, Error>>)>,
 }
 
-impl<Input, Output, Error> WorkerRef<Input, Output, Error> {
+impl<Input, Output, Error> WorkerRef<Input, Output, Error>
+where
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+    Error: Send + Sync + 'static,
+{
+    pub(crate) fn new(
+        state: WorkerState,
+        worker_queue: Sender<(Input, OneshotSender<Result<Output, Error>>)>,
+    ) -> Self {
+        Self {
+            state,
+            worker_queue,
+        }
+    }
+
     fn get_state(&self) -> WorkerStatus {
         self.state.get_state()
+    }
+
+    fn set_state_exit(&self) {
+        self.state.set_state(WorkerStatus::Exit)
     }
 
     async fn push(&self, msg: (Input, OneshotSender<Result<Output, Error>>)) {
@@ -22,13 +46,38 @@ impl<Input, Output, Error> WorkerRef<Input, Output, Error> {
     }
 }
 
-pub(crate) struct WorkerPool<Input, Output, Error> {
+pub(crate) struct WorkerPool<Input, Output, Error>
+where
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+    Error: Send + Sync + 'static,
+{
     worker_pool: Vec<WorkerRef<Input, Output, Error>>,
     in_queue: Receiver<FunnelMessage<Input, Output, Error>>,
     sink: usize,
 }
 
-impl<Input, Output, Error> WorkerPool<Input, Output, Error> {
+impl<Input, Output, Error> WorkerPool<Input, Output, Error>
+where
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+    Error: Send + Sync + 'static,
+{
+    pub(crate) fn new(
+        worker_pool: Vec<WorkerRef<Input, Output, Error>>,
+        in_queue: Receiver<FunnelMessage<Input, Output, Error>>,
+    ) -> Self {
+        Self {
+            worker_pool,
+            in_queue,
+            sink: 0_usize,
+        }
+    }
+
+    pub(crate) fn start(self) {
+        tokio::spawn(async { run_worker_pool(self) });
+    }
+
     pub(crate) async fn run_pooler(&mut self) {
         // Fetch from the queue and resolve which sink to send to.
         while let Some(msg) = self.in_queue.recv().await {
@@ -42,7 +91,7 @@ impl<Input, Output, Error> WorkerPool<Input, Output, Error> {
                 FunnelMessage::Exit => {
                     // On exit, set all worker states to exit.
                     for worker in &self.worker_pool {
-                        worker.state.set_state(WorkerStatus::Exit)
+                        worker.set_state_exit();
                     }
                 }
             }
@@ -76,4 +125,13 @@ impl<Input, Output, Error> WorkerPool<Input, Output, Error> {
     fn size(&self) -> usize {
         self.worker_pool.len()
     }
+}
+
+async fn run_worker_pool<Input, Output, Error>(mut pool: WorkerPool<Input, Output, Error>)
+where
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+    Error: Send + Sync + 'static,
+{
+    pool.run_pooler().await;
 }

@@ -1,7 +1,7 @@
 pub trait Predictor: Clone {
     type Input: Send + Sync + 'static;
     type Output: Send + Sync + 'static;
-    type Error: std::error::Error + Sync + Send + 'static;
+    type Error: std::error::Error + Clone + Sync + Send + 'static;
 
     /// This is where the magic happens.
     ///
@@ -18,5 +18,5 @@ pub trait Predictor: Clone {
     /// This trait requires clone, for the case when multiple workers are configured in the pool.
     /// The type will be cloned n - 1 times to provide each pool with isolated resources to perform
     /// inference.
-    fn predict_batch(&self, inp: &[Self::Input]) -> Vec<Result<Self::Output, Self::Error>>;
+    fn predict_batch(&self, inp: &[Self::Input]) -> Result<Vec<Self::Output>, Self::Error>;
 }

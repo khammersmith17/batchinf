@@ -1,18 +1,16 @@
-use crate::config::BatcherConfig;
+use crate::config::InnerConfig;
 use crate::predictor::Predictor;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use tokio::select;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::oneshot::{Receiver as OneshotReceiver, Sender as OneshotSender};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot::Sender as OneshotSender;
 use tokio::time::{Duration, Instant, sleep};
 
 pub(crate) type OutputSender<P> =
     OneshotSender<Result<<P as Predictor>::Output, <P as Predictor>::Error>>;
-pub(crate) type OutputReciever<P> =
-    OneshotReceiver<Result<<P as Predictor>::Output, <P as Predictor>::Error>>;
 pub(crate) type InputReceiver<P> = Receiver<(<P as Predictor>::Input, OutputSender<P>)>;
-pub(crate) type InputSender<P> = Sender<(<P as Predictor>::Input, OutputSender<P>)>;
-pub(crate) type InferenceResult<P> = Result<<P as Predictor>::Output, <P as Predictor>::Error>;
+pub(crate) type InferenceResult<P> = Result<Vec<<P as Predictor>::Output>, <P as Predictor>::Error>;
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum WorkerStatus {
@@ -45,6 +43,7 @@ impl From<u8> for WorkerStatus {
     }
 }
 
+// Mappings out u8 key and enum variant.
 pub(crate) mod worker_states {
     pub(crate) const WAITING: u8 = 0_u8;
     pub(crate) const EXIT: u8 = 1_u8;
@@ -52,44 +51,70 @@ pub(crate) mod worker_states {
     pub(crate) const BUFFER_FULL: u8 = 3_u8;
 }
 
-pub(crate) struct WorkerState {
+#[derive(Debug)]
+pub(crate) struct WorkerState_ {
     queue_len: AtomicUsize,
-    last_fire: AtomicUsize,
+    // State is stored as atomic u8 for atomic load/store.
+    // Allows concurrent access under a shared reference.
+    // All callers observe the enum, through getter/setter.
     state: AtomicU8,
-    config: BatcherConfig,
+    config: InnerConfig,
+}
+
+impl WorkerState_ {
+    fn new(config: InnerConfig) -> WorkerState_ {
+        WorkerState_ {
+            queue_len: AtomicUsize::new(0_usize),
+            state: AtomicU8::new(worker_states::WAITING),
+            config,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerState {
+    inner: Arc<WorkerState_>,
+}
+
+impl WorkerState {
+    pub(crate) fn new(config: InnerConfig) -> WorkerState {
+        let inner = Arc::new(WorkerState_::new(config));
+
+        WorkerState { inner }
+    }
 }
 
 impl WorkerState {
     fn capacity(&self) -> usize {
-        self.config.size as usize
+        self.inner.config.size as usize
     }
 
     fn timeout(&self) -> u64 {
-        self.config.timeout
+        self.inner.config.timeout
     }
 
     fn increment_len(&self) {
-        self.queue_len.fetch_add(1_usize, Ordering::Relaxed);
+        self.inner.queue_len.fetch_add(1_usize, Ordering::Relaxed);
     }
 
     pub(crate) fn set_state(&self, state: WorkerStatus) {
         let state_key: u8 = state.into();
-        self.state.store(state_key, Ordering::Release);
+        self.inner.state.store(state_key, Ordering::Release);
     }
 
     pub(crate) fn get_state(&self) -> WorkerStatus {
-        let state_key = self.state.load(Ordering::Acquire);
+        let state_key = self.inner.state.load(Ordering::Acquire);
         state_key.into()
     }
 
     fn reset_queue_len(&self) {
-        self.queue_len.store(0_usize, Ordering::Release);
+        self.inner.queue_len.store(0_usize, Ordering::Release);
     }
 }
 
 pub(crate) struct InferenceWorker<P: Predictor + Send + Sync + 'static> {
     state: WorkerState,
-    predicter: P,
+    predictor: P,
     sender_buffer: Vec<OutputSender<P>>,
     input_receiver: InputReceiver<P>,
     input_buffer: Vec<P::Input>,
@@ -97,7 +122,27 @@ pub(crate) struct InferenceWorker<P: Predictor + Send + Sync + 'static> {
 }
 
 impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
-    fn run(self) {
+    pub(crate) fn new(
+        state: WorkerState,
+        predictor: P,
+        input_receiver: InputReceiver<P>,
+    ) -> InferenceWorker<P> {
+        let cap = state.capacity();
+        let sender_buffer = Vec::with_capacity(cap);
+        let input_buffer = Vec::with_capacity(cap);
+        let next_inf = Instant::now() + Duration::from_millis(state.timeout());
+
+        InferenceWorker {
+            state,
+            predictor,
+            sender_buffer,
+            input_receiver,
+            input_buffer,
+            next_inf,
+        }
+    }
+
+    pub(crate) fn start(self) {
         tokio::spawn(async move { run_worker(self) });
     }
 
@@ -130,14 +175,13 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
             match self.state.get_state() {
                 WorkerStatus::Waiting => continue,
                 WorkerStatus::TimedOut | WorkerStatus::BufferFull => {
-                    let inf_results = self.run_inference(&self.input_buffer);
-                    let senders = self.take_senders();
-                    forward_inference_results(inf_results, senders);
+                    let inf_results =
+                        tokio::task::block_in_place(|| self.run_inference(&self.input_buffer));
                     self.state.reset_queue_len();
                     self.input_buffer.clear();
+                    self.send_output(inf_results);
                     self.reset_next_inf();
                     self.state.set_state(WorkerStatus::Waiting);
-                    todo!()
                 }
                 WorkerStatus::Exit => {
                     todo!()
@@ -166,26 +210,37 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
         )
     }
 
-    fn run_inference(&self, input_buffer: &[P::Input]) -> Vec<InferenceResult<P>> {
-        self.predicter.predict_batch(input_buffer)
+    fn run_inference(&self, input_buffer: &[P::Input]) -> InferenceResult<P> {
+        self.predictor.predict_batch(input_buffer)
     }
 
-    async fn send_output(output: Vec<Result<P::Output, P::Error>>, senders: Vec<OutputSender<P>>) {
-        for (out, sender) in output.into_iter().zip(senders.into_iter()) {
+    fn send_output(&mut self, output: InferenceResult<P>) {
+        let batch = match output {
+            Ok(b) => b,
+            Err(e) => {
+                self.send_errors(e);
+                return;
+            }
+        };
+
+        let senders = self.take_senders();
+        debug_assert_eq!(batch.len(), senders.len());
+
+        for (b, s) in batch.into_iter().zip(senders.into_iter()) {
             tokio::spawn(async move {
-                let _ = sender.send(out);
+                let _ = s.send(Ok(b));
             });
         }
     }
-}
 
-fn forward_inference_results<Output, Error>(
-    inf_results: Vec<Result<Output, Error>>,
-    senders: Vec<OneshotSender<Result<Output, Error>>>,
-) {
-    for (output, sender) in inf_results.into_iter().zip(senders.into_iter()) {
-        // TODO: handle errors here.
-        let _ = sender.send(output);
+    fn send_errors(&mut self, error: P::Error) {
+        let senders = self.take_senders();
+        for sender in senders.into_iter() {
+            let e = Err(error.clone());
+            tokio::spawn(async move {
+                let _ = sender.send(e);
+            });
+        }
     }
 }
 

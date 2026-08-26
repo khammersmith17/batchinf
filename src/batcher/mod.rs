@@ -23,6 +23,12 @@ impl<Input, Output, Error> BatcherInner<Input, Output, Error> {
     }
 }
 
+impl<Input, Output, Error> Drop for BatcherInner<Input, Output, Error> {
+    fn drop(&mut self) {
+        let _ = self.funnel.blocking_send(FunnelMessage::Exit);
+    }
+}
+
 pub struct Batchinf<Input, Output, Error> {
     inner: Arc<BatcherInner<Input, Output, Error>>,
 }
