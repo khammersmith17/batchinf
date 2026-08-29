@@ -6,7 +6,7 @@ pub trait Predictor: Clone {
     /// This is where the magic happens.
     ///
     /// This method is called on each inference batch and is a required implementation. It will be
-    /// called once per patch. When configured with multiple workers, it will called once per batch
+    /// called once per batch. When configured with multiple workers, it will called once per batch
     /// local worker.
     ///
     /// Implement this method to take in a slice of queued inference data, and perform inference on

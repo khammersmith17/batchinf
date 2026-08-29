@@ -1,5 +1,6 @@
 pub mod batcher;
 pub mod config;
+pub mod error;
 pub(crate) mod pool;
 pub mod predictor;
 pub(crate) mod worker;
@@ -11,7 +12,6 @@ pub use config::BatcherConfig;
 use config::InnerConfig;
 pub use predictor::Predictor;
 use tokio::sync::mpsc::channel;
-use tokio::sync::oneshot::Sender as OneshotSender;
 use worker::{InferenceWorker, WorkerState};
 
 /*
@@ -38,8 +38,7 @@ fn init_worker_ref_pairs<P: Predictor + Send + Sync + 'static>(
     let mut inf_workers = Vec::with_capacity(state.len());
     let mut worker_refs = Vec::with_capacity(state.len());
     for worker in state {
-        let (tx, rx) =
-            channel::<(P::Input, OneshotSender<Result<P::Output, P::Error>>)>(channel_size);
+        let (tx, rx) = channel::<FunnelMessage<P::Input, P::Output, P::Error>>(channel_size);
         let inf_worker = InferenceWorker::new(worker.clone(), predictor.clone(), rx);
         let worker_ref = WorkerRef::new(worker.clone(), tx);
         inf_workers.push(inf_worker);
@@ -60,10 +59,7 @@ pub fn get_batcher<P: Predictor + Send + Sync + 'static>(
 
     let conf: InnerConfig = config.into();
 
-    let workers: Vec<WorkerState> = (0..pool_size)
-        .into_iter()
-        .map(|_| WorkerState::new(conf))
-        .collect();
+    let workers: Vec<WorkerState> = (0..pool_size).map(|_| WorkerState::new(conf)).collect();
 
     let (inf_workers, worker_refs) =
         init_worker_ref_pairs(predictor, &workers, batch_size as usize);
