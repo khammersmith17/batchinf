@@ -1,8 +1,8 @@
-use batchinf::{get_batcher, BatcherConfig, Predictor};
+use batchinf::{BatcherConfig, Predictor, get_batcher};
 use std::num::NonZeroU64;
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicU32, Ordering},
 };
 use tokio::time::{Duration, Instant};
 
@@ -135,7 +135,11 @@ async fn test_batch_fires_at_capacity() {
         start.elapsed() < Duration::from_secs(5),
         "batch should have fired at capacity, not waited for 10s timeout"
     );
-    assert_eq!(predictor.call_count(), 1, "exactly one predict_batch call expected");
+    assert_eq!(
+        predictor.call_count(),
+        1,
+        "exactly one predict_batch call expected"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -175,7 +179,10 @@ async fn test_error_propagates_to_all_callers_in_batch() {
         .collect();
 
     let results = join(handles).await;
-    assert!(results.iter().all(|r| r.is_err()), "all callers should receive the error");
+    assert!(
+        results.iter().all(|r| r.is_err()),
+        "all callers should receive the error"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
