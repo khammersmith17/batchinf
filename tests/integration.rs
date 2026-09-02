@@ -1,4 +1,5 @@
-use batchinf::{BatcherConfig, Predictor, get_batcher};
+use batchinf::observability::{BatchTrigger, BatcherMetrics};
+use batchinf::{BatcherConfig, Predictor, WorkerSnapshot, WorkerStatus, get_batcher};
 use std::num::NonZeroU64;
 use std::sync::{
     Arc,
@@ -73,6 +74,56 @@ impl Predictor for CountingPredictor {
     }
 }
 
+// --- Test metrics ---
+
+#[derive(Debug)]
+struct TestMetrics {
+    capacity_triggers: AtomicU32,
+    timeout_triggers: AtomicU32,
+    ok_completions: AtomicU32,
+    err_completions: AtomicU32,
+    request_timeouts: AtomicU32,
+}
+
+impl TestMetrics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            capacity_triggers: AtomicU32::new(0),
+            timeout_triggers: AtomicU32::new(0),
+            ok_completions: AtomicU32::new(0),
+            err_completions: AtomicU32::new(0),
+            request_timeouts: AtomicU32::new(0),
+        })
+    }
+
+    fn capacity_triggers(&self) -> u32 { self.capacity_triggers.load(Ordering::SeqCst) }
+    fn timeout_triggers(&self) -> u32 { self.timeout_triggers.load(Ordering::SeqCst) }
+    fn ok_completions(&self) -> u32 { self.ok_completions.load(Ordering::SeqCst) }
+    fn err_completions(&self) -> u32 { self.err_completions.load(Ordering::SeqCst) }
+    fn request_timeouts(&self) -> u32 { self.request_timeouts.load(Ordering::SeqCst) }
+}
+
+impl BatcherMetrics for TestMetrics {
+    fn on_batch_trigger(&self, _batch_size: usize, trigger: BatchTrigger) {
+        match trigger {
+            BatchTrigger::Capacity => self.capacity_triggers.fetch_add(1, Ordering::SeqCst),
+            BatchTrigger::Timeout => self.timeout_triggers.fetch_add(1, Ordering::SeqCst),
+        };
+    }
+
+    fn on_batch_complete_ok(&self, _batch_size: usize, _latency: Duration) {
+        self.ok_completions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_batch_complete_err(&self, _batch_size: usize) {
+        self.err_completions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_request_timeout(&self) {
+        self.request_timeouts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 // --- Helpers ---
 
 fn config(batch_size: u64, timeout_ms: u64, pool_size: u64) -> BatcherConfig {
@@ -81,6 +132,14 @@ fn config(batch_size: u64, timeout_ms: u64, pool_size: u64) -> BatcherConfig {
         batch_timeout: NonZeroU64::new(timeout_ms).unwrap(),
         pool_size: NonZeroU64::new(pool_size).unwrap(),
     }
+}
+
+fn no_obs() -> Option<Arc<dyn BatcherMetrics>> {
+    None
+}
+
+fn with_obs(m: &Arc<TestMetrics>) -> Option<Arc<dyn BatcherMetrics>> {
+    Some(m.clone())
 }
 
 async fn join<T: Send + 'static>(handles: Vec<tokio::task::JoinHandle<T>>) -> Vec<T> {
@@ -95,14 +154,13 @@ async fn join<T: Send + 'static>(handles: Vec<tokio::task::JoinHandle<T>>) -> Ve
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_single_request() {
-    let batcher = get_batcher(EchoPredictor, config(8, 100, 1));
+    let batcher = get_batcher(EchoPredictor, config(8, 100, 1), no_obs());
     assert_eq!(batcher.predict(42).await.unwrap(), 42);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_results_match_inputs() {
-    // Fill an entire batch; each result must equal the corresponding input.
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(8, 500, 1)));
+    let batcher = Arc::new(get_batcher(EchoPredictor, config(8, 500, 1), no_obs()));
 
     let handles: Vec<_> = (0..8u64)
         .map(|i| {
@@ -118,9 +176,8 @@ async fn test_results_match_inputs() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_capacity() {
-    // Long timeout (10s): the only thing that can trigger inference is the batch being full.
     let predictor = CountingPredictor::new();
-    let batcher = Arc::new(get_batcher(predictor.clone(), config(4, 10_000, 1)));
+    let batcher = Arc::new(get_batcher(predictor.clone(), config(4, 10_000, 1), no_obs()));
 
     let start = Instant::now();
     let handles: Vec<_> = (0..4u64)
@@ -135,18 +192,13 @@ async fn test_batch_fires_at_capacity() {
         start.elapsed() < Duration::from_secs(5),
         "batch should have fired at capacity, not waited for 10s timeout"
     );
-    assert_eq!(
-        predictor.call_count(),
-        1,
-        "exactly one predict_batch call expected"
-    );
+    assert_eq!(predictor.call_count(), 1, "exactly one predict_batch call expected");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_timeout() {
-    // batch_size=8 but only 1 request is sent, so inference must wait for the timeout.
     let timeout_ms = 50u64;
-    let batcher = get_batcher(EchoPredictor, config(8, timeout_ms, 1));
+    let batcher = get_batcher(EchoPredictor, config(8, timeout_ms, 1), no_obs());
 
     let start = Instant::now();
     let result = batcher.predict(99).await.unwrap();
@@ -163,13 +215,13 @@ async fn test_batch_fires_at_timeout() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_error_propagates_to_caller() {
-    let batcher = get_batcher(FailPredictor, config(1, 50, 1));
+    let batcher = get_batcher(FailPredictor, config(1, 50, 1), no_obs());
     assert!(batcher.predict(0).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_error_propagates_to_all_callers_in_batch() {
-    let batcher = Arc::new(get_batcher(FailPredictor, config(4, 500, 1)));
+    let batcher = Arc::new(get_batcher(FailPredictor, config(4, 500, 1), no_obs()));
 
     let handles: Vec<_> = (0..4u64)
         .map(|_| {
@@ -179,16 +231,13 @@ async fn test_error_propagates_to_all_callers_in_batch() {
         .collect();
 
     let results = join(handles).await;
-    assert!(
-        results.iter().all(|r| r.is_err()),
-        "all callers should receive the error"
-    );
+    assert!(results.iter().all(|r| r.is_err()), "all callers should receive the error");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_requests_all_complete() {
     let n = 100u64;
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(16, 50, 1)));
+    let batcher = Arc::new(get_batcher(EchoPredictor, config(16, 50, 1), no_obs()));
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -204,7 +253,7 @@ async fn test_concurrent_requests_all_complete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multi_worker_correct_results() {
     let n = 64u64;
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(4, 50, 4)));
+    let batcher = Arc::new(get_batcher(EchoPredictor, config(4, 50, 4), no_obs()));
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -220,9 +269,8 @@ async fn test_multi_worker_correct_results() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_sequential_batches() {
-    // 9 requests with batch_size=4 → 3 separate predict_batch calls (4, 4, 1).
     let predictor = CountingPredictor::new();
-    let batcher = Arc::new(get_batcher(predictor.clone(), config(4, 500, 1)));
+    let batcher = Arc::new(get_batcher(predictor.clone(), config(4, 500, 1), no_obs()));
 
     let handles: Vec<_> = (0..4u64)
         .map(|i| {
@@ -243,4 +291,92 @@ async fn test_multiple_sequential_batches() {
     batcher.predict(8).await.unwrap();
 
     assert_eq!(predictor.call_count(), 3);
+}
+
+// --- Status tests ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pool_status_length_matches_pool_size() {
+    let batcher = get_batcher(EchoPredictor, config(4, 100, 3), no_obs());
+    assert_eq!(batcher.pool_status().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_workers_initially_waiting() {
+    let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
+    for WorkerSnapshot { status, queue_len } in batcher.pool_status() {
+        assert_eq!(status, WorkerStatus::Waiting);
+        assert_eq!(queue_len, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_status_valid_index() {
+    let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
+    assert!(batcher.worker_status(0).is_some());
+    assert!(batcher.worker_status(1).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_status_out_of_bounds() {
+    let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
+    assert!(batcher.worker_status(2).is_none());
+}
+
+// --- Observability tests ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_capacity_trigger() {
+    let metrics = TestMetrics::new();
+    let batcher = Arc::new(get_batcher(EchoPredictor, config(4, 10_000, 1), with_obs(&metrics)));
+
+    let handles: Vec<_> = (0..4u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await.unwrap() })
+        })
+        .collect();
+    join(handles).await;
+
+    assert_eq!(metrics.capacity_triggers(), 1);
+    assert_eq!(metrics.timeout_triggers(), 0);
+    assert_eq!(metrics.ok_completions(), 1);
+    assert_eq!(metrics.err_completions(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_timeout_trigger() {
+    let metrics = TestMetrics::new();
+    let batcher = get_batcher(EchoPredictor, config(8, 50, 1), with_obs(&metrics));
+
+    batcher.predict(1).await.unwrap();
+
+    assert_eq!(metrics.timeout_triggers(), 1);
+    assert_eq!(metrics.capacity_triggers(), 0);
+    assert_eq!(metrics.ok_completions(), 1);
+    assert_eq!(metrics.err_completions(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_err_completion() {
+    let metrics = TestMetrics::new();
+    let batcher = get_batcher(FailPredictor, config(1, 50, 1), with_obs(&metrics));
+
+    let _ = batcher.predict(0).await;
+
+    assert_eq!(metrics.err_completions(), 1);
+    assert_eq!(metrics.ok_completions(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_request_timeout() {
+    let metrics = TestMetrics::new();
+    // Large batch_size and batch_timeout so the worker won't fire on its own.
+    let batcher = get_batcher(EchoPredictor, config(8, 10_000, 1), with_obs(&metrics));
+
+    let _ = batcher
+        .predict_with_timeout(0, Duration::from_millis(20))
+        .await;
+
+    assert_eq!(metrics.request_timeouts(), 1);
 }

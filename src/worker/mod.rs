@@ -1,7 +1,7 @@
-use crate::config::InnerConfig;
+use crate::observability::{BatchTrigger, BatcherMetrics, InfBatchMetrics};
 use crate::predictor::Predictor;
+use crate::state::{WorkerState, WorkerStatus};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot::Sender as OneshotSender;
@@ -12,137 +12,19 @@ pub(crate) type OutputSender<P> =
 pub(crate) type InputReceiver<P> = Receiver<(<P as Predictor>::Input, OutputSender<P>)>;
 pub(crate) type InferenceResult<P> = Result<Vec<<P as Predictor>::Output>, <P as Predictor>::Error>;
 
-// A worker can be in one the three following states.
-// Waiting if when inference requests are being queued, Running trigger an inference
-// run, and Exit defines when resources are being cleaned up.
-#[derive(Debug, PartialEq)]
-pub(crate) enum WorkerStatus {
-    // Waiting to run inference.
-    Waiting,
-    // Exiting/cleaning up.
-    Exit,
-    // Running inference.
-    Running,
-}
+/// When the user defined [Predictor::predict_batch] panics, that worker will be
+/// removed from the pool by setting its state to [WorkerStatus::Exit].
+///
+/// This panic guard works by implementing this removal of the worker, the state gets set to Exit,
+/// only when a thread is panicking.
+struct InferencePanicGuard(WorkerState);
 
-impl From<WorkerStatus> for u8 {
-    fn from(state: WorkerStatus) -> u8 {
-        match state {
-            WorkerStatus::Waiting => worker_states::WAITING,
-            WorkerStatus::Exit => worker_states::EXIT,
-            WorkerStatus::Running => worker_states::RUNNING_INFERENCE,
+impl Drop for InferencePanicGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let state = &self.0;
+            state.set_state(WorkerStatus::Exit)
         }
-    }
-}
-
-impl From<u8> for WorkerStatus {
-    fn from(state: u8) -> WorkerStatus {
-        match state {
-            worker_states::WAITING => Self::Waiting,
-            worker_states::EXIT => Self::Exit,
-            worker_states::RUNNING_INFERENCE => Self::Running,
-            _ => unreachable!("Invalid state value"),
-        }
-    }
-}
-
-// Mappings out u8 key and enum variant.
-// These mappings allow for the state and queue size to be stored in a single atomic.
-// The 2 most significant bits store the state.
-// These u8 values are never stored.
-pub(crate) mod worker_states {
-    pub(crate) const WAITING: u8 = 0_u8;
-    pub(crate) const EXIT: u8 = 1_u8;
-    pub(crate) const RUNNING_INFERENCE: u8 = 2_u8;
-    // Mask the state bits to get the queue len.
-    pub(crate) const QUEUE_MASK: u64 = !(0b11_u64 << 62);
-}
-
-pub(crate) struct WorkerSnapshot {
-    pub(crate) status: WorkerStatus,
-    pub(crate) queue_len: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct WorkerState_ {
-    // State is stored in the 2 MSB here atomic load/store.
-    // The other 62 bits store the queue length.
-    state: AtomicU64,
-    config: InnerConfig,
-}
-
-impl WorkerState_ {
-    fn new(config: InnerConfig) -> WorkerState_ {
-        WorkerState_ {
-            state: AtomicU64::new(0_u64),
-            config,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct WorkerState {
-    inner: Arc<WorkerState_>,
-}
-
-impl WorkerState {
-    pub(crate) fn new(config: InnerConfig) -> WorkerState {
-        let inner = Arc::new(WorkerState_::new(config));
-
-        WorkerState { inner }
-    }
-}
-
-impl WorkerState {
-    pub(crate) fn capacity(&self) -> u64 {
-        self.inner.config.size
-    }
-
-    fn timeout(&self) -> u64 {
-        self.inner.config.timeout
-    }
-
-    fn increment_len(&self) {
-        self.inner.state.fetch_add(1_u64, Ordering::Relaxed);
-    }
-
-    pub(crate) fn set_state(&self, state: WorkerStatus) {
-        let state_key: u8 = state.into();
-        let state = u64::from(state_key) << 62;
-
-        // The 2 MSB need to be cleared here, and then ORed with the state value.
-        // So we need a CAS loop.
-        let mut current = self.inner.state.load(Ordering::Relaxed);
-
-        loop {
-            let new = (current & worker_states::QUEUE_MASK) | state;
-            match self.inner.state.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    pub(crate) fn get_state(&self) -> WorkerStatus {
-        let state_key = self.inner.state.load(Ordering::Acquire);
-        ((state_key >> 62) as u8).into()
-    }
-
-    pub(crate) fn snapshot(&self) -> WorkerSnapshot {
-        let state = self.inner.state.load(Ordering::Acquire);
-        let status: WorkerStatus = ((state >> 62) as u8).into();
-        let queue_len = state & worker_states::QUEUE_MASK;
-
-        WorkerSnapshot { status, queue_len }
-    }
-
-    fn reset_queue_len(&self) {
-        self.inner.state.store(0_u64, Ordering::Release);
     }
 }
 
@@ -185,6 +67,7 @@ pub(crate) struct InferenceWorker<P: Predictor + Send + Sync + 'static> {
     input_receiver: InputReceiver<P>,
     buffer: WorkerBuffer<P>,
     next_inf: Instant,
+    obs: Option<Arc<dyn BatcherMetrics>>,
 }
 
 impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
@@ -192,6 +75,7 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
         state: WorkerState,
         predictor: P,
         input_receiver: InputReceiver<P>,
+        obs: Option<Arc<dyn BatcherMetrics>>,
     ) -> InferenceWorker<P> {
         let cap = state.capacity() as usize;
         let sender_buffer = Vec::with_capacity(cap);
@@ -208,6 +92,7 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
             buffer,
             input_receiver,
             next_inf,
+            obs,
         }
     }
 
@@ -218,20 +103,21 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
 
     // The worker loop.
     //
-    // Wait to the next inference request. Reading the next inference request off the channel and
-    // the remaining time at the start of the poll race using tokio::select!.
+    // Drives accumulate_next_batch then runs inference when a batch is ready.
     async fn worker_loop(&mut self) {
         loop {
             self.accumulate_next_batch().await;
             match self.state.get_state() {
                 // No inference data before timeout, restart accumulation phase.
-                WorkerStatus::Waiting => unreachable!("accumulate_next_batch only returns with an empty buffer on timeout, which cannot occur"),
+                WorkerStatus::Waiting => unreachable!(
+                    "accumulate_next_batch only returns with an empty buffer on timeout, which cannot occur"
+                ),
                 WorkerStatus::Running => {
                     self.run_inference();
                 }
                 WorkerStatus::Exit => {
                     self.run_inference();
-                    // Pool worker exits.
+                    // Inference worker exits.
                     break;
                 }
             }
@@ -264,6 +150,7 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
                         self.state.increment_len();
                         if self.buffer.len() == (self.state.capacity() as usize){
                             self.state.set_state(WorkerStatus::Running);
+                            self.emit_batch_start(BatchTrigger::Capacity);
                             break;
                         }
 
@@ -276,9 +163,13 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
                 _ = sleep(timeout) => {
                         // Do not overwrite state to running when state has been set to Exit.
                         // Inference happens in an Exit state.
+                        //
+                        // Only log a timeout when the worker has not exited.
                         if matches!(self.state.get_state(), WorkerStatus::Waiting) && !self.buffer.is_empty() {
-                            self.state.set_state(WorkerStatus::Running)
+                            self.state.set_state(WorkerStatus::Running);
+                            self.emit_batch_start(BatchTrigger::Timeout);
                         }
+
                         return;
                 }
 
@@ -286,10 +177,12 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
         }
     }
 
+    /// Reset the clock for the next inference timeout.
     fn reset_next_inf(&mut self) {
         self.next_inf = Instant::now() + Duration::from_millis(self.state.timeout())
     }
 
+    /// On each wait for a message from the channel, compute the remaining timeout.
     fn time_until_timeout(&self) -> Duration {
         let now = Instant::now();
 
@@ -299,36 +192,87 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
         Duration::from_millis(duration_remaining.as_millis() as u64)
     }
 
+    /// Perform inference on a batch by calling the user defined batch inference method.
     fn run_inference(&mut self) {
         if self.buffer.is_empty() {
             return;
         };
+
+        // Register the panic guard, to safely remove the worker on panic.
+        let _guard = InferencePanicGuard(self.state.clone());
+        let size = self.buffer.len();
+
+        let start = Instant::now();
         let inf_results =
             tokio::task::block_in_place(|| self.predictor.predict_batch(&self.buffer.input()));
 
+        let latency = Instant::now().duration_since(start);
+
         let senders = self.buffer.clear_and_take_senders();
         self.state.reset_queue_len();
-        self.send_output(inf_results, senders);
+        self.send_output(inf_results, senders, InfBatchMetrics { size, latency });
     }
 
-    fn send_output(&mut self, output: InferenceResult<P>, senders: Vec<OutputSender<P>>) {
+    /// Send the output back out through the oneshot senders.
+    fn send_output(
+        &mut self,
+        output: InferenceResult<P>,
+        senders: Vec<OutputSender<P>>,
+        metrics: InfBatchMetrics,
+    ) {
         let batch = match output {
             Ok(b) => b,
             Err(e) => {
-                self.send_errors(e, senders);
+                self.send_errors(e, senders, metrics);
                 return;
             }
         };
+
+        self.emit_inference_ok(metrics);
 
         for (res, send) in batch.into_iter().zip(senders.into_iter()) {
             let _ = send.send(Ok(res));
         }
     }
 
-    fn send_errors(&mut self, error: P::Error, senders: Vec<OutputSender<P>>) {
+    /// If the predict function result is Err, send all waiting the error.
+    fn send_errors(
+        &mut self,
+        error: P::Error,
+        senders: Vec<OutputSender<P>>,
+        metrics: InfBatchMetrics,
+    ) {
+        self.emit_inference_err(metrics.size);
         for sender in senders.into_iter() {
             let e = Err(error.clone());
             let _ = sender.send(e);
+        }
+    }
+
+    /*
+     * The following 3 methods emit metrics when an obserability handler with the proper callbacks
+     * is defined, otherwise it is a no-op.
+     *
+     * This could get compiled away, given if there is no observability metrics handler defined,
+     * then it can be statically proven all these methods are no-ops.
+     * */
+    fn emit_batch_start(&self, trigger_type: BatchTrigger) {
+        if let Some(ref obs) = self.obs {
+            let size = self.buffer.len();
+            obs.on_batch_trigger(size, trigger_type)
+        }
+    }
+
+    fn emit_inference_ok(&self, metrics: InfBatchMetrics) {
+        if let Some(ref obs) = self.obs {
+            let InfBatchMetrics { size, latency } = metrics;
+            obs.on_batch_complete_ok(size, latency)
+        }
+    }
+
+    fn emit_inference_err(&self, size: usize) {
+        if let Some(ref obs) = self.obs {
+            obs.on_batch_complete_err(size)
         }
     }
 }

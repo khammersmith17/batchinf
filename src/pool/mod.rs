@@ -1,60 +1,18 @@
-use crate::worker::{WorkerSnapshot, WorkerState, WorkerStatus};
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::oneshot::Sender as OneshotSender;
+use crate::FunnelMessage;
+use crate::error::BatchinfError;
+use crate::state::{WorkerRef, WorkerSnapshot, WorkerStatus};
+use std::sync::Arc;
 
-pub(crate) type FunnelMessage<Input, Output, Error> = (Input, OneshotSender<Result<Output, Error>>);
-
-pub(crate) struct WorkerRef<Input, Output, Error>
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
-{
-    state: WorkerState,
-    worker_queue: Sender<FunnelMessage<Input, Output, Error>>,
-}
-
-impl<Input, Output, Error> WorkerRef<Input, Output, Error>
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
-{
-    pub(crate) fn new(
-        state: WorkerState,
-        worker_queue: Sender<FunnelMessage<Input, Output, Error>>,
-    ) -> Self {
-        Self {
-            state,
-            worker_queue,
-        }
-    }
-
-    fn snapshot(&self) -> WorkerSnapshot {
-        self.state.snapshot()
-    }
-
-    pub(crate) fn capacity(&self) -> u64 {
-        self.state.capacity()
-    }
-
-
-    async fn push(&self, msg: FunnelMessage<Input, Output, Error>) {
-        // If the worker channel is closed (worker exited), the send error is dropped here.
-        // The caller's oneshot receiver will return Err, which maps to BatchinfError::InternalError.
-        let _ = self.worker_queue.send(msg).await;
-    }
-}
-
+#[derive(Debug, Clone)]
 pub(crate) struct WorkerPool<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
     Error: Send + Sync + 'static,
 {
-    worker_pool: Vec<WorkerRef<Input, Output, Error>>,
-    in_queue: Receiver<FunnelMessage<Input, Output, Error>>,
-    sink: usize,
+    // Arc to a boxed slice implies that workers are never evicted from the pool if they ever are
+    // in a bad state.
+    pool: Arc<[WorkerRef<Input, Output, Error>]>,
 }
 
 impl<Input, Output, Error> WorkerPool<Input, Output, Error>
@@ -64,74 +22,81 @@ where
     Error: Send + Sync + 'static,
 {
     pub(crate) fn new(
-        worker_pool: Vec<WorkerRef<Input, Output, Error>>,
-        in_queue: Receiver<FunnelMessage<Input, Output, Error>>,
-    ) -> Self {
-        Self {
-            worker_pool,
-            in_queue,
-            sink: 0_usize,
-        }
+        pool: Vec<WorkerRef<Input, Output, Error>>,
+    ) -> WorkerPool<Input, Output, Error> {
+        WorkerPool { pool: pool.into() }
     }
 
-    pub(crate) fn start(self) {
-        tokio::spawn(async { run_worker_pool(self).await });
-    }
+    /// Use a load aware round robin starting at a random index.
+    ///
+    /// Select an initial start point in the pool, and traversing to pool until all workers are
+    /// exhausted. If a worker that can accept work is not found, then the first observed worker
+    /// who is still alive, not [WorkerStatus::Exit] state, is selected as the fallback
+    /// destination.
+    pub(crate) async fn push<E: Clone + std::error::Error + Send + Sync + 'static>(
+        &self,
+        msg: FunnelMessage<Input, Output, Error>,
+    ) -> Result<(), BatchinfError<E>> {
+        let pool_size = self.pool.len();
 
-    pub(crate) async fn run_pooler(&mut self) {
-        // Fetch from the queue and resolve which sink to send to.
-        while let Some(input_msg) = self.in_queue.recv().await {
-            let dest = self.determine_destination();
-            self.worker_pool[dest].push(input_msg).await;
-            self.increment_sink();
+        // If the pool only has a single worker, then it is just dispatched.
+        if pool_size == 1 {
+            self.pool[0].push(msg).await?;
+            return Ok(());
         }
-    }
 
-    // A load aware round robin algorithm to determine the next worker that is dispatched to.
-    pub(crate) fn determine_destination(&mut self) -> usize {
-        if self.worker_pool.len() == 1 {
-            return 0_usize;
-        }
+        // Select random place to start in the pool. This position is where we start from.
+        let mut sink = self.get_search_start();
 
-        let worker_count = self.size();
-        for _ in 0..worker_count {
-            let snapshot = self.worker_pool[self.sink].snapshot();
-            if snapshot.status == WorkerStatus::Waiting
-                && snapshot.queue_len < self.worker_pool[self.sink].capacity()
-            {
-                return self.sink;
+        // Fallback is the first non exited worker that we observe when looking for a worker that
+        // can accept work.
+        let mut fallback: Option<usize> = None;
+
+        // Select the first worker in the waiting state. Exhaust all workers.
+        for _ in 0..pool_size {
+            let WorkerSnapshot { status, queue_len } = self.pool[sink].snapshot();
+            let capacity = self.pool[sink].capacity();
+            match status {
+                WorkerStatus::Exit => {}
+                // If worker is waiting and has capacity, route to it.
+                // Additional capacity check is for the case where a worker is full, but has yet to
+                // update state.
+                WorkerStatus::Waiting if queue_len < capacity => {
+                    self.pool[sink].push(msg).await?;
+                    return Ok(());
+                }
+                _ => {
+                    if fallback.is_none() {
+                        fallback = Some(sink)
+                    }
+                }
             }
-            self.increment_sink();
+
+            sink = (sink + 1) % pool_size;
         }
 
-        for _ in 0..worker_count {
-            let snapshot = self.worker_pool[self.sink].snapshot();
-
-            if snapshot.status != WorkerStatus::Exit {
-                return self.sink;
-            }
-            self.increment_sink();
+        // If we are unable to find an available worker, we dispatch to the first worker we find
+        // that has not/is exited.
+        if let Some(fallback_sink) = fallback {
+            self.pool[fallback_sink].push(msg).await?;
+            return Ok(());
         }
 
-        self.sink
+        Err(BatchinfError::NoAvailableWorkersError)
     }
 
-    #[inline]
-    fn increment_sink(&mut self) {
-        self.sink = (self.sink + 1) % self.worker_pool.len();
+    /// Query the status of all pools.
+    pub(crate) fn pool_status(&self) -> Vec<WorkerSnapshot> {
+        self.pool.iter().map(|w| w.snapshot()).collect()
     }
 
-    #[inline]
-    fn size(&self) -> usize {
-        self.worker_pool.len()
+    /// Query the status of a single worker in the pool.
+    pub(crate) fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
+        self.pool.get(idx).map(|w| w.snapshot())
     }
-}
 
-async fn run_worker_pool<Input, Output, Error>(mut pool: WorkerPool<Input, Output, Error>)
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
-{
-    pool.run_pooler().await;
+    // Select a random start position in the pool, rather than maintaining a round robin count.
+    fn get_search_start(&self) -> usize {
+        fastrand::usize(..self.pool.len())
+    }
 }
