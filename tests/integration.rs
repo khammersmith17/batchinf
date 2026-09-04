@@ -298,13 +298,13 @@ async fn test_multiple_sequential_batches() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pool_status_length_matches_pool_size() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 3), no_obs());
-    assert_eq!(batcher.pool_status().len(), 3);
+    assert_eq!(batcher.pool_status().await.len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_workers_initially_waiting() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
-    for WorkerSnapshot { status, queue_len } in batcher.pool_status() {
+    for WorkerSnapshot { status, queue_len } in batcher.pool_status().await {
         assert_eq!(status, WorkerStatus::Waiting);
         assert_eq!(queue_len, 0);
     }
@@ -313,14 +313,14 @@ async fn test_workers_initially_waiting() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_status_valid_index() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
-    assert!(batcher.worker_status(0).is_some());
-    assert!(batcher.worker_status(1).is_some());
+    assert!(batcher.worker_status(0).await.is_some());
+    assert!(batcher.worker_status(1).await.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_status_out_of_bounds() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
-    assert!(batcher.worker_status(2).is_none());
+    assert!(batcher.worker_status(2).await.is_none());
 }
 
 // --- Observability tests ---

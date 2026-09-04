@@ -23,6 +23,10 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Fires when an inference request queued through
     /// [crate::batcher::Batchinf::predict_with_timeout] times out.
     fn on_request_timeout(&self);
+
+    /// Fires in a background supervisor control plane and emits the total queue depth, which is
+    /// the total number of inference requests waiting to be serviced.
+    fn on_queue_depth(&self, queue_depth: usize);
 }
 
 pub(crate) struct InfBatchMetrics {

@@ -73,13 +73,13 @@ where
     }
 
     /// Returns a snapshot of every worker in the pool, indexed by worker position.
-    pub fn pool_status(&self) -> Vec<WorkerSnapshot> {
-        self.pool.pool_status()
+    pub async fn pool_status(&self) -> Vec<WorkerSnapshot> {
+        self.pool.pool_status().await
     }
 
     /// Returns a snapshot of the worker at `idx`, or `None` if out of bounds.
-    pub fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
-        self.pool.worker_status(idx)
+    pub async fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
+        self.pool.worker_status(idx).await
     }
 
     fn emit_timeout(&self) {

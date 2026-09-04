@@ -21,4 +21,6 @@ where
     TimeoutError,
     #[error("No available workers")]
     NoAvailableWorkersError,
+    #[error("All worker queues are full")]
+    QueueFullError(tokio::sync::mpsc::TrySendError),
 }

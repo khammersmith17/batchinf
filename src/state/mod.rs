@@ -1,13 +1,10 @@
-use crate::FunnelMessage;
 use crate::config::InnerConfig;
 use crate::error::BatchinfError;
+use crate::pool::FunnelMessage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::Sender;
 
-// A worker can be in one the three following states.
-// Waiting if when inference requests are being queued, Running trigger an inference
-// run, and Exit defines when resources are being cleaned up.
 /// The operational state of an inference worker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkerStatus {
@@ -17,6 +14,8 @@ pub enum WorkerStatus {
     Exit,
     /// Currently executing [`Predictor::predict_batch`].
     Running,
+    /// [`Predictor::predict_batch`] panicked. The control plane will restart the worker.
+    Crashed,
 }
 
 impl From<WorkerStatus> for u8 {
@@ -25,6 +24,7 @@ impl From<WorkerStatus> for u8 {
             WorkerStatus::Waiting => worker_states::WAITING,
             WorkerStatus::Exit => worker_states::EXIT,
             WorkerStatus::Running => worker_states::RUNNING_INFERENCE,
+            WorkerStatus::Crashed => worker_states::CRASHED,
         }
     }
 }
@@ -35,6 +35,7 @@ impl From<u8> for WorkerStatus {
             worker_states::WAITING => Self::Waiting,
             worker_states::EXIT => Self::Exit,
             worker_states::RUNNING_INFERENCE => Self::Running,
+            worker_states::CRASHED => Self::Crashed,
             _ => unreachable!("Invalid state value"),
         }
     }
@@ -48,6 +49,7 @@ pub(crate) mod worker_states {
     pub(crate) const WAITING: u8 = 0_u8;
     pub(crate) const EXIT: u8 = 1_u8;
     pub(crate) const RUNNING_INFERENCE: u8 = 2_u8;
+    pub(crate) const CRASHED: u8 = 3_u8;
     // Mask the state bits to get the queue len.
     pub(crate) const QUEUE_MASK: u64 = !(0b11_u64 << 62);
 }
@@ -182,16 +184,33 @@ where
         self.state.capacity()
     }
 
-    pub(crate) async fn push<E: Clone + std::error::Error + Send + Sync + 'static>(
+    pub(crate) fn push<E: Clone + std::error::Error + Send + Sync + 'static>(
         &self,
         msg: FunnelMessage<Input, Output, Error>,
     ) -> Result<(), BatchinfError<E>> {
-        if matches!(self.snapshot().status, WorkerStatus::Exit) {
+        if matches!(
+            self.snapshot().status,
+            WorkerStatus::Exit | WorkerStatus::Crashed
+        ) {
             return Err(BatchinfError::InternalError);
         }
         // If the worker channel is closed (worker exited), the send error is dropped here.
         // The caller's oneshot receiver will return Err, which maps to BatchinfError::InternalError.
-        let _ = self.worker_queue.send(msg).await;
+        let res = self.worker_queue.try_send(msg);
+        if res.is_err() {
+            return Err(BatchinfError::QueueFullError(res));
+        }
         Ok(())
+    }
+
+    pub(crate) fn replace_queue(
+        &mut self,
+        worker_queue: Sender<FunnelMessage<Input, Output, Error>>,
+    ) {
+        self.worker_queue = worker_queue;
+    }
+
+    pub(crate) fn clone_worker_state(&self) -> WorkerState {
+        self.state.clone()
     }
 }

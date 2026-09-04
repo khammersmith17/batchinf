@@ -1,0 +1,91 @@
+use crate::config::BatcherConfig;
+use crate::observability::BatcherMetrics;
+use crate::pool::FunnelMessage;
+use crate::predictor::Predictor;
+use crate::state::{WorkerRef, WorkerSnapshot, WorkerState, WorkerStatus};
+use crate::worker::{InferenceWorker, run_worker};
+use std::sync::{Arc, Weak};
+use tokio::sync::RwLock;
+use tokio::sync::mpsc::{Sender, channel};
+use tokio::time::{Duration, sleep};
+
+pub(crate) struct ControlPlane<P: Predictor + Send + Sync + 'static> {
+    pub(crate) predictor: P,
+    pub(crate) pool_weak: Weak<[RwLock<WorkerRef<P::Input, P::Output, P::Error>>]>,
+    pub(crate) obs: Option<Arc<dyn BatcherMetrics>>,
+    pub(crate) config: BatcherConfig,
+}
+
+pub(crate) fn run_control_plane<P: Predictor + Send + Sync + 'static>(
+    control_plane: ControlPlane<P>,
+) {
+    tokio::task::spawn(async { supervisor_loop(control_plane).await });
+}
+
+async fn supervisor_loop<P: Predictor + Send + Sync + 'static>(control_plane: ControlPlane<P>) {
+    let ControlPlane {
+        predictor,
+        pool_weak,
+        obs,
+        config,
+    } = control_plane;
+    loop {
+        let Some(pool) = pool_weak.upgrade() else {
+            return;
+        };
+
+        let pool_size = pool.len();
+        // If all workers have exited, then the control plane also exits.
+        let mut exited = 0_usize;
+        let mut total_queue_depth = 0_usize;
+        for i in 0..pool_size {
+            let worker_snapshot = {
+                let handle = pool[i].read().await;
+                handle.snapshot()
+            };
+
+            let WorkerSnapshot { status, queue_len } = worker_snapshot;
+            total_queue_depth += queue_len as usize;
+
+            match status {
+                WorkerStatus::Crashed => {
+                    let mut handle = pool[i].write().await;
+                    let tx = restart_worker(
+                        predictor.clone(),
+                        handle.clone_worker_state(),
+                        obs.clone(),
+                        &config,
+                    );
+
+                    handle.replace_queue(tx);
+                }
+                WorkerStatus::Exit => exited += 1,
+                _ => {}
+            }
+        }
+
+        if exited == pool_size {
+            return;
+        }
+
+        if let Some(ref obs) = obs {
+            obs.on_queue_depth(total_queue_depth)
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Restart a worker that has crashed.
+fn restart_worker<P: Predictor + Send + Sync + 'static>(
+    predictor: P,
+    state: WorkerState,
+    obs: Option<Arc<dyn BatcherMetrics>>,
+    config: &BatcherConfig,
+) -> Sender<FunnelMessage<P::Input, P::Output, P::Error>> {
+    let (tx, rx) = channel(config.batch_size.get() as usize);
+    state.reset_queue_len();
+    let worker = InferenceWorker::new(state, predictor, obs);
+    run_worker(worker, rx);
+    tx
+}
