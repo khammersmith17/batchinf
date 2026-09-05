@@ -2,6 +2,8 @@
 name = "batchinf"
 version = "0.1.0"
 edition = "2024"
+description = "A harness for static ML batching. This is useful to saturate a device (TPU/GPU) an increase throughput for expensive ML inference."
+license = "MIT"
 
 [dependencies]
 fastrand = "2.5.0"
