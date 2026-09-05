@@ -133,6 +133,10 @@ async fn worker_loop<P: Predictor + Send + Sync + 'static>(
             ),
             WorkerStatus::Running => {
                 run_inference(&worker, &mut buffer);
+                // Reset the worker queue size and set to Waiting State.
+                // Setting the queue len to 0, also sets the state bits to 0b00, which is
+                // `WorkerStatus::Waiting`
+                worker.state.reset_queue_len();
             }
             WorkerStatus::Exit => {
                 run_inference(&worker, &mut buffer);
@@ -224,7 +228,6 @@ fn run_inference<P: Predictor + Send + Sync + 'static>(
     let latency = Instant::now().duration_since(start);
 
     let senders = buffer.clear_and_take_senders();
-    worker.state.reset_queue_len();
     send_output(
         worker,
         inf_results,

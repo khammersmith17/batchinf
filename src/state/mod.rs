@@ -1,9 +1,14 @@
 use crate::config::InnerConfig;
-use crate::error::BatchinfError;
 use crate::pool::FunnelMessage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
+
+pub(crate) enum QueuePushResult<Input, Output, Error> {
+    Success,
+    QueueFull(FunnelMessage<Input, Output, Error>),
+    QueueClosed(FunnelMessage<Input, Output, Error>),
+}
 
 /// The operational state of an inference worker.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +140,9 @@ impl WorkerState {
         ((state_key >> 62) as u8).into()
     }
 
+    /// Get a snapshot of the worker state.
+    ///
+    /// Provides a `WorkerSnapshot`, which provides the current state and the size of the queue.
     pub(crate) fn snapshot(&self) -> WorkerSnapshot {
         let state = self.inner.state.load(Ordering::Acquire);
         let status: WorkerStatus = ((state >> 62) as u8).into();
@@ -176,33 +184,39 @@ where
         }
     }
 
+    /// Get a snapshot of the worker state.
     pub(crate) fn snapshot(&self) -> WorkerSnapshot {
         self.state.snapshot()
     }
 
+    /// Provides the capacity of the worker queue, describing the maximum number of inference
+    /// requests that can be queued on the worker.
     pub(crate) fn capacity(&self) -> u64 {
         self.state.capacity()
     }
 
-    pub(crate) fn push<E: Clone + std::error::Error + Send + Sync + 'static>(
+    pub(crate) fn push(
         &self,
         msg: FunnelMessage<Input, Output, Error>,
-    ) -> Result<(), BatchinfError<E>> {
+    ) -> QueuePushResult<Input, Output, Error> {
         if matches!(
             self.snapshot().status,
             WorkerStatus::Exit | WorkerStatus::Crashed
         ) {
-            return Err(BatchinfError::InternalError);
+            return QueuePushResult::QueueClosed(msg);
         }
         // If the worker channel is closed (worker exited), the send error is dropped here.
         // The caller's oneshot receiver will return Err, which maps to BatchinfError::InternalError.
-        let res = self.worker_queue.try_send(msg);
-        if res.is_err() {
-            return Err(BatchinfError::QueueFullError(res));
+        match self.worker_queue.try_send(msg) {
+            Ok(_) => QueuePushResult::Success,
+            Err(TrySendError::Full(m)) => QueuePushResult::QueueFull(m),
+            Err(TrySendError::Closed(m)) => QueuePushResult::QueueClosed(m),
         }
-        Ok(())
     }
 
+    /// Swap in a new sender channel.
+    ///
+    /// This is called when a crashed worker is crashed, or during SIGTERM handling.
     pub(crate) fn replace_queue(
         &mut self,
         worker_queue: Sender<FunnelMessage<Input, Output, Error>>,
@@ -210,7 +224,17 @@ where
         self.worker_queue = worker_queue;
     }
 
+    /// Pull a clone of the worker state.
     pub(crate) fn clone_worker_state(&self) -> WorkerState {
         self.state.clone()
+    }
+
+    /// On SIGTERM, set the worker state to exit.
+    /// Replace the sender with a dummy channel, to drop the sender channel.
+    /// When the channel drops, the inference worker receiver channel also closes.
+    pub(crate) fn set_exit(&mut self) {
+        self.state.set_state(WorkerStatus::Exit);
+        let (tx, _) = channel(1);
+        self.replace_queue(tx);
     }
 }

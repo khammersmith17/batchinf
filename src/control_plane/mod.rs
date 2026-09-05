@@ -4,7 +4,11 @@ use crate::pool::FunnelMessage;
 use crate::predictor::Predictor;
 use crate::state::{WorkerRef, WorkerSnapshot, WorkerState, WorkerStatus};
 use crate::worker::{InferenceWorker, run_worker};
-use std::sync::{Arc, Weak};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::signal::unix::{SignalKind, signal as tokio_sig_handler};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{Duration, sleep};
@@ -29,7 +33,17 @@ async fn supervisor_loop<P: Predictor + Send + Sync + 'static>(control_plane: Co
         obs,
         config,
     } = control_plane;
+    let shutdown_signal = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&shutdown_signal);
+
+    // Spawns SIGTERM handler.
+    tokio::task::spawn(async move { wait_for_sigterm(signal).await });
+
     loop {
+        if shutdown_signal.load(Ordering::Acquire) {
+            break;
+        }
+
         let Some(pool) = pool_weak.upgrade() else {
             return;
         };
@@ -74,6 +88,8 @@ async fn supervisor_loop<P: Predictor + Send + Sync + 'static>(control_plane: Co
 
         sleep(Duration::from_secs(1)).await;
     }
+
+    shutdown_workers(pool_weak).await;
 }
 
 /// Restart a worker that has crashed.
@@ -88,4 +104,53 @@ fn restart_worker<P: Predictor + Send + Sync + 'static>(
     let worker = InferenceWorker::new(state, predictor, obs);
     run_worker(worker, rx);
     tx
+}
+
+async fn wait_for_sigterm(flag: Arc<AtomicBool>) {
+    // If there is an error in the syscall registering the signal handler, then we should exit
+    // right away.
+    let Ok(mut sig) = tokio_sig_handler(SignalKind::terminate()) else {
+        flag.store(true, Ordering::Release);
+        return;
+    };
+    sig.recv().await;
+    flag.store(true, Ordering::Release)
+}
+
+// Set the state of each worker to Exit.
+// Poll the states to ensure they are not overwritten until the reference count of the worker pool
+// is 0.
+async fn shutdown_workers<Input, Output, Error>(
+    pool_weak: Weak<[RwLock<WorkerRef<Input, Output, Error>>]>,
+) where
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+    Error: Send + Sync + 'static,
+{
+    loop {
+        let mut exited = 0_usize;
+        let Some(pool) = pool_weak.upgrade() else {
+            return;
+        };
+
+        let pool_size = pool.len();
+
+        for worker in pool.iter() {
+            let snapshot = { worker.read().await.snapshot() };
+
+            if !matches!(snapshot.status, WorkerStatus::Exit) {
+                let mut handle = worker.write().await;
+                handle.set_exit();
+            } else {
+                exited += 1;
+            }
+        }
+
+        if exited == pool_size {
+            break;
+        }
+
+        // Sleep for half a second inbetween poll loops.
+        sleep(Duration::from_millis(500)).await;
+    }
 }

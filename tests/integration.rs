@@ -122,6 +122,8 @@ impl BatcherMetrics for TestMetrics {
     fn on_request_timeout(&self) {
         self.request_timeouts.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn on_queue_depth(&self, _queue_depth: usize) {}
 }
 
 // --- Helpers ---
@@ -237,7 +239,7 @@ async fn test_error_propagates_to_all_callers_in_batch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_requests_all_complete() {
     let n = 100u64;
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(16, 50, 1), no_obs()));
+    let batcher = Arc::new(get_batcher(EchoPredictor, config(100, 50, 1), no_obs()));
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -253,7 +255,7 @@ async fn test_concurrent_requests_all_complete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multi_worker_correct_results() {
     let n = 64u64;
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(4, 50, 4), no_obs()));
+    let batcher = Arc::new(get_batcher(EchoPredictor, config(16, 50, 4), no_obs()));
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
