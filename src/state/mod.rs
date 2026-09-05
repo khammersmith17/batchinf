@@ -20,9 +20,9 @@ pub enum WorkerStatus {
     Waiting,
     /// The worker has exited and is no longer accepting requests.
     Exit,
-    /// Currently executing [`Predictor::predict_batch`].
+    /// Currently executing [`Predictor::predict_batch`](`crate::Predictor`).
     Running,
-    /// [`Predictor::predict_batch`] panicked. The control plane will restart the worker.
+    /// [`Predictor::predict_batch`](`crate::Predictor`) panicked. The control plane will restart the worker.
     Crashed,
 }
 
@@ -64,7 +64,7 @@ pub(crate) mod worker_states {
 
 /// A point-in-time snapshot of a worker's state.
 ///
-/// Returned by [`Batchinf::pool_status`] and [`Batchinf::worker_status`]. Reflects the state
+/// Returned by [`Batchinf::pool_status`](`crate::Batchinf`) and [`Batchinf::worker_status`](`crate::Batchinf`). Reflects the state
 /// at the moment of the atomic load; the worker may have advanced by the time it is read.
 pub struct WorkerSnapshot {
     /// The worker's current operational status.

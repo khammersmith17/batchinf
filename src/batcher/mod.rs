@@ -9,7 +9,7 @@ use tokio::time::{Duration, sleep};
 
 /// The public handle for submitting inference requests.
 ///
-/// `Batchinf` is cheap to clone — all clones share the same underlying worker pool via [`Arc`].
+/// [`Batchinf`] is cheap to clone — all clones share the same underlying worker pool via [`Arc`].
 /// Each clone can independently submit requests and query worker status.
 ///
 /// Dropping all `Batchinf` clones triggers graceful shutdown: the pool stops accepting new
@@ -45,8 +45,8 @@ where
     ///
     /// # Errors
     ///
-    /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`] returned an error.
-    /// - [`BatchinfError::InvalidPredictorOutput`] — [`Predictor::predict_batch`] returned a different number of outputs than inputs.
+    /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`](`crate::Predictor`) returned an error.
+    /// - [`BatchinfError::InvalidPredictorOutput`] — [`Predictor::predict_batch`](`crate::Predictor`) returned a different number of outputs than inputs.
     /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
     /// - [`BatchinfError::QueueFullError`] — all worker queues are full; the caller should retry or apply backpressure.
     /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed.

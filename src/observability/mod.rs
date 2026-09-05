@@ -13,15 +13,15 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger);
 
     /// Fires after a batch is complete and successful. Clocks how fast the
-    /// [crate::predictor::Predictor::predict_batch] runs on a batch size.
+    /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) runs on a batch size.
     fn on_batch_complete_ok(&self, batch_size: usize, latency: tokio::time::Duration);
 
     /// Fires after a batch is complete and not successful. Clocks how fast the
-    /// [crate::predictor::Predictor::predict_batch] runs on a batch size.
+    /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) runs on a batch size.
     fn on_batch_complete_err(&self, batch_size: usize);
 
     /// Fires when an inference request queued through
-    /// [crate::batcher::Batchinf::predict_with_timeout] times out.
+    /// [`Batchinf::predict_with_timeout`](`crate::batcher::Batchinf::predict_with_timeout`) times out.
     fn on_request_timeout(&self);
 
     /// Fires in a background supervisor control plane and emits the total queue depth, which is
