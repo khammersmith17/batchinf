@@ -46,7 +46,10 @@ where
     /// # Errors
     ///
     /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`] returned an error.
-    /// - [`BatchinfError::InternalError`] — the worker exited before returning a result.
+    /// - [`BatchinfError::InvalidPredictorOutput`] — [`Predictor::predict_batch`] returned a different number of outputs than inputs.
+    /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
+    /// - [`BatchinfError::QueueFullError`] — all worker queues are full; the caller should retry or apply backpressure.
+    /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed.
     pub async fn predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         self.pool.push((input, tx)).await?;
@@ -57,7 +60,8 @@ where
     ///
     /// Equivalent to [`predict`](Batchinf::predict) but returns [`BatchinfError::TimeoutError`]
     /// if `timeout` elapses before the result arrives. The request may still be processed by the
-    /// worker after the timeout — the result is simply discarded.
+    /// worker after the timeout — the result is simply discarded. All errors from [`predict`](Batchinf::predict)
+    /// may also be returned if inference fails before the timeout.
     pub async fn predict_with_timeout(
         &self,
         input: Input,

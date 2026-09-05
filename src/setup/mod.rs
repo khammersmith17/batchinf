@@ -12,7 +12,7 @@ use tokio::sync::mpsc::channel;
 
 /*
 * Implementation:
-*   User implements the Predicter trait on a model type wrapper.
+*   User implements the Predictor trait on a model type wrapper.
 *
 * The model runs in a dedicated tokio task.
 * Inference inputs are buffered in the task, and inference is performed across all examples that
@@ -63,7 +63,7 @@ fn init_worker_ref_pairs<P: Predictor + Send + Sync + 'static>(
 ///
 /// # Parameters
 ///
-/// - `predictor`: The inference backend. Cloned once per pool worker at startup.
+/// - `predictor`: The inference backend. Cloned once per pool worker at startup, plus once into the control plane for crash recovery restarts.
 /// - `config`: Batching and pool configuration. See [`BatcherConfig`].
 /// - `observability`: Optional metrics hook. Pass `None` to disable. See [`observability::BatcherMetrics`].
 pub fn get_batcher<P: Predictor + Send + Sync + 'static>(

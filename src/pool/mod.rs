@@ -131,7 +131,7 @@ where
         }
     }
 
-    /// Query the status of all pools.
+    /// Query the status of all workers in the pool.
     pub(crate) async fn pool_status(&self) -> Vec<WorkerSnapshot> {
         let mut result = Vec::with_capacity(self.size);
 

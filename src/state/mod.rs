@@ -219,7 +219,7 @@ where
 
     /// Swap in a new sender channel.
     ///
-    /// This is called when a crashed worker is crashed, or during SIGTERM handling.
+    /// This is called when a crashed worker is restarted, or during shutdown signal handling.
     pub(crate) fn replace_queue(
         &mut self,
         worker_queue: Sender<FunnelMessage<Input, Output, Error>>,

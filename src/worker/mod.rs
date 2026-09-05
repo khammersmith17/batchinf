@@ -113,6 +113,7 @@ impl<P: Predictor + Send + Sync + 'static> WorkerBuffer<P> {
         std::mem::replace(&mut self.sender_buffer, Vec::with_capacity(cap))
     }
 }
+
 async fn worker_loop<P: Predictor + Send + Sync + 'static>(
     worker: InferenceWorker<P>,
     mut input_receiver: InputReceiver<P>,
@@ -246,9 +247,7 @@ fn time_until_timeout(ts: &Instant) -> Duration {
     let now = Instant::now();
 
     // Calculates the difference or returns Duration::ZERO if 'now' has passed 'deadline'
-    let duration_remaining = ts.saturating_duration_since(now);
-
-    Duration::from_millis(duration_remaining.as_millis() as u64)
+    ts.saturating_duration_since(now)
 }
 
 /// Send the output back out through the oneshot senders.

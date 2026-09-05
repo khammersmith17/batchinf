@@ -127,11 +127,11 @@ async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
     flag.store(true, Ordering::Release);
 }
 
-// On a platform where there are no signals supported, the signal handler effectively spins
-// forever. Graceful shutdown is unsupported in this cases.
+// On platforms where no signal API is available, graceful shutdown via signal is unsupported.
+// The handler suspends indefinitely without consuming CPU.
 #[cfg(not(any(unix, windows)))]
-async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
-    loop {}
+async fn wait_for_shutdown(_flag: Arc<AtomicBool>) {
+    std::future::pending::<()>().await;
 }
 
 // Set the state of each worker to Exit.

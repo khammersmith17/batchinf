@@ -1,5 +1,4 @@
-use batchinf::observability::{BatchTrigger, BatcherMetrics};
-use batchinf::{BatcherConfig, Predictor, WorkerSnapshot, WorkerStatus, get_batcher};
+use batchinf::{BatchTrigger, BatcherMetrics, BatcherConfig, BatchinfError, Predictor, WorkerSnapshot, WorkerStatus, get_batcher};
 use std::num::NonZeroU64;
 use std::sync::{
     Arc,
@@ -109,11 +108,21 @@ impl TestMetrics {
         })
     }
 
-    fn capacity_triggers(&self) -> u32 { self.capacity_triggers.load(Ordering::SeqCst) }
-    fn timeout_triggers(&self) -> u32 { self.timeout_triggers.load(Ordering::SeqCst) }
-    fn ok_completions(&self) -> u32 { self.ok_completions.load(Ordering::SeqCst) }
-    fn err_completions(&self) -> u32 { self.err_completions.load(Ordering::SeqCst) }
-    fn request_timeouts(&self) -> u32 { self.request_timeouts.load(Ordering::SeqCst) }
+    fn capacity_triggers(&self) -> u32 {
+        self.capacity_triggers.load(Ordering::SeqCst)
+    }
+    fn timeout_triggers(&self) -> u32 {
+        self.timeout_triggers.load(Ordering::SeqCst)
+    }
+    fn ok_completions(&self) -> u32 {
+        self.ok_completions.load(Ordering::SeqCst)
+    }
+    fn err_completions(&self) -> u32 {
+        self.err_completions.load(Ordering::SeqCst)
+    }
+    fn request_timeouts(&self) -> u32 {
+        self.request_timeouts.load(Ordering::SeqCst)
+    }
 }
 
 impl BatcherMetrics for TestMetrics {
@@ -192,7 +201,11 @@ async fn test_results_match_inputs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_capacity() {
     let predictor = CountingPredictor::new();
-    let batcher = Arc::new(get_batcher(predictor.clone(), config(4, 10_000, 1), no_obs()));
+    let batcher = Arc::new(get_batcher(
+        predictor.clone(),
+        config(4, 10_000, 1),
+        no_obs(),
+    ));
 
     let start = Instant::now();
     let handles: Vec<_> = (0..4u64)
@@ -207,7 +220,11 @@ async fn test_batch_fires_at_capacity() {
         start.elapsed() < Duration::from_secs(5),
         "batch should have fired at capacity, not waited for 10s timeout"
     );
-    assert_eq!(predictor.call_count(), 1, "exactly one predict_batch call expected");
+    assert_eq!(
+        predictor.call_count(),
+        1,
+        "exactly one predict_batch call expected"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -246,7 +263,10 @@ async fn test_error_propagates_to_all_callers_in_batch() {
         .collect();
 
     let results = join(handles).await;
-    assert!(results.iter().all(|r| r.is_err()), "all callers should receive the error");
+    assert!(
+        results.iter().all(|r| r.is_err()),
+        "all callers should receive the error"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -343,7 +363,11 @@ async fn test_worker_status_out_of_bounds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_capacity_trigger() {
     let metrics = TestMetrics::new();
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(4, 10_000, 1), with_obs(&metrics)));
+    let batcher = Arc::new(get_batcher(
+        EchoPredictor,
+        config(4, 10_000, 1),
+        with_obs(&metrics),
+    ));
 
     let handles: Vec<_> = (0..4u64)
         .map(|i| {
@@ -398,7 +422,6 @@ async fn test_metrics_request_timeout() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invalid_predictor_output_propagates_to_all_callers() {
-    use batchinf::BatchinfError;
     let batcher = Arc::new(get_batcher(MismatchPredictor, config(4, 500, 1), no_obs()));
 
     let handles: Vec<_> = (0..4u64)
