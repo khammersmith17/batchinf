@@ -1,4 +1,5 @@
 use thiserror::Error;
+use tokio::sync::oneshot::error::RecvError;
 
 /// Error returned by [`Batchinf::predict`] and [`Batchinf::predict_with_timeout`].
 #[derive(Debug, Error, Clone)]
@@ -19,8 +20,21 @@ where
     /// result is discarded.
     #[error("Inference request timed out")]
     TimeoutError,
+    /// All workers have exited or crashed and no request could be dispatched.
     #[error("No available workers")]
     NoAvailableWorkersError,
+    /// Every worker's channel is full. The caller should retry or apply backpressure.
     #[error("All worker queues are full")]
     QueueFullError,
+    #[error("Predictor produced an invalid number of outputs for the given input")]
+    InvalidPredictorOutput,
+}
+
+impl<E> From<RecvError> for BatchinfError<E>
+where
+    E: std::error::Error + Clone + Sync + Send + 'static,
+{
+    fn from(_err: RecvError) -> BatchinfError<E> {
+        BatchinfError::InternalError
+    }
 }

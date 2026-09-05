@@ -1,3 +1,4 @@
+use crate::error::BatchinfError;
 use crate::observability::{BatchTrigger, BatcherMetrics, InfBatchMetrics};
 use crate::predictor::Predictor;
 use crate::state::{WorkerState, WorkerStatus};
@@ -8,7 +9,7 @@ use tokio::sync::oneshot::Sender as OneshotSender;
 use tokio::time::{Duration, Instant, sleep};
 
 pub(crate) type OutputSender<P> =
-    OneshotSender<Result<<P as Predictor>::Output, <P as Predictor>::Error>>;
+    OneshotSender<Result<<P as Predictor>::Output, BatchinfError<<P as Predictor>::Error>>>;
 pub(crate) type InputReceiver<P> = Receiver<(<P as Predictor>::Input, OutputSender<P>)>;
 pub(crate) type InferenceResult<P> = Result<Vec<<P as Predictor>::Output>, <P as Predictor>::Error>;
 
@@ -86,13 +87,13 @@ impl<P: Predictor + Send + Sync + 'static> WorkerBuffer<P> {
         self.input_buffer.push(inp);
     }
 
-    // Provides the length of the buffer. The
+    // Returns the number of items in the buffer.
     fn len(&self) -> usize {
         debug_assert_eq!(self.input_buffer.len(), self.sender_buffer.len());
         self.input_buffer.len()
     }
 
-    // Returns if the size is empty.
+    // Returns true if the buffer is empty.
     fn is_empty(&self) -> bool {
         debug_assert_eq!(self.input_buffer.len(), self.sender_buffer.len());
         self.input_buffer.is_empty()
@@ -260,14 +261,27 @@ fn send_output<P: Predictor + Send + Sync + 'static>(
     let batch = match output {
         Ok(b) => b,
         Err(e) => {
-            send_errors(worker, e, senders, metrics);
+            send_errors(worker, BatchinfError::InferenceError(e), senders, metrics);
             return;
         }
     };
 
+    // Ensure that the predictors output buffer matches the number of senders we have.
+    if batch.len() != senders.len() {
+        send_errors(
+            worker,
+            BatchinfError::InvalidPredictorOutput,
+            senders,
+            metrics,
+        );
+        return;
+    }
+
     worker.emit_inference_ok(metrics);
 
     for (res, send) in batch.into_iter().zip(senders.into_iter()) {
+        // Ignoring error here as receiver might have been closed due to timeout.
+        // Which is a valid state.
         let _ = send.send(Ok(res));
     }
 }
@@ -275,13 +289,15 @@ fn send_output<P: Predictor + Send + Sync + 'static>(
 /// If the predict function result is Err, send all waiting the error.
 fn send_errors<P: Predictor + Send + Sync + 'static>(
     worker: &InferenceWorker<P>,
-    error: P::Error,
+    error: BatchinfError<P::Error>,
     senders: Vec<OutputSender<P>>,
     metrics: InfBatchMetrics,
 ) {
     worker.emit_inference_err(metrics.size);
     for sender in senders.into_iter() {
         let e = Err(error.clone());
+        // Ignoring error here as receiver might have been closed due to timeout.
+        // Which is a valid state.
         let _ = sender.send(e);
     }
 }

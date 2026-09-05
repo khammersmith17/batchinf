@@ -8,7 +8,6 @@ use std::sync::{
     Arc, Weak,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::signal::unix::{SignalKind, signal as tokio_sig_handler};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{Duration, sleep};
@@ -36,8 +35,8 @@ async fn supervisor_loop<P: Predictor + Send + Sync + 'static>(control_plane: Co
     let shutdown_signal = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&shutdown_signal);
 
-    // Spawns SIGTERM handler.
-    tokio::task::spawn(async move { wait_for_sigterm(signal).await });
+    // Spawns shutdown signal handler.
+    tokio::task::spawn(async move { wait_for_shutdown(signal).await });
 
     loop {
         if shutdown_signal.load(Ordering::Acquire) {
@@ -106,15 +105,33 @@ fn restart_worker<P: Predictor + Send + Sync + 'static>(
     tx
 }
 
-async fn wait_for_sigterm(flag: Arc<AtomicBool>) {
-    // If there is an error in the syscall registering the signal handler, then we should exit
-    // right away.
-    let Ok(mut sig) = tokio_sig_handler(SignalKind::terminate()) else {
+#[cfg(unix)]
+async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut sig) = signal(SignalKind::terminate()) else {
         flag.store(true, Ordering::Release);
         return;
     };
     sig.recv().await;
-    flag.store(true, Ordering::Release)
+    flag.store(true, Ordering::Release);
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
+    use tokio::signal::windows::ctrl_shutdown;
+    let Ok(mut sig) = ctrl_shutdown() else {
+        flag.store(true, Ordering::Release);
+        return;
+    };
+    sig.recv().await;
+    flag.store(true, Ordering::Release);
+}
+
+// On a platform where there are no signals supported, the signal handler effectively spins
+// forever. Graceful shutdown is unsupported in this cases.
+#[cfg(not(any(unix, windows)))]
+async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
+    loop {}
 }
 
 // Set the state of each worker to Exit.
@@ -125,7 +142,7 @@ async fn shutdown_workers<Input, Output, Error>(
 ) where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     loop {
         let mut exited = 0_usize;

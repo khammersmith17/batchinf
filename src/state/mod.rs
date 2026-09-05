@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
 
-pub(crate) enum QueuePushResult<Input, Output, Error> {
+pub(crate) enum QueuePushResult<Input, Output, Error>
+where
+    Error: std::error::Error + Clone + Send + Sync + 'static,
+{
     Success,
     QueueFull(FunnelMessage<Input, Output, Error>),
     QueueClosed(FunnelMessage<Input, Output, Error>),
@@ -162,7 +165,7 @@ pub(crate) struct WorkerRef<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     state: WorkerState,
     worker_queue: Sender<FunnelMessage<Input, Output, Error>>,
@@ -172,7 +175,7 @@ impl<Input, Output, Error> WorkerRef<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(
         state: WorkerState,

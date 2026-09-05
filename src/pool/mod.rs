@@ -3,15 +3,17 @@ use crate::state::{QueuePushResult, WorkerRef, WorkerSnapshot, WorkerStatus};
 use std::sync::{Arc, Weak};
 use tokio::sync::RwLock;
 
-pub(crate) type FunnelMessage<Input, Output, Error> =
-    (Input, tokio::sync::oneshot::Sender<Result<Output, Error>>);
+pub(crate) type FunnelMessage<Input, Output, Error> = (
+    Input,
+    tokio::sync::oneshot::Sender<Result<Output, BatchinfError<Error>>>,
+);
 
 #[derive(Debug)]
 pub(crate) struct WorkerPool<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     // Arc over a fixed-size slice — pool slots are never added or removed. Crashed workers are
     // restarted in-place by the control plane, which swaps the channel sender within the slot.
@@ -23,7 +25,7 @@ impl<Input, Output, Error> Clone for WorkerPool<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -37,7 +39,7 @@ impl<Input, Output, Error> WorkerPool<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(
         pool: Vec<WorkerRef<Input, Output, Error>>,
@@ -61,10 +63,10 @@ where
     /// exhausted. If a worker that can accept work is not found, then the first observed worker
     /// who is still alive, not [WorkerStatus::Exit] state, is selected as the fallback
     /// destination.
-    pub(crate) async fn push<E: Clone + std::error::Error + Send + Sync + 'static>(
+    pub(crate) async fn push(
         &self,
         mut msg: FunnelMessage<Input, Output, Error>,
-    ) -> Result<(), BatchinfError<E>> {
+    ) -> Result<(), BatchinfError<Error>> {
         // If the pool only has a single worker, then it is just dispatched.
         if self.size == 1 {
             let handle = self.pool[0].read().await;

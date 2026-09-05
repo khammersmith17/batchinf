@@ -1,4 +1,4 @@
-/// Enum to provide obserability callbacks which trigger fired.
+/// Enum describing what triggered a batch to fire.
 #[derive(Debug, Clone, Copy)]
 pub enum BatchTrigger {
     Capacity,

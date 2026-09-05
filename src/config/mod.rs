@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 /// Pool size defines the number of workers that inference requests will be distributed across.
 ///
 /// Inference requests use a load aware round robin algorithm. It is a best effort round robin
-/// implementation to try and distrubte load and not send inference requests to a busy worker if
+/// implementation to try and distribute load and not send inference requests to a busy worker if
 /// possible.
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {

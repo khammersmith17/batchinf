@@ -34,6 +34,19 @@ impl Predictor for EchoPredictor {
 }
 
 #[derive(Clone)]
+struct MismatchPredictor;
+
+impl Predictor for MismatchPredictor {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+        Ok(vec![]) // always returns wrong number of outputs
+    }
+}
+
+#[derive(Clone)]
 struct FailPredictor;
 
 impl Predictor for FailPredictor {
@@ -381,4 +394,25 @@ async fn test_metrics_request_timeout() {
         .await;
 
     assert_eq!(metrics.request_timeouts(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_invalid_predictor_output_propagates_to_all_callers() {
+    use batchinf::BatchinfError;
+    let batcher = Arc::new(get_batcher(MismatchPredictor, config(4, 500, 1), no_obs()));
+
+    let handles: Vec<_> = (0..4u64)
+        .map(|_| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(0).await })
+        })
+        .collect();
+
+    let results = join(handles).await;
+    assert!(
+        results
+            .iter()
+            .all(|r| matches!(r, Err(BatchinfError::InvalidPredictorOutput))),
+        "all callers should receive InvalidPredictorOutput"
+    );
 }

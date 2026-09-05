@@ -4,7 +4,7 @@ use crate::pool::WorkerPool;
 use crate::state::WorkerSnapshot;
 use std::sync::Arc;
 use tokio::select;
-use tokio::sync::oneshot::{Receiver as OneshotReceiver, channel as oneshot_channel};
+use tokio::sync::oneshot::channel as oneshot_channel;
 use tokio::time::{Duration, sleep};
 
 /// The public handle for submitting inference requests.
@@ -19,7 +19,7 @@ pub struct Batchinf<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
-    Error: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     pool: WorkerPool<Input, Output, Error>,
     obs: Option<Arc<dyn BatcherMetrics>>,
@@ -48,9 +48,9 @@ where
     /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`] returned an error.
     /// - [`BatchinfError::InternalError`] — the worker exited before returning a result.
     pub async fn predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
-        let (tx, rx) = oneshot_channel::<Result<Output, Error>>();
+        let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         self.pool.push((input, tx)).await?;
-        handle_recv(rx).await
+        rx.await?
     }
 
     /// Submits an inference request with a caller-side deadline.
@@ -86,21 +86,5 @@ where
         if let Some(ref obs) = self.obs {
             obs.on_request_timeout();
         }
-    }
-}
-
-async fn handle_recv<Output, Error>(
-    rx: OneshotReceiver<Result<Output, Error>>,
-) -> Result<Output, BatchinfError<Error>>
-where
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
-    match rx.await {
-        Ok(result) => match result {
-            Ok(r) => Ok(r),
-            Err(e) => Err(BatchinfError::InferenceError(e)),
-        },
-        Err(_) => Err(BatchinfError::InternalError),
     }
 }

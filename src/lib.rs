@@ -10,6 +10,7 @@ pub(crate) mod state;
 pub(crate) mod worker;
 
 pub use batcher::Batchinf;
+pub use error::BatchinfError;
 pub use config::BatcherConfig;
 pub use predictor::Predictor;
 pub use setup::get_batcher;
