@@ -1,4 +1,7 @@
-use batchinf::{BatchTrigger, BatcherMetrics, BatcherConfig, BatchinfError, Predictor, WorkerSnapshot, WorkerStatus, get_batcher};
+use batchinf::{
+    BatchTrigger, BatcherConfig, BatcherMetrics, BatchinfError, Predictor, WorkerSnapshot,
+    WorkerStatus, get_batcher,
+};
 use std::num::NonZeroU64;
 use std::sync::{
     Arc,
@@ -184,7 +187,7 @@ async fn test_single_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_results_match_inputs() {
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(8, 500, 1), no_obs()));
+    let batcher = get_batcher(EchoPredictor, config(8, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..8u64)
         .map(|i| {
@@ -201,11 +204,7 @@ async fn test_results_match_inputs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_capacity() {
     let predictor = CountingPredictor::new();
-    let batcher = Arc::new(get_batcher(
-        predictor.clone(),
-        config(4, 10_000, 1),
-        no_obs(),
-    ));
+    let batcher = get_batcher(predictor.clone(), config(4, 10_000, 1), no_obs());
 
     let start = Instant::now();
     let handles: Vec<_> = (0..4u64)
@@ -253,7 +252,7 @@ async fn test_error_propagates_to_caller() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_error_propagates_to_all_callers_in_batch() {
-    let batcher = Arc::new(get_batcher(FailPredictor, config(4, 500, 1), no_obs()));
+    let batcher = get_batcher(FailPredictor, config(4, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..4u64)
         .map(|_| {
@@ -272,7 +271,7 @@ async fn test_error_propagates_to_all_callers_in_batch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_requests_all_complete() {
     let n = 100u64;
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(100, 50, 1), no_obs()));
+    let batcher = get_batcher(EchoPredictor, config(100, 50, 1), no_obs());
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -288,7 +287,7 @@ async fn test_concurrent_requests_all_complete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multi_worker_correct_results() {
     let n = 64u64;
-    let batcher = Arc::new(get_batcher(EchoPredictor, config(16, 50, 4), no_obs()));
+    let batcher = get_batcher(EchoPredictor, config(16, 50, 4), no_obs());
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -305,7 +304,7 @@ async fn test_multi_worker_correct_results() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_sequential_batches() {
     let predictor = CountingPredictor::new();
-    let batcher = Arc::new(get_batcher(predictor.clone(), config(4, 500, 1), no_obs()));
+    let batcher = get_batcher(predictor.clone(), config(4, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..4u64)
         .map(|i| {
@@ -363,11 +362,7 @@ async fn test_worker_status_out_of_bounds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_capacity_trigger() {
     let metrics = TestMetrics::new();
-    let batcher = Arc::new(get_batcher(
-        EchoPredictor,
-        config(4, 10_000, 1),
-        with_obs(&metrics),
-    ));
+    let batcher = get_batcher(EchoPredictor, config(4, 10_000, 1), with_obs(&metrics));
 
     let handles: Vec<_> = (0..4u64)
         .map(|i| {
@@ -422,7 +417,7 @@ async fn test_metrics_request_timeout() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invalid_predictor_output_propagates_to_all_callers() {
-    let batcher = Arc::new(get_batcher(MismatchPredictor, config(4, 500, 1), no_obs()));
+    let batcher = get_batcher(MismatchPredictor, config(4, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..4u64)
         .map(|_| {

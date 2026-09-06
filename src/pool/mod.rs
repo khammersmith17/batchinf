@@ -18,7 +18,6 @@ where
     // Arc over a fixed-size slice — pool slots are never added or removed. Crashed workers are
     // restarted in-place by the control plane, which swaps the channel sender within the slot.
     pool: Arc<[RwLock<WorkerRef<Input, Output, Error>>]>,
-    size: usize,
 }
 
 impl<Input, Output, Error> Clone for WorkerPool<Input, Output, Error>
@@ -30,7 +29,6 @@ where
     fn clone(&self) -> Self {
         Self {
             pool: Arc::clone(&self.pool),
-            size: self.size,
         }
     }
 }
@@ -44,13 +42,9 @@ where
     pub(crate) fn new(
         pool: Vec<WorkerRef<Input, Output, Error>>,
     ) -> WorkerPool<Input, Output, Error> {
-        let size = pool.len();
         let pool: Vec<RwLock<WorkerRef<Input, Output, Error>>> =
             pool.into_iter().map(|p| RwLock::new(p)).collect();
-        WorkerPool {
-            pool: pool.into(),
-            size,
-        }
+        WorkerPool { pool: pool.into() }
     }
 
     pub(crate) fn get_weak_ref(&self) -> Weak<[RwLock<WorkerRef<Input, Output, Error>>]> {
@@ -68,7 +62,7 @@ where
         mut msg: FunnelMessage<Input, Output, Error>,
     ) -> Result<(), BatchinfError<Error>> {
         // If the pool only has a single worker, then it is just dispatched.
-        if self.size == 1 {
+        if self.is_single_worker() {
             let handle = self.pool[0].read().await;
             match handle.push(msg) {
                 QueuePushResult::Success => return Ok(()),
@@ -85,9 +79,10 @@ where
         // Fallback is the first non exited worker that we observe when looking for a worker that
         // can accept work.
         let mut fallback: Option<usize> = None;
+        let size = self.pool_size();
 
         // Select the first worker in the waiting state. Exhaust all workers.
-        for _ in 0..self.size {
+        for _ in 0..size {
             let handle = self.pool[sink].read().await;
             let WorkerSnapshot { status, queue_len } = handle.snapshot();
             let capacity = handle.capacity();
@@ -113,7 +108,7 @@ where
                 }
             }
 
-            sink = (sink + 1) % self.size;
+            sink = (sink + 1) % size;
         }
 
         // If not fallback workers where identified, then no workers are available.
@@ -133,9 +128,10 @@ where
 
     /// Query the status of all workers in the pool.
     pub(crate) async fn pool_status(&self) -> Vec<WorkerSnapshot> {
-        let mut result = Vec::with_capacity(self.size);
+        let size = self.pool_size();
+        let mut result = Vec::with_capacity(size);
 
-        for i in 0..self.size {
+        for i in 0..size {
             let handle = self.pool[i].read().await;
             result.push(handle.snapshot());
         }
@@ -144,11 +140,19 @@ where
 
     /// Query the status of a single worker in the pool.
     pub(crate) async fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
-        if idx >= self.size {
+        if idx >= self.pool_size() {
             return None;
         }
         let handle = self.pool[idx].read().await;
         Some(handle.snapshot())
+    }
+
+    fn is_single_worker(&self) -> bool {
+        self.pool_size() == 1_usize
+    }
+
+    fn pool_size(&self) -> usize {
+        self.pool.len()
     }
 
     // Select a random start position in the pool, rather than maintaining a round robin count.
