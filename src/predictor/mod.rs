@@ -16,7 +16,7 @@ pub trait Predictor: Clone {
     /// method as a Vec.
     ///
     /// This trait requires clone, for the case when multiple workers are configured in the pool.
-    /// The type will be cloned n - 1 times to provide each pool with isolated resources to perform
+    /// The type will be cloned n times to provide each pool with isolated resources to perform
     /// inference.
     ///
     /// A panic here is caught by the Tokio task executor. Callers whose requests were in the

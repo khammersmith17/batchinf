@@ -63,6 +63,11 @@ async fn supervisor_loop<P: Predictor + Send + Sync + 'static>(control_plane: Co
             match status {
                 WorkerStatus::Crashed => {
                     let mut handle = pool[i].write().await;
+                    // Ensure the worker has not changed state, should not in practice.
+                    if !matches!(handle.snapshot().status, WorkerStatus::Crashed) {
+                        continue;
+                    }
+
                     let tx = restart_worker(
                         predictor.clone(),
                         handle.clone_worker_state(),
@@ -85,7 +90,7 @@ async fn supervisor_loop<P: Predictor + Send + Sync + 'static>(control_plane: Co
             obs.on_queue_depth(total_queue_depth)
         }
 
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(250)).await;
     }
 
     shutdown_workers(pool_weak).await;

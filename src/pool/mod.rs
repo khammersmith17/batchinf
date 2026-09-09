@@ -111,7 +111,7 @@ where
             sink = (sink + 1) % size;
         }
 
-        // If not fallback workers where identified, then no workers are available.
+        // If no fallback workers were identified, then no workers are available.
         let Some(fallback_sink) = fallback else {
             return Err(BatchinfError::NoAvailableWorkersError);
         };

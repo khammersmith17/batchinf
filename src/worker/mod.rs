@@ -129,7 +129,6 @@ async fn worker_loop<P: Predictor + Send + Sync + 'static>(
     loop {
         accumulate_next_batch(&mut input_receiver, &worker, &mut buffer, &mut next_inf).await;
         match worker.state.get_state() {
-            // No inference data before timeout, restart accumulation phase.
             WorkerStatus::Waiting => unreachable!(
                 "accumulate_next_batch only returns with an empty buffer on timeout, which cannot occur"
             ),
@@ -154,9 +153,7 @@ async fn worker_loop<P: Predictor + Send + Sync + 'static>(
 
 // Accumulate the next batch of inference data.
 // Starts timer for the batch upon receiving the first record for the batch.
-// Rolls up state to perform inference, maintaining state when the buffer is empty.
-//
-// Sets state after accumulation phase, or on exit.
+// Sets state to Running when the batch is ready, or Exit when the channel closes.
 async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
     receiver: &mut InputReceiver<P>,
     worker: &InferenceWorker<P>,

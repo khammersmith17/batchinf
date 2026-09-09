@@ -74,16 +74,16 @@ pub struct WorkerSnapshot {
 }
 
 #[derive(Debug)]
-pub(crate) struct WorkerState_ {
+pub(crate) struct WorkerStateInner {
     // State is stored in the 2 MSB here atomic load/store.
     // The other 62 bits store the queue length.
     state: AtomicU64,
     config: InnerConfig,
 }
 
-impl WorkerState_ {
-    fn new(config: InnerConfig) -> WorkerState_ {
-        WorkerState_ {
+impl WorkerStateInner {
+    fn new(config: InnerConfig) -> WorkerStateInner {
+        WorkerStateInner {
             state: AtomicU64::new(0_u64),
             config,
         }
@@ -92,12 +92,12 @@ impl WorkerState_ {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerState {
-    inner: Arc<WorkerState_>,
+    inner: Arc<WorkerStateInner>,
 }
 
 impl WorkerState {
     pub(crate) fn new(config: InnerConfig) -> WorkerState {
-        let inner = Arc::new(WorkerState_::new(config));
+        let inner = Arc::new(WorkerStateInner::new(config));
 
         WorkerState { inner }
     }
