@@ -113,6 +113,7 @@ impl WorkerState {
     }
 
     pub(crate) fn increment_len(&self) {
+        // Batch size will never overwrite state bits in practice.
         self.inner.state.fetch_add(1_u64, Ordering::Relaxed);
     }
 

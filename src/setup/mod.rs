@@ -86,7 +86,7 @@ pub fn get_batcher<P: Predictor + Send + Sync + 'static>(
     );
     let pool: WorkerPool<P::Input, P::Output, P::Error> = WorkerPool::new(worker_refs);
 
-    for (w, rx) in inf_workers.into_iter() {
+    for (w, rx) in inf_workers {
         run_worker(w, rx);
     }
 
