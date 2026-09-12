@@ -2,7 +2,7 @@ use batchinf::{
     BatchTrigger, BatcherConfig, BatcherMetrics, BatchinfError, Predictor, WorkerSnapshot,
     WorkerStatus, get_batcher,
 };
-use std::num::NonZeroU64;
+use std::num::NonZeroU32;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
@@ -153,11 +153,11 @@ impl BatcherMetrics for TestMetrics {
 
 // --- Helpers ---
 
-fn config(batch_size: u64, timeout_ms: u64, pool_size: u64) -> BatcherConfig {
+fn config(batch_size: u32, timeout_ms: u32, pool_size: u32) -> BatcherConfig {
     BatcherConfig {
-        batch_size: NonZeroU64::new(batch_size).unwrap(),
-        batch_timeout: NonZeroU64::new(timeout_ms).unwrap(),
-        pool_size: NonZeroU64::new(pool_size).unwrap(),
+        batch_size: NonZeroU32::new(batch_size).unwrap(),
+        batch_timeout: NonZeroU32::new(timeout_ms).unwrap(),
+        pool_size: NonZeroU32::new(pool_size).unwrap(),
     }
 }
 
@@ -228,7 +228,7 @@ async fn test_batch_fires_at_capacity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_timeout() {
-    let timeout_ms = 50u64;
+    let timeout_ms = 50u32;
     let batcher = get_batcher(EchoPredictor, config(8, timeout_ms, 1), no_obs());
 
     let start = Instant::now();
@@ -237,7 +237,7 @@ async fn test_batch_fires_at_timeout() {
 
     assert_eq!(result, 99);
     assert!(
-        elapsed >= Duration::from_millis(timeout_ms),
+        elapsed >= Duration::from_millis(u64::from(timeout_ms)),
         "should have waited at least {}ms for timeout, took {:?}",
         timeout_ms,
         elapsed

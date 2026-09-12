@@ -66,11 +66,12 @@ pub(crate) mod worker_states {
 ///
 /// Returned by [`Batchinf::pool_status`](`crate::Batchinf`) and [`Batchinf::worker_status`](`crate::Batchinf`). Reflects the state
 /// at the moment of the atomic load; the worker may have advanced by the time it is read.
+#[derive(Clone, Debug)]
 pub struct WorkerSnapshot {
     /// The worker's current operational status.
     pub status: WorkerStatus,
     /// Number of requests accumulated in the current batch, up to `batch_size`.
-    pub queue_len: u64,
+    pub queue_len: u32,
 }
 
 #[derive(Debug)]
@@ -104,17 +105,16 @@ impl WorkerState {
 }
 
 impl WorkerState {
-    pub(crate) fn capacity(&self) -> u64 {
+    pub(crate) fn capacity(&self) -> u32 {
         self.inner.config.size
     }
 
-    pub(crate) fn timeout(&self) -> u64 {
+    pub(crate) fn timeout(&self) -> u32 {
         self.inner.config.timeout
     }
 
     pub(crate) fn increment_len(&self) {
-        // Batch size will never overwrite state bits in practice.
-        self.inner.state.fetch_add(1_u64, Ordering::Relaxed);
+        self.inner.state.fetch_add(1_u64, Ordering::Release);
     }
 
     pub(crate) fn set_state(&self, state: WorkerStatus) {
@@ -150,7 +150,7 @@ impl WorkerState {
     pub(crate) fn snapshot(&self) -> WorkerSnapshot {
         let state = self.inner.state.load(Ordering::Acquire);
         let status: WorkerStatus = ((state >> 62) as u8).into();
-        let queue_len = state & worker_states::QUEUE_MASK;
+        let queue_len = (state & worker_states::QUEUE_MASK) as u32;
 
         WorkerSnapshot { status, queue_len }
     }
@@ -195,7 +195,7 @@ where
 
     /// Provides the capacity of the worker queue, describing the maximum number of inference
     /// requests that can be queued on the worker.
-    pub(crate) fn capacity(&self) -> u64 {
+    pub(crate) fn capacity(&self) -> u32 {
         self.state.capacity()
     }
 

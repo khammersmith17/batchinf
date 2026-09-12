@@ -8,20 +8,6 @@ timeout is hit, then dispatched together. The crate is backend-agnostic —
 `ort`, `burn`, `candle`, or anything else — via a trait boundary, with a
 worker pool for concurrency and simple least-loaded routing.
 
-## Prior art
-
-- **`batched-fn`** — macro-based, channel-backed (`flume`) queue with
-  `max_batch_size` + `max_delay`. Closest prior art; unmaintained, single-model.
-- **`ort_batcher`** — same pattern, hard-coded to `ort` + `f32` tensors.
-- **`text-embeddings-inference` (TEI)** — production reference architecture.
-  Router → tokenizer → Queue → batch manager → backend (Candle/ORT/Python).
-  Notably batches by **token budget**, not just count/timeout, since request
-  cost is heterogeneous. Worth generalizing as a pluggable flush policy.
-- **`tritonserver-rs`** — wraps Triton's batching scheduler via FFI; different
-  tradeoff (Triton's process model, not in-process pure-Rust).
-- Nothing on crates.io currently unifies `ort`/`burn`/`candle` under one
-  batching abstraction — this is a real gap.
-
 ## Why unifying ort/burn/candle is nontrivial
 
 The three don't share a tensor type or execution model:
@@ -44,27 +30,16 @@ trait Predictor: Send + Sync {
     type Output;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Called once per flushed batch. Implementor receives all queued items
-    /// for this flush and is responsible for fusing them into one backend
-    /// call (e.g. stacking into a single ort::Value / candle::Tensor /
-    /// burn::Tensor) to get the actual GPU-utilization benefit of batching.
-    /// Reads and is implemented like a normal single-request handler —
-    /// the queueing/timeout mechanics are invisible to the implementor.
     fn predict_batch(&self, inputs: Vec<Self::Input>) -> Result<Vec<Self::Output>, Self::Error>;
 }
 ```
 
-Implementors get a `Vec<Input>`, do one fused forward pass, return
-`Vec<Output>` in the same order. Optional helper types (`TensorBuffer`,
-`Batch`, described below) make the concat/split mechanical, but an
-implementor can also hand-roll it directly against `ort`/`candle`/`burn`.
+This trait allows for any arbitray implementation and a no-opinion inference implementation. The crate only provides the plumbing to easily plug this in to something like an `axum` api. Define the input, output, and Error type that could occur and the inference implementation on a batch.
 
-**Rejected alternative:** `predict` operating on one item at a time in a
-loop inside the flush. Keeps the device/thread warm and smooths bursty
-traffic, but loses the fused-matmul throughput win that's the actual point
-of batching for GPU-bound inference — sequential per-item calls underutilize
-the GPU the same way unbatched serving does. Rejected in favor of the
-`Vec<Input> -> Vec<Output>` fused signature above.
+Implementors get a `Vec<Input>`, do one fused forward pass, return
+`Vec<Output>` in the same order. 
+
+The result is all or nothing on the batch. This matches the semantics around a batch inference execution.
 
 ## Optional helper types for building `Input`/`Output`
 

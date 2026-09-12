@@ -26,6 +26,9 @@ where
     /// Every worker's channel is full. The caller should retry or apply backpressure.
     #[error("All worker queues are full")]
     QueueFullError,
+    /// [`Predictor::predict_batch`](`crate::Predictor`) returned a `Vec` whose length does not
+    /// match the number of inputs in the batch. The error is propagated to every caller whose
+    /// request was part of the affected batch.
     #[error("Predictor produced an invalid number of outputs for the given input")]
     InvalidPredictorOutput,
 }

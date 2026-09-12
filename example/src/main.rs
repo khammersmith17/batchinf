@@ -29,7 +29,7 @@ use candle_transformers::models::clip::{ClipConfig, ClipModel};
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use image::{DynamicImage, imageops::FilterType};
 use serde::Serialize;
-use std::{num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc};
 
 const IMAGE_SIZE: usize = 224;
 
@@ -140,9 +140,9 @@ async fn main() -> Result<()> {
     let batcher = get_batcher(
         predictor,
         BatcherConfig {
-            batch_size: NonZeroU64::new(32).unwrap(),
-            batch_timeout: NonZeroU64::new(10).unwrap(),
-            pool_size: NonZeroU64::new(1).unwrap(),
+            batch_size: NonZeroU32::new(32).unwrap(),
+            batch_timeout: NonZeroU32::new(10).unwrap(),
+            pool_size: NonZeroU32::new(1).unwrap(),
         },
         None,
     );

@@ -19,9 +19,10 @@ pub trait Predictor: Clone {
     /// The type will be cloned n times to provide each pool with isolated resources to perform
     /// inference.
     ///
-    /// A panic here is caught by the Tokio task executor. Callers whose requests were in the
-    /// panicking batch will receive [`crate::error::BatchinfError::InternalError`]. To make
-    /// panics visible, install a panic hook via [`std::panic::set_hook`] before starting the
-    /// batcher.
+    /// A panic here crashes the worker task. During unwind, the oneshot senders for all requests
+    /// in the panicking batch are dropped, so callers receive
+    /// [`crate::error::BatchinfError::InternalError`]. The control plane detects the crash and
+    /// restarts the worker. To make panics visible, install a panic hook via
+    /// [`std::panic::set_hook`] before starting the batcher.
     fn predict_batch(&self, inp: &[Self::Input]) -> Result<Vec<Self::Output>, Self::Error>;
 }

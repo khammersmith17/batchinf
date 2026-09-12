@@ -29,7 +29,7 @@
 //!
 //! ```no_run
 //! use batchinf::{BatcherConfig, Predictor, get_batcher};
-//! use std::num::NonZeroU64;
+//! use std::num::NonZeroU32;
 //!
 //! #[derive(Clone)]
 //! struct EchoModel;
@@ -61,9 +61,9 @@
 //!     let batcher = get_batcher(
 //!         EchoModel,
 //!         BatcherConfig {
-//!             batch_size: NonZeroU64::new(32).unwrap(),
-//!             batch_timeout: NonZeroU64::new(10).unwrap(), // 10ms
-//!             pool_size: NonZeroU64::new(1).unwrap(),
+//!             batch_size: NonZeroU32::new(32).unwrap(),
+//!             batch_timeout: NonZeroU32::new(10).unwrap(), // 10ms
+//!             pool_size: NonZeroU32::new(1).unwrap(),
 //!         },
 //!         None,
 //!     );

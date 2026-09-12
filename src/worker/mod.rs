@@ -235,8 +235,8 @@ fn run_inference<P: Predictor + Send + Sync + 'static>(
     )
 }
 
-fn reset_next_inf(ts: &mut Instant, timeout: u64) {
-    *ts = Instant::now() + Duration::from_millis(timeout)
+fn reset_next_inf(ts: &mut Instant, timeout: u32) {
+    *ts = Instant::now() + Duration::from_millis(u64::from(timeout))
 }
 
 /// On each wait for a message from the channel, compute the remaining timeout.
