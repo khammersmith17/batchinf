@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-/// Config that defines the batching semantics. An inference batch will fire at the first occurance
+/// Config that defines the batching semantics. An inference batch will fire at the first occurrence
 /// of either the batch size being reached or the timeout.
 ///
 /// Batch size is defined per worker in the pool. Multiple pool workers may be beneficial when the

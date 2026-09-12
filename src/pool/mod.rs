@@ -55,8 +55,8 @@ where
     ///
     /// Select an initial start point in the pool, and traversing to pool until all workers are
     /// exhausted. If a worker that can accept work is not found, then the first observed worker
-    /// who is still alive, not [WorkerStatus::Exit] state, is selected as the fallback
-    /// destination.
+    /// who is still alive, not in [WorkerStatus::Exit] or [WorkerStatus::Crashed] state, is
+    /// selected as the fallback destination.
     pub(crate) async fn push(
         &self,
         mut msg: FunnelMessage<Input, Output, Error>,
@@ -76,8 +76,8 @@ where
         // Select random place to start in the pool. This position is where we start from.
         let mut sink = self.get_search_start();
 
-        // Fallback is the first non exited worker that we observe when looking for a worker that
-        // can accept work.
+        // Fallback is the first worker not in Exit or Crashed state that we observe when looking
+        // for a worker that can accept work.
         let mut fallback: Option<usize> = None;
         let size = self.pool_size();
 
@@ -116,8 +116,8 @@ where
             return Err(BatchinfError::NoAvailableWorkersError);
         };
 
-        // If we are unable to find an available worker, we dispatch to the first worker we find
-        // that has not/is exited.
+        // If we are unable to find an available worker, we dispatch to the first worker we found
+        // that has not exited or crashed.
         let handle = self.pool[fallback_sink].read().await;
         match handle.push(msg) {
             QueuePushResult::Success => Ok(()),

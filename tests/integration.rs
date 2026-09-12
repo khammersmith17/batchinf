@@ -2,6 +2,7 @@ use batchinf::{
     BatchTrigger, BatcherConfig, BatcherMetrics, BatchinfError, Predictor, WorkerSnapshot,
     WorkerStatus, get_batcher,
 };
+use std::sync::atomic::AtomicBool;
 use std::num::NonZeroU32;
 use std::sync::{
     Arc,
@@ -408,10 +409,14 @@ async fn test_metrics_request_timeout() {
     // Large batch_size and batch_timeout so the worker won't fire on its own.
     let batcher = get_batcher(EchoPredictor, config(8, 10_000, 1), with_obs(&metrics));
 
-    let _ = batcher
+    let result = batcher
         .predict_with_timeout(0, Duration::from_millis(20))
         .await;
 
+    assert!(
+        matches!(result, Err(BatchinfError::TimeoutError)),
+        "expected TimeoutError, got {result:?}"
+    );
     assert_eq!(metrics.request_timeouts(), 1);
 }
 
@@ -433,4 +438,50 @@ async fn test_invalid_predictor_output_propagates_to_all_callers() {
             .all(|r| matches!(r, Err(BatchinfError::InvalidPredictorOutput))),
         "all callers should receive InvalidPredictorOutput"
     );
+}
+
+#[derive(Clone)]
+struct PanicOncePredictor {
+    has_panicked: Arc<AtomicBool>,
+}
+
+impl PanicOncePredictor {
+    fn new() -> Self {
+        Self {
+            has_panicked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Predictor for PanicOncePredictor {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+        if !self.has_panicked.swap(true, Ordering::SeqCst) {
+            panic!("intentional panic for crash recovery test");
+        }
+        Ok(inp.to_vec())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_restarts_after_panic() {
+    let predictor = PanicOncePredictor::new();
+    let batcher = get_batcher(predictor, config(1, 50, 1), no_obs());
+
+    // First request triggers the panic; callers in that batch receive InternalError.
+    let first = batcher.predict(1).await;
+    assert!(
+        matches!(first, Err(BatchinfError::InternalError)),
+        "expected InternalError from panicking batch, got {first:?}"
+    );
+
+    // Allow the control plane time to detect the crash and restart the worker.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Subsequent requests should succeed on the restarted worker.
+    let second = batcher.predict(2).await;
+    assert_eq!(second.unwrap(), 2, "restarted worker should process requests");
 }

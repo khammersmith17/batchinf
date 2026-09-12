@@ -155,7 +155,7 @@ impl WorkerState {
         WorkerSnapshot { status, queue_len }
     }
 
-    // Reseting the queue len to 0 also puts the worker state back to Waiting.
+    // Resetting the queue len to 0 also puts the worker state back to Waiting.
     pub(crate) fn reset_queue_len(&self) {
         self.inner.state.store(0_u64, Ordering::Release);
     }

@@ -49,7 +49,7 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
     }
 
     /*
-     * The following 3 methods emit metrics when an obserability handler with the proper callbacks
+     * The following 3 methods emit metrics when an observability handler with the proper callbacks
      * is defined, otherwise it is a no-op.
      *
      * This could get compiled away, given if there is no observability metrics handler defined,
@@ -282,7 +282,7 @@ fn send_output<P: Predictor + Send + Sync + 'static>(
     }
 }
 
-/// If the predict function result is Err, send all waiting the error.
+/// Send `error` to all callers in the batch.
 fn send_errors<P: Predictor + Send + Sync + 'static>(
     worker: &InferenceWorker<P>,
     error: BatchinfError<P::Error>,

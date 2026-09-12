@@ -7,17 +7,16 @@ pub enum BatchTrigger {
 
 /// This crate provides the contract for emitting observability metrics. Implement the backend.
 pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
-    /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger]
-    ///. This may provide some information that can help tune the batch size and the timeout for a
-    ///batch.
+    /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger].
+    /// This may provide some information that can help tune the batch size and the timeout for a
+    /// batch.
     fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger);
 
     /// Fires after a batch is complete and successful. Clocks how fast the
     /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) runs on a batch size.
     fn on_batch_complete_ok(&self, batch_size: usize, latency: tokio::time::Duration);
 
-    /// Fires after a batch is complete and not successful. Clocks how fast the
-    /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) runs on a batch size.
+    /// Fires after a batch completes with an error.
     fn on_batch_complete_err(&self, batch_size: usize);
 
     /// Fires when an inference request queued through
