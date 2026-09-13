@@ -15,6 +15,9 @@ pub trait Predictor: Clone {
     /// Each inference result is its own result, and all inference results are returned from this
     /// method as a Vec.
     ///
+    /// It is assumed under this contract that the output and input vectors are element wise pairs;
+    /// the order of outputs must match the order of inputs.
+    ///
     /// This trait requires clone, for the case when multiple workers are configured in the pool.
     /// The type will be cloned n times to provide each pool with isolated resources to perform
     /// inference.

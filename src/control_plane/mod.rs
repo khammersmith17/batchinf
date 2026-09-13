@@ -103,11 +103,19 @@ fn restart_worker<P: Predictor + Send + Sync + 'static>(
     obs: Option<Arc<dyn BatcherMetrics>>,
     config: &BatcherConfig,
 ) -> Sender<FunnelMessage<P::Input, P::Output, P::Error>> {
+    emit_worker_panic(obs.clone());
     let (tx, rx) = channel(config.batch_size.get() as usize);
     state.reset_queue_len();
     let worker = InferenceWorker::new(state, predictor, obs);
     run_worker(worker, rx);
     tx
+}
+
+/// Emit worker panicked.
+fn emit_worker_panic(obs: Option<Arc<dyn BatcherMetrics>>) {
+    if let Some(obs) = obs {
+        obs.on_worker_panic()
+    }
 }
 
 #[cfg(unix)]

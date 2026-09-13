@@ -99,6 +99,7 @@ struct TestMetrics {
     ok_completions: AtomicU32,
     err_completions: AtomicU32,
     request_timeouts: AtomicU32,
+    worker_panics: AtomicU32,
 }
 
 impl TestMetrics {
@@ -109,6 +110,7 @@ impl TestMetrics {
             ok_completions: AtomicU32::new(0),
             err_completions: AtomicU32::new(0),
             request_timeouts: AtomicU32::new(0),
+            worker_panics: AtomicU32::new(0),
         })
     }
 
@@ -126,6 +128,9 @@ impl TestMetrics {
     }
     fn request_timeouts(&self) -> u32 {
         self.request_timeouts.load(Ordering::SeqCst)
+    }
+    fn worker_panics(&self) -> u32 {
+        self.worker_panics.load(Ordering::SeqCst)
     }
 }
 
@@ -150,6 +155,10 @@ impl BatcherMetrics for TestMetrics {
     }
 
     fn on_queue_depth(&self, _queue_depth: usize) {}
+
+    fn on_worker_panic(&self) {
+        self.worker_panics.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 // --- Helpers ---
@@ -484,4 +493,19 @@ async fn test_worker_restarts_after_panic() {
     // Subsequent requests should succeed on the restarted worker.
     let second = batcher.predict(2).await;
     assert_eq!(second.unwrap(), 2, "restarted worker should process requests");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_worker_panic() {
+    let metrics = TestMetrics::new();
+    let predictor = PanicOncePredictor::new();
+    let batcher = get_batcher(predictor, config(1, 50, 1), with_obs(&metrics));
+
+    // Trigger the panic.
+    let _ = batcher.predict(1).await;
+
+    // Allow the control plane time to detect the crash and emit on_worker_panic.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(metrics.worker_panics(), 1);
 }

@@ -48,13 +48,9 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
         }
     }
 
-    /*
-     * The following 3 methods emit metrics when an observability handler with the proper callbacks
-     * is defined, otherwise it is a no-op.
-     *
-     * This could get compiled away, given if there is no observability metrics handler defined,
-     * then it can be statically proven all these methods are no-ops.
-     * */
+    // The emit methods below are no-ops when obs is None. Option<Arc<dyn BatcherMetrics>> uses
+    // the null pointer optimisation, so the None check is a single null pointer comparison.
+    // The only overhead when obs is Some is the virtual dispatch through the fat pointer.
     fn emit_batch_start(&self, trigger_type: BatchTrigger, size: usize) {
         if let Some(ref obs) = self.obs {
             obs.on_batch_trigger(size, trigger_type)
@@ -140,6 +136,7 @@ async fn worker_loop<P: Predictor + Send + Sync + 'static>(
                 worker.state.reset_queue_len();
             }
             WorkerStatus::Exit => {
+                // On exit, run inference on the remaining batch then begin to clean up.
                 run_inference(&worker, &mut buffer);
                 // Inference worker exits.
                 break;
@@ -166,6 +163,7 @@ async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
         worker.state.increment_len();
         reset_next_inf(next_inf, worker.state.timeout());
     } else {
+        // None indicates the channel is closed. In this case set the state to exit.
         worker.state.set_state(WorkerStatus::Exit);
         return;
     }
@@ -221,6 +219,10 @@ fn run_inference<P: Predictor + Send + Sync + 'static>(
     let size = buffer.len();
 
     let start = Instant::now();
+
+    // `spawn_blocking` would be nice here, but not worth the additional allocation to pass an
+    // owned input buffer.
+    // This requires the multi thread runtime, reasonable trade off.
     let inf_results =
         tokio::task::block_in_place(|| worker.predictor.predict_batch(&buffer.input()));
 
@@ -276,8 +278,8 @@ fn send_output<P: Predictor + Send + Sync + 'static>(
     worker.emit_inference_ok(metrics);
 
     for (res, send) in batch.into_iter().zip(senders.into_iter()) {
-        // Ignoring error here as receiver might have been closed due to timeout.
-        // Which is a valid state.
+        // Ignoring error here as receiver might have been closed due to timeout,
+        // which is a valid state.
         let _ = send.send(Ok(res));
     }
 }
@@ -292,8 +294,8 @@ fn send_errors<P: Predictor + Send + Sync + 'static>(
     worker.emit_inference_err(metrics.size);
     for sender in senders.into_iter() {
         let e = Err(error.clone());
-        // Ignoring error here as receiver might have been closed due to timeout.
-        // Which is a valid state.
+        // Ignoring error here as receiver might have been closed due to timeout,
+        // which is a valid state.
         let _ = sender.send(e);
     }
 }

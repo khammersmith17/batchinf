@@ -26,6 +26,9 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Fires in a background supervisor control plane and emits the total queue depth, which is
     /// the total number of inference requests waiting to be serviced.
     fn on_queue_depth(&self, queue_depth: usize);
+
+    /// Fires when a worker panics and is restarted by the control plane.
+    fn on_worker_panic(&self);
 }
 
 pub(crate) struct InfBatchMetrics {
