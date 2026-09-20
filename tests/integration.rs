@@ -2,8 +2,8 @@ use batchinf::{
     BatchTrigger, BatcherConfig, BatcherMetrics, BatchinfError, Predictor, WorkerSnapshot,
     WorkerStatus, get_batcher,
 };
-use std::sync::atomic::AtomicBool;
 use std::num::NonZeroU32;
+use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
@@ -100,6 +100,8 @@ struct TestMetrics {
     err_completions: AtomicU32,
     request_timeouts: AtomicU32,
     worker_panics: AtomicU32,
+    last_trigger_size: AtomicU32,
+    queue_depth_calls: AtomicU32,
 }
 
 impl TestMetrics {
@@ -111,6 +113,8 @@ impl TestMetrics {
             err_completions: AtomicU32::new(0),
             request_timeouts: AtomicU32::new(0),
             worker_panics: AtomicU32::new(0),
+            last_trigger_size: AtomicU32::new(0),
+            queue_depth_calls: AtomicU32::new(0),
         })
     }
 
@@ -132,10 +136,18 @@ impl TestMetrics {
     fn worker_panics(&self) -> u32 {
         self.worker_panics.load(Ordering::SeqCst)
     }
+    fn last_trigger_size(&self) -> u32 {
+        self.last_trigger_size.load(Ordering::SeqCst)
+    }
+    fn queue_depth_calls(&self) -> u32 {
+        self.queue_depth_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl BatcherMetrics for TestMetrics {
-    fn on_batch_trigger(&self, _batch_size: usize, trigger: BatchTrigger) {
+    fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger) {
+        self.last_trigger_size
+            .store(batch_size as u32, Ordering::SeqCst);
         match trigger {
             BatchTrigger::Capacity => self.capacity_triggers.fetch_add(1, Ordering::SeqCst),
             BatchTrigger::Timeout => self.timeout_triggers.fetch_add(1, Ordering::SeqCst),
@@ -154,7 +166,9 @@ impl BatcherMetrics for TestMetrics {
         self.request_timeouts.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn on_queue_depth(&self, _queue_depth: usize) {}
+    fn on_queue_depth(&self, _queue_depth: usize) {
+        self.queue_depth_calls.fetch_add(1, Ordering::SeqCst);
+    }
 
     fn on_worker_panic(&self) {
         self.worker_panics.fetch_add(1, Ordering::SeqCst);
@@ -492,7 +506,24 @@ async fn test_worker_restarts_after_panic() {
 
     // Subsequent requests should succeed on the restarted worker.
     let second = batcher.predict(2).await;
-    assert_eq!(second.unwrap(), 2, "restarted worker should process requests");
+    assert_eq!(
+        second.unwrap(),
+        2,
+        "restarted worker should process requests"
+    );
+}
+
+#[derive(Clone)]
+struct AlwaysPanicPredictor;
+
+impl Predictor for AlwaysPanicPredictor {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+        panic!("intentional panic");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -508,4 +539,130 @@ async fn test_metrics_worker_panic() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert_eq!(metrics.worker_panics(), 1);
+}
+
+// --- predict_with_timeout success path ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_predict_with_timeout_succeeds() {
+    let batcher = get_batcher(EchoPredictor, config(1, 50, 1), no_obs());
+    let result = batcher
+        .predict_with_timeout(42, Duration::from_millis(500))
+        .await;
+    assert_eq!(result.unwrap(), 42);
+}
+
+// --- Timed-out request does not stall subsequent requests ---
+
+// When a caller times out, its oneshot sender remains in the worker's batch buffer. The worker
+// should continue accumulating and processing normally. Once the batch fires (here via capacity),
+// the timed-out slot is silently skipped and the remaining callers receive their results.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_timed_out_request_does_not_block_subsequent() {
+    // Large timeout so the batch only fires at capacity, not by time.
+    let batcher = get_batcher(EchoPredictor, config(8, 10_000, 1), no_obs());
+
+    // Queue one request and let it time out. Its input stays in the worker buffer.
+    let timed_out = batcher
+        .predict_with_timeout(0, Duration::from_millis(20))
+        .await;
+    assert!(matches!(timed_out, Err(BatchinfError::TimeoutError)));
+
+    // Fill the remaining 7 slots to trigger capacity. These should all succeed.
+    let handles: Vec<_> = (1..8u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await })
+        })
+        .collect();
+    let results = join(handles).await;
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "subsequent requests should succeed after a timed-out slot in the batch"
+    );
+}
+
+// --- Multi-worker: one crashes, others keep serving ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_worker_one_panic_others_serve() {
+    // 4-worker pool; predictor panics exactly once.
+    let predictor = PanicOncePredictor::new();
+    let batcher = get_batcher(predictor, config(1, 50, 4), no_obs());
+
+    let handles: Vec<_> = (0..8u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await })
+        })
+        .collect();
+    let results = join(handles).await;
+
+    // At most two requests may fail: the panicking batch plus one more that races into the
+    // now-empty channel before state is set to Crashed. On a crash, in-flight requests on that
+    // worker are not guaranteed to succeed; the recovery guarantee is that the worker restarts.
+    let failures = results.iter().filter(|r| r.is_err()).count();
+    assert!(
+        failures <= 2,
+        "at most two requests should fail; got {failures} failures"
+    );
+}
+
+// --- Batch size reported correctly in metrics ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_batch_trigger_size() {
+    let metrics = TestMetrics::new();
+    let batcher = get_batcher(EchoPredictor, config(4, 10_000, 1), with_obs(&metrics));
+
+    let handles: Vec<_> = (0..4u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await.unwrap() })
+        })
+        .collect();
+    join(handles).await;
+
+    assert_eq!(metrics.capacity_triggers(), 1);
+    assert_eq!(
+        metrics.last_trigger_size(),
+        4,
+        "on_batch_trigger should report the correct batch size"
+    );
+}
+
+// --- on_queue_depth is emitted ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_queue_depth_emitted() {
+    let metrics = TestMetrics::new();
+    let batcher = get_batcher(EchoPredictor, config(8, 500, 1), with_obs(&metrics));
+
+    // Keep the batcher alive past one control plane poll cycle (250ms).
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    drop(batcher);
+
+    assert!(
+        metrics.queue_depth_calls() >= 1,
+        "on_queue_depth should fire at least once per control plane poll cycle"
+    );
+}
+
+// --- NoAvailableWorkersError when all workers are crashed ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_no_available_workers_error() {
+    // Single worker that always panics → crashes immediately.
+    let batcher = get_batcher(AlwaysPanicPredictor, config(1, 50, 1), no_obs());
+
+    // Crash the worker.
+    let _ = batcher.predict(0).await;
+
+    // The worker is now Crashed. Before the control plane restarts it (250ms poll),
+    // pushes should return NoAvailableWorkersError.
+    let result = batcher.predict(1).await;
+    assert!(
+        matches!(result, Err(BatchinfError::NoAvailableWorkersError)),
+        "expected NoAvailableWorkersError while worker is crashed, got {result:?}"
+    );
 }
