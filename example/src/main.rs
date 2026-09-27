@@ -1,17 +1,9 @@
 //! Image embedding service using CLIP ViT-B/32 and batchinf.
 //!
-//! Accepts raw image bytes at `POST /embed` and returns a 512-dimensional
-//! embedding vector. Requests are accumulated and dispatched as a batch to
-//! the model, improving throughput under concurrent load.
+//! This example illustrates wiring a model and [axum] service for usage of [batchinf].
 //!
-//! # Usage
-//!
-//! ```bash
-//! cargo run --release
-//! curl -X POST http://localhost:3000/embed \
-//!     --data-binary @image.jpg \
-//!     -H "Content-Type: application/octet-stream"
-//! ```
+//! Implement [batchinf::Predictor] on the model struct, and wire [batchinf::Batchinf] into axum
+//! state to reference in request handlers.
 
 use anyhow::{Context, Result};
 use axum::{
@@ -29,7 +21,11 @@ use candle_transformers::models::clip::{ClipConfig, ClipModel};
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use image::{DynamicImage, imageops::FilterType};
 use serde::Serialize;
-use std::{num::NonZeroU32, sync::Arc};
+use std::{
+    num::{NonZeroU8, NonZeroU32},
+    sync::Arc,
+    time::Duration,
+};
 
 const IMAGE_SIZE: usize = 224;
 
@@ -43,6 +39,7 @@ struct ClipPredictor {
     device: Device,
 }
 
+/// Define Error that returns when [Predictor::predict_batch] errors.
 #[derive(Debug, Clone)]
 struct EmbedError(String);
 
@@ -76,8 +73,6 @@ impl Predictor for ClipPredictor {
     }
 }
 
-// Resize to 224×224, convert to RGB, scale to [0, 1], and apply CLIP normalisation.
-// Returns a CHW-ordered flat Vec<f32>.
 fn preprocess(img: DynamicImage) -> Vec<f32> {
     let img = img
         .resize_exact(IMAGE_SIZE as u32, IMAGE_SIZE as u32, FilterType::Lanczos3)
@@ -137,18 +132,20 @@ async fn main() -> Result<()> {
         device,
     };
 
+    // Configure batcher before service start up.
     let batcher = get_batcher(
         predictor,
         BatcherConfig {
             batch_size: NonZeroU32::new(32).unwrap(),
-            batch_timeout: NonZeroU32::new(10).unwrap(),
-            pool_size: NonZeroU32::new(1).unwrap(),
+            batch_timeout: Duration::from_millis(10),
+            pool_size: NonZeroU8::new(1).unwrap(),
         },
         None,
     );
 
     let app = Router::new()
         .route("/embed", post(embed))
+        // Wire the batcher into axum state.
         .with_state(batcher);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
