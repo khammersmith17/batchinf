@@ -29,7 +29,8 @@
 //!
 //! ```no_run
 //! use batchinf::{BatcherConfig, Predictor, get_batcher};
-//! use std::num::NonZeroU32;
+//! use std::num::{NonZeroU8, NonZeroU32};
+//! use std::time::Duration;
 //!
 //! #[derive(Clone)]
 //! struct EchoModel;
@@ -62,8 +63,8 @@
 //!         EchoModel,
 //!         BatcherConfig {
 //!             batch_size: NonZeroU32::new(32).unwrap(),
-//!             batch_timeout: NonZeroU32::new(10).unwrap(), // 10ms
-//!             pool_size: NonZeroU32::new(1).unwrap(),
+//!             batch_timeout: Duration::from_millis(10),
+//!             pool_size: NonZeroU8::new(1).unwrap(),
 //!         },
 //!         None,
 //!     );

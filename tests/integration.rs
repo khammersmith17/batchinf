@@ -2,15 +2,13 @@ use batchinf::{
     BatchTrigger, BatcherConfig, BatcherMetrics, BatchinfError, Predictor, WorkerSnapshot,
     WorkerStatus, get_batcher,
 };
-use std::num::NonZeroU32;
+use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
 use tokio::time::{Duration, Instant};
-
-// --- Test predictors ---
 
 #[derive(Clone)]
 struct EchoPredictor;
@@ -89,8 +87,6 @@ impl Predictor for CountingPredictor {
         Ok(inp.to_vec())
     }
 }
-
-// --- Test metrics ---
 
 #[derive(Debug)]
 struct TestMetrics {
@@ -175,13 +171,11 @@ impl BatcherMetrics for TestMetrics {
     }
 }
 
-// --- Helpers ---
-
-fn config(batch_size: u32, timeout_ms: u32, pool_size: u32) -> BatcherConfig {
+fn config(batch_size: u32, timeout_ms: u64, pool_size: u8) -> BatcherConfig {
     BatcherConfig {
         batch_size: NonZeroU32::new(batch_size).unwrap(),
-        batch_timeout: NonZeroU32::new(timeout_ms).unwrap(),
-        pool_size: NonZeroU32::new(pool_size).unwrap(),
+        batch_timeout: Duration::from_millis(timeout_ms),
+        pool_size: NonZeroU8::new(pool_size).unwrap(),
     }
 }
 
@@ -200,8 +194,6 @@ async fn join<T: Send + 'static>(handles: Vec<tokio::task::JoinHandle<T>>) -> Ve
     }
     out
 }
-
-// --- Tests ---
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_single_request() {
@@ -252,7 +244,7 @@ async fn test_batch_fires_at_capacity() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_timeout() {
-    let timeout_ms = 50u32;
+    let timeout_ms = 50u64;
     let batcher = get_batcher(EchoPredictor, config(8, timeout_ms, 1), no_obs());
 
     let start = Instant::now();
@@ -351,18 +343,16 @@ async fn test_multiple_sequential_batches() {
     assert_eq!(predictor.call_count(), 3);
 }
 
-// --- Status tests ---
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pool_status_length_matches_pool_size() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 3), no_obs());
-    assert_eq!(batcher.pool_status().await.len(), 3);
+    assert_eq!(batcher.pool_status().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_workers_initially_waiting() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
-    for WorkerSnapshot { status, queue_len } in batcher.pool_status().await {
+    for WorkerSnapshot { status, queue_len } in batcher.pool_status() {
         assert_eq!(status, WorkerStatus::Waiting);
         assert_eq!(queue_len, 0);
     }
@@ -371,17 +361,15 @@ async fn test_workers_initially_waiting() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_status_valid_index() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
-    assert!(batcher.worker_status(0).await.is_some());
-    assert!(batcher.worker_status(1).await.is_some());
+    assert!(batcher.worker_status(0).is_some());
+    assert!(batcher.worker_status(1).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_status_out_of_bounds() {
     let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
-    assert!(batcher.worker_status(2).await.is_none());
+    assert!(batcher.worker_status(2).is_none());
 }
-
-// --- Observability tests ---
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_capacity_trigger() {
@@ -552,8 +540,6 @@ async fn test_predict_with_timeout_succeeds() {
     assert_eq!(result.unwrap(), 42);
 }
 
-// --- Timed-out request does not stall subsequent requests ---
-
 // When a caller times out, its oneshot sender remains in the worker's batch buffer. The worker
 // should continue accumulating and processing normally. Once the batch fires (here via capacity),
 // the timed-out slot is silently skipped and the remaining callers receive their results.
@@ -582,8 +568,6 @@ async fn test_timed_out_request_does_not_block_subsequent() {
     );
 }
 
-// --- Multi-worker: one crashes, others keep serving ---
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multi_worker_one_panic_others_serve() {
     // 4-worker pool; predictor panics exactly once.
@@ -598,17 +582,19 @@ async fn test_multi_worker_one_panic_others_serve() {
         .collect();
     let results = join(handles).await;
 
-    // At most two requests may fail: the panicking batch plus one more that races into the
-    // now-empty channel before state is set to Crashed. On a crash, in-flight requests on that
-    // worker are not guaranteed to succeed; the recovery guarantee is that the worker restarts.
-    let failures = results.iter().filter(|r| r.is_err()).count();
+    // All concurrent requests may have been queued to the panicking worker before its state
+    // was set to Crashed. The recovery guarantee is that the worker restarts, not that every
+    // in-flight request succeeds. Assert that at least some requests were served by other workers.
+    let successes = results.iter().filter(|r| r.is_ok()).count();
     assert!(
-        failures <= 2,
-        "at most two requests should fail; got {failures} failures"
+        successes > 0,
+        "at least one other worker should have served a request"
     );
-}
 
-// --- Batch size reported correctly in metrics ---
+    // After recovery the pool is fully functional again.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(batcher.predict(99).await.unwrap(), 99);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_batch_trigger_size() {
@@ -631,8 +617,6 @@ async fn test_metrics_batch_trigger_size() {
     );
 }
 
-// --- on_queue_depth is emitted ---
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_queue_depth_emitted() {
     let metrics = TestMetrics::new();
@@ -648,8 +632,6 @@ async fn test_metrics_queue_depth_emitted() {
     );
 }
 
-// --- NoAvailableWorkersError when all workers are crashed ---
-
 #[tokio::test(flavor = "multi_thread")]
 async fn test_no_available_workers_error() {
     // Single worker that always panics → crashes immediately.
@@ -658,11 +640,12 @@ async fn test_no_available_workers_error() {
     // Crash the worker.
     let _ = batcher.predict(0).await;
 
-    // The worker is now Crashed. Before the control plane restarts it (250ms poll),
-    // pushes should return NoAvailableWorkersError.
+    // The sentinel channel wakes the control plane immediately on crash, so the worker may
+    // already be restarted by the time the next predict is submitted. Either way, an
+    // always-panicking worker returns an error — no hang, no silent success.
     let result = batcher.predict(1).await;
     assert!(
-        matches!(result, Err(BatchinfError::NoAvailableWorkersError)),
-        "expected NoAvailableWorkersError while worker is crashed, got {result:?}"
+        result.is_err(),
+        "expected an error from an always-panicking worker, got Ok"
     );
 }

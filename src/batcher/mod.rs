@@ -52,7 +52,7 @@ where
     /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed.
     pub async fn predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
-        self.pool.push((input, tx)).await?;
+        self.pool.push((input, tx))?;
         rx.await?
     }
 
@@ -77,13 +77,13 @@ where
     }
 
     /// Returns a snapshot of every worker in the pool, indexed by worker position.
-    pub async fn pool_status(&self) -> Vec<WorkerSnapshot> {
-        self.pool.pool_status().await
+    pub fn pool_status(&self) -> Vec<WorkerSnapshot> {
+        self.pool.pool_status()
     }
 
     /// Returns a snapshot of the worker at `idx`, or `None` if out of bounds.
-    pub async fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
-        self.pool.worker_status(idx).await
+    pub fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
+        self.pool.worker_status(idx)
     }
 
     fn emit_timeout(&self) {

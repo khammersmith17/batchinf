@@ -13,31 +13,50 @@ pub(crate) type OutputSender<P> =
 pub(crate) type InputReceiver<P> = Receiver<(<P as Predictor>::Input, OutputSender<P>)>;
 pub(crate) type InferenceResult<P> = Result<Vec<<P as Predictor>::Output>, <P as Predictor>::Error>;
 
-/// When the user defined [Predictor::predict_batch] panics, the worker is marked as crashed
-/// by setting its state to [WorkerStatus::Crashed].
+/// On crash, drain the receiver to capture inference requests that were queued while a worker was
+/// running inferece.
 ///
-/// The state is only set when a thread is panicking. The control plane detects the crashed state
-/// and restarts the worker.
-struct InferencePanicGuard(WorkerState);
-
-impl Drop for InferencePanicGuard {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            let state = &self.0;
-            state.set_state(WorkerStatus::Crashed)
-        }
+/// This batch of inference requests was not in the group that lead to a panic, thus they are not
+/// thrown away on the panic.
+fn drain_receiver<P: Predictor + Send + Sync + 'static>(
+    recv: &mut InputReceiver<P>,
+) -> Vec<(P::Input, OutputSender<P>)> {
+    let mut orphaned = Vec::new();
+    while let Ok(inp) = recv.try_recv() {
+        orphaned.push(inp);
     }
+    orphaned
 }
 
+/// Handle the worker state on crash.
+/// Drain messages currently buffered during inference + signal crash to the control plane.
+fn handle_worker_panic<P: Predictor + Send + Sync + 'static>(
+    state: &WorkerState<P::Input, P::Output, P::Error>,
+    recv: &mut InputReceiver<P>,
+) {
+    // Block writers from queueing a crashed worker during restart.
+    // Blocking writers ensures that new messages are not missed when the queue is drained.
+    state.set_state(WorkerStatus::Crashed);
+
+    // Drain requests that were queued since worker was dispatched for inference.
+    let orphaned = drain_receiver::<P>(recv);
+    state.queue_orphaned_messages(orphaned);
+
+    // Wake the control loop.
+    state.signal_crash();
+}
+
+/// Type that holds state required to orchestrate and perform inference.
 pub(crate) struct InferenceWorker<P: Predictor + Send + Sync + 'static> {
-    state: WorkerState,
+    state: WorkerState<P::Input, P::Output, P::Error>,
     predictor: P,
     obs: Option<Arc<dyn BatcherMetrics>>,
 }
 
+/// Core behavior of the inference worker.
 impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
     pub(crate) fn new(
-        state: WorkerState,
+        state: WorkerState<P::Input, P::Output, P::Error>,
         predictor: P,
         obs: Option<Arc<dyn BatcherMetrics>>,
     ) -> InferenceWorker<P> {
@@ -57,6 +76,7 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
         }
     }
 
+    // Emit a succesful inference.
     fn emit_inference_ok(&self, metrics: InfBatchMetrics) {
         if let Some(ref obs) = self.obs {
             let InfBatchMetrics { size, latency } = metrics;
@@ -64,23 +84,31 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
         }
     }
 
+    // Emit and unsuccesful inference.
     fn emit_inference_err(&self, size: usize) {
         if let Some(ref obs) = self.obs {
             obs.on_batch_complete_err(size)
         }
     }
+
+    // Reset the inference timeout clock.
+    fn reset_next_inf(&self, ts: &mut Instant) {
+        *ts = Instant::now() + self.state.timeout();
+    }
 }
 
+/// Buffer for inference input and the senders.
+///
+/// Inference requests and sender to hand back are element wise pairs.
 struct WorkerBuffer<P: Predictor + Send + Sync + 'static> {
     sender_buffer: Vec<OutputSender<P>>,
     input_buffer: Vec<P::Input>,
 }
 
 impl<P: Predictor + Send + Sync + 'static> WorkerBuffer<P> {
-    fn push(&mut self, data: (P::Input, OutputSender<P>)) {
-        let (inp, send) = data;
-        self.sender_buffer.push(send);
-        self.input_buffer.push(inp);
+    fn push(&mut self, request: P::Input, sender: OutputSender<P>) {
+        self.sender_buffer.push(sender);
+        self.input_buffer.push(request);
     }
 
     // Returns the number of items in the buffer.
@@ -110,6 +138,12 @@ impl<P: Predictor + Send + Sync + 'static> WorkerBuffer<P> {
     }
 }
 
+// The main worker loop.
+//
+// Accumulate inference examples from request writers until batch conditions are satisfied,
+// then dispatch inference.
+//
+// After inference, the state is evaluated to determine if the worker should continue.
 async fn worker_loop<P: Predictor + Send + Sync + 'static>(
     worker: InferenceWorker<P>,
     mut input_receiver: InputReceiver<P>,
@@ -125,22 +159,18 @@ async fn worker_loop<P: Predictor + Send + Sync + 'static>(
     loop {
         accumulate_next_batch(&mut input_receiver, &worker, &mut buffer, &mut next_inf).await;
         match worker.state.get_state() {
-            WorkerStatus::Waiting => unreachable!(
-                "accumulate_next_batch only returns with an empty buffer on timeout, which cannot occur"
-            ),
+            WorkerStatus::Waiting => unreachable!(),
             WorkerStatus::Running => {
-                run_inference(&worker, &mut buffer);
-                // Reset the worker queue size and set to Waiting State.
-                // Setting the queue len to 0, also sets the state bits to 0b00, which is
-                // `WorkerStatus::Waiting`
+                run_inference(&worker, &mut buffer, &mut input_receiver);
                 worker.state.reset_queue_len();
             }
             WorkerStatus::Exit => {
-                // On exit, run inference on the remaining batch then begin to clean up.
-                run_inference(&worker, &mut buffer);
-                // Inference worker exits.
+                run_inference(&worker, &mut buffer, &mut input_receiver);
                 break;
             }
+            // Crashed state is handled in the inference handler.
+            // When a worker panics, the panic is resumed after saving state and signaling the
+            // control plane.
             WorkerStatus::Crashed => {
                 unreachable!("Worker observed its own crashed state")
             }
@@ -148,9 +178,9 @@ async fn worker_loop<P: Predictor + Send + Sync + 'static>(
     }
 }
 
-// Accumulate the next batch of inference data.
-// Starts timer for the batch upon receiving the first record for the batch.
-// Sets state to Running when the batch is ready, or Exit when the channel closes.
+/// Accumulate the next batch of inference data.
+/// Starts timer for the batch upon receiving the first record for the batch.
+/// Sets state to Running when the batch is ready, or Exit when the channel closes.
 async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
     receiver: &mut InputReceiver<P>,
     worker: &InferenceWorker<P>,
@@ -158,10 +188,10 @@ async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
     next_inf: &mut Instant,
 ) {
     // Wait for first item in batch to start batch timer.
-    if let Some(payload) = receiver.recv().await {
-        buffer.push(payload);
+    if let Some((request, sender)) = receiver.recv().await {
+        buffer.push(request, sender);
         worker.state.increment_len();
-        reset_next_inf(next_inf, worker.state.timeout());
+        worker.reset_next_inf(next_inf);
     } else {
         // None indicates the channel is closed. In this case set the state to exit.
         worker.state.set_state(WorkerStatus::Exit);
@@ -172,11 +202,12 @@ async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
         let timeout = time_until_timeout(next_inf);
         select! {
             user_input = receiver.recv() => {
-                if let Some(payload) = user_input {
-                    buffer.push(payload);
+                if let Some((request, sender)) = user_input {
+                    buffer.push(request, sender);
 
                     worker.state.increment_len();
                     if buffer.len() == (worker.state.capacity() as usize){
+                        // Set state and emit trigger.
                         worker.state.set_state(WorkerStatus::Running);
                         worker.emit_batch_start(BatchTrigger::Capacity, buffer.len());
                         break;
@@ -205,40 +236,58 @@ async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
     }
 }
 
-/// Perform inference on a batch by calling the user defined batch inference method.
+/// Inference runner.
+/// Runs inference with buffered input and handle when the user implemented inference function
+/// crashes.
 fn run_inference<P: Predictor + Send + Sync + 'static>(
     worker: &InferenceWorker<P>,
     buffer: &mut WorkerBuffer<P>,
+    recv: &mut InputReceiver<P>,
 ) {
     if buffer.is_empty() {
         return;
+    }
+
+    // Capture panic signal to handle crash and restart.
+    let panic_signal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        predict(&worker.predictor, buffer.input())
+    }));
+
+    // Inspect the result and handle panic in the case the user defined prediction method panicked.
+    let (metrics, inf_results) = match panic_signal {
+        Ok((m, ir)) => (m, ir),
+        Err(panic) => {
+            handle_worker_panic::<P>(&worker.state, recv);
+            // Resume panic after crash is handled to kill the task.
+            std::panic::resume_unwind(panic);
+        }
     };
 
-    // Register the panic guard, to safely remove the worker on panic.
-    let _guard = InferencePanicGuard(worker.state.clone());
-    let size = buffer.len();
+    let senders = buffer.clear_and_take_senders();
+    send_output(&worker, inf_results, senders, metrics);
+}
 
+/// Perform inference on a batch by calling the user defined batch inference method.
+///
+/// Captures inference latency and batch size for metric emission.
+fn predict<P: Predictor + Send + Sync + 'static>(
+    predictor: &P,
+    input: &[P::Input],
+) -> (InfBatchMetrics, Result<Vec<P::Output>, P::Error>) {
     let start = Instant::now();
 
     // `spawn_blocking` would be nice here, but not worth the additional allocation to pass an
     // owned input buffer.
     // This requires the multi thread runtime, reasonable trade off.
-    let inf_results =
-        tokio::task::block_in_place(|| worker.predictor.predict_batch(&buffer.input()));
+    let inf_results = tokio::task::block_in_place(|| predictor.predict_batch(input));
 
     let latency = Instant::now().duration_since(start);
+    let metrics = InfBatchMetrics {
+        size: input.len(),
+        latency,
+    };
 
-    let senders = buffer.clear_and_take_senders();
-    send_output(
-        worker,
-        inf_results,
-        senders,
-        InfBatchMetrics { size, latency },
-    )
-}
-
-fn reset_next_inf(ts: &mut Instant, timeout: u32) {
-    *ts = Instant::now() + Duration::from_millis(u64::from(timeout))
+    (metrics, inf_results)
 }
 
 /// On each wait for a message from the channel, compute the remaining timeout.
@@ -256,24 +305,26 @@ fn send_output<P: Predictor + Send + Sync + 'static>(
     senders: Vec<OutputSender<P>>,
     metrics: InfBatchMetrics,
 ) {
+    // When user defined predict errors, dispatch to error handler.
     let batch = match output {
+        // Ensure that the predictors output buffer matches the number of senders we have.
+        // This is a user error, so the user defined error is overriden.
+        Ok(b) if b.len() != senders.len() => {
+            send_errors(
+                worker,
+                BatchinfError::InvalidPredictorOutput,
+                senders,
+                metrics,
+            );
+            return;
+        }
         Ok(b) => b,
+        // User defined error, so P::Error is propogated forward.
         Err(e) => {
             send_errors(worker, BatchinfError::InferenceError(e), senders, metrics);
             return;
         }
     };
-
-    // Ensure that the predictors output buffer matches the number of senders we have.
-    if batch.len() != senders.len() {
-        send_errors(
-            worker,
-            BatchinfError::InvalidPredictorOutput,
-            senders,
-            metrics,
-        );
-        return;
-    }
 
     worker.emit_inference_ok(metrics);
 
@@ -300,6 +351,7 @@ fn send_errors<P: Predictor + Send + Sync + 'static>(
     }
 }
 
+/// Entry point to worker lifecycle.
 pub(crate) fn run_worker<P: Predictor + Send + Sync + 'static>(
     worker: InferenceWorker<P>,
     receiver: InputReceiver<P>,

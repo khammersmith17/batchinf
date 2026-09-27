@@ -1,7 +1,6 @@
 use crate::error::BatchinfError;
 use crate::state::{QueuePushResult, WorkerRef, WorkerSnapshot, WorkerStatus};
 use std::sync::{Arc, Weak};
-use tokio::sync::RwLock;
 
 pub(crate) type FunnelMessage<Input, Output, Error> = (
     Input,
@@ -17,7 +16,7 @@ where
 {
     // Arc over a fixed-size slice — pool slots are never added or removed. Crashed workers are
     // restarted in-place by the control plane, which swaps the channel sender within the slot.
-    pool: Arc<[RwLock<WorkerRef<Input, Output, Error>>]>,
+    pool: Arc<[WorkerRef<Input, Output, Error>]>,
 }
 
 impl<Input, Output, Error> Clone for WorkerPool<Input, Output, Error>
@@ -42,28 +41,28 @@ where
     pub(crate) fn new(
         pool: Vec<WorkerRef<Input, Output, Error>>,
     ) -> WorkerPool<Input, Output, Error> {
-        let pool: Vec<RwLock<WorkerRef<Input, Output, Error>>> =
-            pool.into_iter().map(|p| RwLock::new(p)).collect();
         WorkerPool { pool: pool.into() }
     }
 
-    pub(crate) fn get_weak_ref(&self) -> Weak<[RwLock<WorkerRef<Input, Output, Error>>]> {
+    pub(crate) fn get_weak_ref(&self) -> Weak<[WorkerRef<Input, Output, Error>]> {
         Arc::downgrade(&self.pool)
     }
 
-    /// Use a load aware round robin starting at a random index.
+    /// Use a load aware uniform random routing.  
+    ///
+    /// TODO: Should this actually be round robin?
     ///
     /// Select an initial start point in the pool, and traversing to pool until all workers are
     /// exhausted. If a worker that can accept work is not found, then the first observed worker
     /// who is still alive, not in [WorkerStatus::Exit] or [WorkerStatus::Crashed] state, is
     /// selected as the fallback destination.
-    pub(crate) async fn push(
+    pub(crate) fn push(
         &self,
         mut msg: FunnelMessage<Input, Output, Error>,
     ) -> Result<(), BatchinfError<Error>> {
         // If the pool only has a single worker, then it is just dispatched.
         if self.is_single_worker() {
-            let handle = self.pool[0].read().await;
+            let handle = &self.pool[0];
             match handle.push(msg) {
                 QueuePushResult::Success => return Ok(()),
                 QueuePushResult::QueueFull(_) => return Err(BatchinfError::QueueFullError),
@@ -83,7 +82,7 @@ where
 
         // Select the first worker in the waiting state. Exhaust all workers.
         for _ in 0..size {
-            let handle = self.pool[sink].read().await;
+            let handle = &self.pool[sink];
             let WorkerSnapshot { status, queue_len } = handle.snapshot();
             let capacity = handle.capacity();
             match status {
@@ -118,7 +117,7 @@ where
 
         // If we are unable to find an available worker, we dispatch to the first worker we found
         // that has not exited or crashed.
-        let handle = self.pool[fallback_sink].read().await;
+        let handle = &self.pool[fallback_sink];
         match handle.push(msg) {
             QueuePushResult::Success => Ok(()),
             QueuePushResult::QueueFull(_) => Err(BatchinfError::QueueFullError),
@@ -127,24 +126,22 @@ where
     }
 
     /// Query the status of all workers in the pool.
-    pub(crate) async fn pool_status(&self) -> Vec<WorkerSnapshot> {
+    pub(crate) fn pool_status(&self) -> Vec<WorkerSnapshot> {
         let size = self.pool_size();
         let mut result = Vec::with_capacity(size);
 
         for i in 0..size {
-            let handle = self.pool[i].read().await;
-            result.push(handle.snapshot());
+            result.push(self.pool[i].snapshot());
         }
         result
     }
 
     /// Query the status of a single worker in the pool.
-    pub(crate) async fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
+    pub(crate) fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
         if idx >= self.pool_size() {
             return None;
         }
-        let handle = self.pool[idx].read().await;
-        Some(handle.snapshot())
+        Some(self.pool[idx].snapshot())
     }
 
     fn is_single_worker(&self) -> bool {

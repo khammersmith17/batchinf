@@ -25,7 +25,7 @@ use tokio::sync::mpsc::channel;
 
 fn init_worker_ref_pairs<P: Predictor + Send + Sync + 'static>(
     predictor: P,
-    state: &[WorkerState],
+    state: &[WorkerState<P::Input, P::Output, P::Error>],
     channel_size: usize,
     obs: Option<Arc<dyn observability::BatcherMetrics>>,
 ) -> (
@@ -75,8 +75,14 @@ pub fn get_batcher<P: Predictor + Send + Sync + 'static>(
     let pool_size = config.pool_size.get();
 
     let conf: InnerConfig = config.clone().into();
+    let (panic_tx, panic_rx) = channel::<u8>(usize::from(pool_size));
 
-    let workers: Vec<WorkerState> = (0..pool_size).map(|_| WorkerState::new(conf)).collect();
+    let workers: Vec<WorkerState<P::Input, P::Output, P::Error>> = (0..pool_size)
+        .map(|id| {
+            let tx = panic_tx.clone();
+            WorkerState::new(conf, tx, id)
+        })
+        .collect();
 
     let (inf_workers, worker_refs) = init_worker_ref_pairs(
         predictor.clone(),
@@ -95,6 +101,7 @@ pub fn get_batcher<P: Predictor + Send + Sync + 'static>(
         pool_weak: pool.get_weak_ref(),
         obs: observability.clone(),
         config,
+        panic_rx,
     };
 
     run_control_plane(control_plane);

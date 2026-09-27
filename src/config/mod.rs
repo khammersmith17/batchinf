@@ -1,4 +1,5 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU8, NonZeroU32};
+use std::time::Duration;
 
 /// Config that defines the batching semantics. An inference batch will fire at the first occurrence
 /// of either the batch size being reached or the timeout.
@@ -13,17 +14,17 @@ use std::num::NonZeroU32;
 /// possible.
 #[derive(Debug, Clone)]
 pub struct BatcherConfig {
-    /// Timeout defined in milliseconds.
-    pub batch_timeout: NonZeroU32,
+    /// Duration to wait before firing a batch that has not reached `batch_size`.
+    pub batch_timeout: Duration,
     /// Batch size per inference run.
     pub batch_size: NonZeroU32,
     /// The number of workers defined in the pool.
-    pub pool_size: NonZeroU32,
+    pub pool_size: NonZeroU8,
 }
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct InnerConfig {
-    pub(crate) timeout: u32,
+    pub(crate) timeout: Duration,
     pub(crate) size: u32,
 }
 
@@ -35,7 +36,7 @@ impl From<BatcherConfig> for InnerConfig {
             ..
         } = conf;
         InnerConfig {
-            timeout: timeout.into(),
+            timeout,
             size: size.into(),
         }
     }
