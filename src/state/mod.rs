@@ -9,6 +9,11 @@ use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
 
 type WorkerDlQueue<Input, Output, Error> = Mutex<VecDeque<FunnelMessage<Input, Output, Error>>>;
 
+const QUEUE_MASK: u64 = !(0b11_u64 << 62);
+// Worker crashed is the highest state that should be observed.
+#[cfg(debug_assertions)]
+const MAX_WORKER_STATE_VALUE: u8 = 3_u8;
+
 pub(crate) enum QueuePushResult<Input, Output, Error>
 where
     Error: std::error::Error + Clone + Send + Sync + 'static,
@@ -18,61 +23,38 @@ where
     QueueClosed(FunnelMessage<Input, Output, Error>),
 }
 
+// These mappings allow for the state and queue size to be stored in a single atomic.
+// The 2 most significant bits store the status. Remaining 62 bits store the queue len.
+// [state bits] [remaining 62 bits]
+// These u8 values are never stored.
+
 /// The operational state of an inference worker.
 #[derive(Debug, Clone, PartialEq)]
 #[repr(u8)]
 pub enum WorkerStatus {
     /// Accumulating requests into the next batch.
-    Waiting,
+    Waiting = 0,
     /// The worker has exited and is no longer accepting requests.
-    Exit,
+    Exit = 1,
     /// Currently executing [`Predictor::predict_batch`](`crate::Predictor`).
-    Running,
+    Running = 2,
     /// [`Predictor::predict_batch`](`crate::Predictor`) panicked. The control plane will restart the worker.
-    Crashed,
+    Crashed = 3,
 }
 
 /// Map the concrete enum variant to enum integer.
 impl From<WorkerStatus> for u8 {
     fn from(state: WorkerStatus) -> u8 {
-        match state {
-            WorkerStatus::Waiting => worker_states::WAITING,
-            WorkerStatus::Exit => worker_states::EXIT,
-            WorkerStatus::Running => worker_states::RUNNING_INFERENCE,
-            WorkerStatus::Crashed => worker_states::CRASHED,
-        }
+        unsafe { std::mem::transmute(state) }
     }
 }
 
 /// Map the enum integer to concrete enum variat.
 impl From<u8> for WorkerStatus {
     fn from(state: u8) -> WorkerStatus {
-        match state {
-            worker_states::WAITING => Self::Waiting,
-            worker_states::EXIT => Self::Exit,
-            worker_states::RUNNING_INFERENCE => Self::Running,
-            worker_states::CRASHED => Self::Crashed,
-            _ => unreachable!("Invalid state value"),
-        }
+        debug_assert!(state <= MAX_WORKER_STATE_VALUE);
+        unsafe { std::mem::transmute(state) }
     }
-}
-
-// Mappings out u8 key and enum variant.
-// These mappings allow for the state and queue size to be stored in a single atomic.
-// The 2 most significant bits store the state.
-// [state bits] [remaining 62 bits]
-// These u8 values are never stored.
-mod worker_states {
-    // 0b00
-    pub(super) const WAITING: u8 = 0_u8;
-    // 0b01
-    pub(super) const EXIT: u8 = 1_u8;
-    // 0b10
-    pub(super) const RUNNING_INFERENCE: u8 = 2_u8;
-    // 0b11
-    pub(super) const CRASHED: u8 = 3_u8;
-    // Mask the state bits to get the queue len.
-    pub(super) const QUEUE_MASK: u64 = !(0b11_u64 << 62);
 }
 
 /// A point-in-time snapshot of a worker's state.
@@ -206,7 +188,7 @@ where
     }
 
     pub(crate) fn increment_len(&self) {
-        // Stricter ordering given shared access and moving parts.
+        // Stricter ordering given moving parts.
         self.inner.state.fetch_add(1_u64, Ordering::Release);
     }
 
@@ -218,9 +200,9 @@ where
         // So we need a CAS loop.
         let mut current = self.inner.state.load(Ordering::Relaxed);
 
-        // CAS loop given that the atomic has multiple state attributes.
+        // Update the state bits using a CAS loop.
         loop {
-            let new = (current & worker_states::QUEUE_MASK) | state;
+            let new = (current & QUEUE_MASK) | state;
             match self.inner.state.compare_exchange_weak(
                 current,
                 new,
@@ -235,6 +217,7 @@ where
 
     pub(crate) fn get_state(&self) -> WorkerStatus {
         let state_key = self.inner.state.load(Ordering::Acquire);
+        // Ignore length bits to evaluate state.
         ((state_key >> 62) as u8).into()
     }
 
@@ -244,7 +227,7 @@ where
     pub(crate) fn snapshot(&self) -> WorkerSnapshot {
         let state = self.inner.state.load(Ordering::Acquire);
         let status: WorkerStatus = ((state >> 62) as u8).into();
-        let queue_len = (state & worker_states::QUEUE_MASK) as u32;
+        let queue_len = (state & QUEUE_MASK) as u32;
 
         WorkerSnapshot { status, queue_len }
     }
@@ -358,5 +341,59 @@ where
         self.state.set_state(WorkerStatus::Exit);
         let (tx, _) = channel(1);
         self.replace_queue(tx);
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::WorkerStatus;
+    // 0b00
+    const WAITING: u8 = 0_u8;
+    // 0b01
+    const EXIT: u8 = 1_u8;
+    // 0b10
+    const RUNNING_INFERENCE: u8 = 2_u8;
+    // 0b11
+    const CRASHED: u8 = 3_u8;
+    // Mask the state bits to get the queue len.
+
+    #[test]
+    fn waiting_status_from_u8() {
+        assert_eq!(WorkerStatus::from(WAITING), WorkerStatus::Waiting)
+    }
+
+    #[test]
+    fn exit_status_from_u8() {
+        assert_eq!(WorkerStatus::from(EXIT), WorkerStatus::Exit)
+    }
+
+    #[test]
+    fn running_status_from_u8() {
+        assert_eq!(WorkerStatus::from(RUNNING_INFERENCE), WorkerStatus::Running)
+    }
+
+    #[test]
+    fn crashed_status_from_u8() {
+        assert_eq!(WorkerStatus::from(CRASHED), WorkerStatus::Crashed)
+    }
+
+    #[test]
+    fn waiting_status_to_u8() {
+        assert_eq!(u8::from(WorkerStatus::Waiting), WAITING)
+    }
+
+    #[test]
+    fn exit_status_to_u8() {
+        assert_eq!(u8::from(WorkerStatus::Exit), EXIT)
+    }
+
+    #[test]
+    fn running_status_to_u8() {
+        assert_eq!(u8::from(WorkerStatus::Running), RUNNING_INFERENCE)
+    }
+
+    #[test]
+    fn crashed_status_to_u8() {
+        assert_eq!(u8::from(WorkerStatus::Crashed), CRASHED)
     }
 }
