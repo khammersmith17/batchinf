@@ -7,6 +7,7 @@ use std::{
 };
 use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
 
+/// Exclusive access around the DL Queue buffer to recover orphaned requests on worker crash.
 type WorkerDlQueue<Input, Output, Error> = Mutex<VecDeque<FunnelMessage<Input, Output, Error>>>;
 
 const QUEUE_MASK: u64 = !(0b11_u64 << 62);
@@ -70,7 +71,6 @@ pub struct WorkerSnapshot {
 }
 
 /// Struct to store inner worker state.
-///
 /// State that will be shared and wrapped in Arc<T>.
 #[derive(Debug)]
 struct WorkerStateInner<Input, Output, Error>
@@ -344,6 +344,7 @@ where
     }
 }
 
+/// Test that repr(u8) on [WorkerStatus] maintains correct behavior.
 #[cfg(test)]
 mod state_tests {
     use super::WorkerStatus;
