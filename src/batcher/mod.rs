@@ -1,11 +1,12 @@
-use crate::error::BatchinfError;
-use crate::observability::BatcherMetrics;
-use crate::pool::WorkerPool;
-use crate::state::WorkerSnapshot;
+use crate::{
+    error::BatchinfError, observability::BatcherMetrics, pool::WorkerPool, state::WorkerSnapshot,
+};
 use std::sync::Arc;
-use tokio::select;
-use tokio::sync::oneshot::channel as oneshot_channel;
-use tokio::time::{Duration, sleep};
+use tokio::{
+    select,
+    sync::oneshot::channel as oneshot_channel,
+    time::{Duration, sleep},
+};
 
 /// The public handle for submitting inference requests.
 ///

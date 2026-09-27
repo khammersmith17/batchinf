@@ -1,6 +1,11 @@
-use crate::error::BatchinfError;
-use crate::state::{QueuePushResult, WorkerRef, WorkerSnapshot, WorkerStatus};
-use std::sync::{Arc, Weak};
+use crate::{
+    error::BatchinfError,
+    state::{QueuePushResult, WorkerRef, WorkerSnapshot, WorkerStatus},
+};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicUsize, Ordering},
+};
 
 pub(crate) type FunnelMessage<Input, Output, Error> = (
     Input,
@@ -17,6 +22,8 @@ where
     // Arc over a fixed-size slice — pool slots are never added or removed. Crashed workers are
     // restarted in-place by the control plane, which swaps the channel sender within the slot.
     pool: Arc<[WorkerRef<Input, Output, Error>]>,
+    size: u8,
+    start: Arc<AtomicUsize>,
 }
 
 impl<Input, Output, Error> Clone for WorkerPool<Input, Output, Error>
@@ -26,8 +33,12 @@ where
     Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
+        let pool = Arc::clone(&self.pool);
+        let start = Arc::clone(&self.start);
         Self {
-            pool: Arc::clone(&self.pool),
+            pool,
+            size: self.size,
+            start,
         }
     }
 }
@@ -41,7 +52,13 @@ where
     pub(crate) fn new(
         pool: Vec<WorkerRef<Input, Output, Error>>,
     ) -> WorkerPool<Input, Output, Error> {
-        WorkerPool { pool: pool.into() }
+        let size = pool.len() as u8;
+        let start = AtomicUsize::new(0_usize);
+        WorkerPool {
+            pool: pool.into(),
+            size,
+            start: start.into(),
+        }
     }
 
     pub(crate) fn get_weak_ref(&self) -> Weak<[WorkerRef<Input, Output, Error>]> {
@@ -49,8 +66,6 @@ where
     }
 
     /// Use a load aware uniform random routing.  
-    ///
-    /// TODO: Should this actually be round robin?
     ///
     /// Select an initial start point in the pool, and traversing to pool until all workers are
     /// exhausted. If a worker that can accept work is not found, then the first observed worker
@@ -72,8 +87,8 @@ where
             }
         }
 
-        // Select random place to start in the pool. This position is where we start from.
-        let mut sink = self.get_search_start();
+        // First try uses global round robin.
+        let mut sink = self.get_and_increment();
 
         // Fallback is the first worker not in Exit or Crashed state that we observe when looking
         // for a worker that can accept work.
@@ -92,7 +107,11 @@ where
                 // update state.
                 WorkerStatus::Waiting if queue_len < capacity => match handle.push(msg) {
                     QueuePushResult::Success => return Ok(()),
+                    // When the queue is closed due to either a worker crash or exit, messages get
+                    // handed back and retried.
                     QueuePushResult::QueueClosed(m) => msg = m,
+                    // The resolved queue is full. Hand back message and set fallback sink.
+                    // The first live worker is set to be the fallback sink.
                     QueuePushResult::QueueFull(m) => {
                         msg = m;
                         if fallback.is_none() {
@@ -107,7 +126,9 @@ where
                 }
             }
 
-            sink = (sink + 1) % size;
+            // Subsequent attempts to resolve worker is thread local walk the worker search space
+            // linearly.
+            sink = (sink + 1) % usize::from(self.size);
         }
 
         // If no fallback workers were identified, then no workers are available.
@@ -120,6 +141,7 @@ where
         let handle = &self.pool[fallback_sink];
         match handle.push(msg) {
             QueuePushResult::Success => Ok(()),
+            // If the resolved sink cannot accept the request, error to user code.
             QueuePushResult::QueueFull(_) => Err(BatchinfError::QueueFullError),
             QueuePushResult::QueueClosed(_) => Err(BatchinfError::NoAvailableWorkersError),
         }
@@ -152,8 +174,11 @@ where
         self.pool.len()
     }
 
-    // Select a random start position in the pool, rather than maintaining a round robin count.
-    fn get_search_start(&self) -> usize {
-        fastrand::usize(..self.pool.len())
+    /// Get thread start position for worker resolution.
+    ///
+    /// Search space start is round robin amoong threads.
+    #[inline]
+    fn get_and_increment(&self) -> usize {
+        self.start.fetch_add(1, Ordering::AcqRel) % usize::from(self.size)
     }
 }

@@ -1,12 +1,15 @@
-use crate::error::BatchinfError;
-use crate::observability::{BatchTrigger, BatcherMetrics, InfBatchMetrics};
-use crate::predictor::Predictor;
-use crate::state::{WorkerState, WorkerStatus};
+use crate::{
+    error::BatchinfError,
+    observability::{BatchTrigger, BatcherMetrics, InfBatchMetrics},
+    predictor::Predictor,
+    state::{WorkerState, WorkerStatus},
+};
 use std::sync::Arc;
-use tokio::select;
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot::Sender as OneshotSender;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::{
+    select,
+    sync::{mpsc::Receiver, oneshot::Sender as OneshotSender},
+    time::{Duration, Instant, sleep},
+};
 
 pub(crate) type OutputSender<P> =
     OneshotSender<Result<<P as Predictor>::Output, BatchinfError<<P as Predictor>::Error>>>;

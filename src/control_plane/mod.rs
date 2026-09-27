@@ -1,16 +1,20 @@
-use crate::config::BatcherConfig;
-use crate::observability::BatcherMetrics;
-use crate::pool::FunnelMessage;
-use crate::predictor::Predictor;
-use crate::state::{WorkerRef, WorkerSnapshot, WorkerState, WorkerStatus};
-use crate::worker::{InferenceWorker, run_worker};
+use crate::{
+    config::BatcherConfig,
+    observability::BatcherMetrics,
+    pool::FunnelMessage,
+    predictor::Predictor,
+    state::{WorkerRef, WorkerSnapshot, WorkerState, WorkerStatus},
+    worker::{InferenceWorker, run_worker},
+};
 use std::sync::{
     Arc, Weak,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::select;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::time::{Duration, sleep};
+use tokio::{
+    select,
+    sync::mpsc::{Receiver, Sender, channel},
+    time::{Duration, sleep},
+};
 
 pub(crate) struct ControlPlane<P: Predictor + Send + Sync + 'static> {
     pub(crate) predictor: P,

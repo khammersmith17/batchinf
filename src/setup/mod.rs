@@ -1,12 +1,14 @@
-use crate::batcher::Batchinf;
-use crate::config::BatcherConfig;
-use crate::config::InnerConfig;
-use crate::control_plane::{ControlPlane, run_control_plane};
-use crate::observability;
-use crate::pool::{FunnelMessage, WorkerPool};
-use crate::predictor::Predictor;
-use crate::state::{WorkerRef, WorkerState};
-use crate::worker::{InferenceWorker, InputReceiver, run_worker};
+use crate::{
+    batcher::Batchinf,
+    config::BatcherConfig,
+    config::InnerConfig,
+    control_plane::{ControlPlane, run_control_plane},
+    observability,
+    pool::{FunnelMessage, WorkerPool},
+    predictor::Predictor,
+    state::{WorkerRef, WorkerState},
+    worker::{InferenceWorker, InputReceiver, run_worker},
+};
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
 

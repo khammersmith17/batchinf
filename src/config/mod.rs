@@ -1,5 +1,7 @@
-use std::num::{NonZeroU8, NonZeroU32};
-use std::time::Duration;
+use std::{
+    num::{NonZeroU8, NonZeroU32},
+    time::Duration,
+};
 
 /// Config that defines the batching semantics. An inference batch will fire at the first occurrence
 /// of either the batch size being reached or the timeout.

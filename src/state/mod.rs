@@ -1,9 +1,10 @@
-use crate::config::InnerConfig;
-use crate::pool::FunnelMessage;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use crate::{config::InnerConfig, pool::FunnelMessage};
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
 
 type WorkerDlQueue<Input, Output, Error> = Mutex<VecDeque<FunnelMessage<Input, Output, Error>>>;
@@ -19,6 +20,7 @@ where
 
 /// The operational state of an inference worker.
 #[derive(Debug, Clone, PartialEq)]
+#[repr(u8)]
 pub enum WorkerStatus {
     /// Accumulating requests into the next batch.
     Waiting,
@@ -30,6 +32,7 @@ pub enum WorkerStatus {
     Crashed,
 }
 
+/// Map the concrete enum variant to enum integer.
 impl From<WorkerStatus> for u8 {
     fn from(state: WorkerStatus) -> u8 {
         match state {
@@ -41,6 +44,7 @@ impl From<WorkerStatus> for u8 {
     }
 }
 
+/// Map the enum integer to concrete enum variat.
 impl From<u8> for WorkerStatus {
     fn from(state: u8) -> WorkerStatus {
         match state {
@@ -58,17 +62,17 @@ impl From<u8> for WorkerStatus {
 // The 2 most significant bits store the state.
 // [state bits] [remaining 62 bits]
 // These u8 values are never stored.
-pub(crate) mod worker_states {
+mod worker_states {
     // 0b00
-    pub(crate) const WAITING: u8 = 0_u8;
+    pub(super) const WAITING: u8 = 0_u8;
     // 0b01
-    pub(crate) const EXIT: u8 = 1_u8;
+    pub(super) const EXIT: u8 = 1_u8;
     // 0b10
-    pub(crate) const RUNNING_INFERENCE: u8 = 2_u8;
+    pub(super) const RUNNING_INFERENCE: u8 = 2_u8;
     // 0b11
-    pub(crate) const CRASHED: u8 = 3_u8;
+    pub(super) const CRASHED: u8 = 3_u8;
     // Mask the state bits to get the queue len.
-    pub(crate) const QUEUE_MASK: u64 = !(0b11_u64 << 62);
+    pub(super) const QUEUE_MASK: u64 = !(0b11_u64 << 62);
 }
 
 /// A point-in-time snapshot of a worker's state.
@@ -83,8 +87,11 @@ pub struct WorkerSnapshot {
     pub queue_len: u32,
 }
 
+/// Struct to store inner worker state.
+///
+/// State that will be shared and wrapped in Arc<T>.
 #[derive(Debug)]
-pub(crate) struct WorkerStateInner<Input, Output, Error>
+struct WorkerStateInner<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
     Output: Send + Sync + 'static,
@@ -92,10 +99,14 @@ where
 {
     // State is stored in the 2 MSB here atomic load/store.
     // The other 62 bits store the queue length.
+    // Fused into a single atomic given both attributes may need to be updated in a single store.
     state: AtomicU64,
     config: InnerConfig,
+    // Collection to handle orphaned requests on crash.
     dl_queue: WorkerDlQueue<Input, Output, Error>,
+    // Tx to signal crash to control loop with `worker_id`.
     panic_tx: Sender<u8>,
+    // ID for random access in control plane during crash handling.
     worker_id: u8,
 }
 
@@ -147,6 +158,7 @@ where
     }
 }
 
+/// Crate public wrapper type for [WorkerStateInner].
 #[derive(Debug)]
 pub(crate) struct WorkerState<Input, Output, Error>
 where
@@ -194,6 +206,7 @@ where
     }
 
     pub(crate) fn increment_len(&self) {
+        // Stricter ordering given shared access and moving parts.
         self.inner.state.fetch_add(1_u64, Ordering::Release);
     }
 
@@ -205,6 +218,7 @@ where
         // So we need a CAS loop.
         let mut current = self.inner.state.load(Ordering::Relaxed);
 
+        // CAS loop given that the atomic has multiple state attributes.
         loop {
             let new = (current & worker_states::QUEUE_MASK) | state;
             match self.inner.state.compare_exchange_weak(
@@ -266,7 +280,7 @@ where
     Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     state: WorkerState<Input, Output, Error>,
-    // This type is already wrapped in Arc, no need to the extra indirection.
+    // This type is already wrapped in Arc, no need for the extra indirection.
     worker_queue: Mutex<Sender<FunnelMessage<Input, Output, Error>>>,
 }
 
@@ -309,10 +323,8 @@ where
         }
 
         // Only hold the lock to clone the tx pointer.
-        let queue_handle = {
-            let handle = self.worker_queue.lock().unwrap();
-            handle.clone()
-        };
+        let queue_handle = self.acquire_queue_handle();
+
         match queue_handle.try_send(msg) {
             Ok(_) => QueuePushResult::Success,
             Err(TrySendError::Full(m)) => QueuePushResult::QueueFull(m),
@@ -320,12 +332,18 @@ where
         }
     }
 
+    /// Acquire a pointer to the queue channel sender.
+    /// The critical section is only a pointer copy.
+    #[inline]
+    fn acquire_queue_handle(&self) -> Sender<FunnelMessage<Input, Output, Error>> {
+        self.worker_queue.lock().unwrap().clone()
+    }
+
     /// Swap in a new sender channel.
-    ///
     /// This is called when a crashed worker is restarted, or during shutdown signal handling.
     pub(crate) fn replace_queue(&self, worker_queue: Sender<FunnelMessage<Input, Output, Error>>) {
         let mut handle = self.worker_queue.lock().unwrap();
-        *handle = worker_queue;
+        let _ = std::mem::replace(&mut *handle, worker_queue);
     }
 
     /// Pull a clone of the worker state.

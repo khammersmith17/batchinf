@@ -2,11 +2,13 @@ use batchinf::{
     BatchTrigger, BatcherConfig, BatcherMetrics, BatchinfError, Predictor, WorkerSnapshot,
     WorkerStatus, get_batcher,
 };
-use std::num::{NonZeroU8, NonZeroU32};
-use std::sync::atomic::AtomicBool;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
+use std::{
+    num::{NonZeroU8, NonZeroU32},
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 use tokio::time::{Duration, Instant};
 
