@@ -37,8 +37,7 @@ fn handle_worker_panic<P: Predictor + Send + Sync + 'static>(
     state: &WorkerState<P::Input, P::Output, P::Error>,
     recv: &mut InputReceiver<P>,
 ) {
-    // Block writers from queueing a crashed worker during restart.
-    // Blocking writers ensures that new messages are not missed when the queue is drained.
+    // Block writers before draining to minimise the window for new arrivals.
     state.set_state(WorkerStatus::Crashed);
 
     // Drain requests that were queued since worker was dispatched for inference.

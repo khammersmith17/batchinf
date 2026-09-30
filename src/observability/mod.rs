@@ -5,7 +5,7 @@ pub enum BatchTrigger {
     Timeout,
 }
 
-/// This crate provides the contract for emitting observability metrics. Implement the backend.
+/// This trait provides the contract for emitting observability metrics. Implement the backend.
 pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger].
     /// This may provide some information that can help tune the batch size and the timeout for a

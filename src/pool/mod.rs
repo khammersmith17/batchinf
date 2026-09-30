@@ -65,12 +65,11 @@ where
         Arc::downgrade(&self.pool)
     }
 
-    /// Use a load aware uniform random routing.  
+    /// Load-aware round-robin routing.
     ///
-    /// Select an initial start point in the pool, and traversing to pool until all workers are
-    /// exhausted. If a worker that can accept work is not found, then the first observed worker
-    /// who is still alive, not in [WorkerStatus::Exit] or [WorkerStatus::Crashed] state, is
-    /// selected as the fallback destination.
+    /// Selects a start point via global round-robin and walks the pool until all workers are
+    /// exhausted. If no worker is ready to accept work, the first live worker not in
+    /// [WorkerStatus::Exit] or [WorkerStatus::Crashed] state is used as a fallback.
     pub(crate) fn push(
         &self,
         mut msg: FunnelMessage<Input, Output, Error>,
@@ -176,7 +175,7 @@ where
 
     /// Get thread start position for worker resolution.
     ///
-    /// Search space start is round robin amoong threads.
+    /// Search space start is round robin among threads.
     #[inline]
     fn get_and_increment(&self) -> usize {
         self.start.fetch_add(1, Ordering::AcqRel) % usize::from(self.size)
