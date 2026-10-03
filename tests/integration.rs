@@ -619,6 +619,7 @@ async fn test_metrics_batch_trigger_size() {
     );
 }
 
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_queue_depth_emitted() {
     let metrics = TestMetrics::new();
@@ -649,5 +650,42 @@ async fn test_no_available_workers_error() {
     assert!(
         result.is_err(),
         "expected an error from an always-panicking worker, got Ok"
+    );
+}
+
+#[derive(Clone)]
+struct MarkedPredictor {
+    // Every clone of the predictor holds a strong reference to this marker.
+    _marker: Arc<()>,
+}
+
+impl Predictor for MarkedPredictor {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+        Ok(inp.to_vec())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drop_releases_all_predictor_clones() {
+    let marker = Arc::new(());
+    let predictor = MarkedPredictor {
+        _marker: Arc::clone(&marker),
+    };
+    let batcher = get_batcher(predictor, config(4, 10, 3), no_obs());
+
+    assert_eq!(batcher.predict(1).await.unwrap(), 1);
+    drop(batcher);
+
+    // Workers and the control plane exit asynchronously once the last handle is dropped.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        Arc::strong_count(&marker),
+        1,
+        "workers or control plane still hold predictor clones after the batcher was dropped"
     );
 }

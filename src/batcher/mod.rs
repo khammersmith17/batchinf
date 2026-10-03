@@ -15,7 +15,7 @@ use tokio::{
 ///
 /// Dropping all `Batchinf` clones triggers graceful shutdown: the pool stops accepting new
 /// requests and each worker flushes its in-progress batch before exiting.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Batchinf<Input, Output, Error>
 where
     Input: Send + Sync + 'static,
@@ -24,6 +24,19 @@ where
 {
     pool: WorkerPool<Input, Output, Error>,
     obs: Option<Arc<dyn BatcherMetrics>>,
+}
+
+impl<Input, Output, Error> Clone for Batchinf<Input, Output, Error>
+where
+    Input: Send + Sync + 'static,
+    Output: Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        let obs = self.obs.clone();
+        let pool = self.pool.clone();
+        Batchinf { pool, obs }
+    }
 }
 
 impl<Input, Output, Error> Batchinf<Input, Output, Error>

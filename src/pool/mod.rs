@@ -91,7 +91,6 @@ where
 
         // Fallback is the first worker not in Exit or Crashed state that we observe when looking
         // for a worker that can accept work.
-        let mut fallback: Option<usize> = None;
         let size = self.pool_size();
 
         // Select the first worker in the waiting state. Exhaust all workers.
@@ -113,16 +112,9 @@ where
                     // The first live worker is set to be the fallback sink.
                     QueuePushResult::QueueFull(m) => {
                         msg = m;
-                        if fallback.is_none() {
-                            fallback = Some(sink)
-                        }
                     }
                 },
-                _ => {
-                    if fallback.is_none() {
-                        fallback = Some(sink)
-                    }
-                }
+                _ => {}
             }
 
             // Subsequent attempts to resolve worker is thread local walk the worker search space
@@ -130,19 +122,30 @@ where
             sink = (sink + 1) % usize::from(self.size);
         }
 
-        // If no fallback workers were identified, then no workers are available.
-        let Some(fallback_sink) = fallback else {
-            return Err(BatchinfError::NoAvailableWorkersError);
-        };
+        let mut has_live_worker = false;
 
-        // If we are unable to find an available worker, we dispatch to the first worker we found
-        // that has not exited or crashed.
-        let handle = &self.pool[fallback_sink];
-        match handle.push(msg) {
-            QueuePushResult::Success => Ok(()),
-            // If the resolved sink cannot accept the request, error to user code.
-            QueuePushResult::QueueFull(_) => Err(BatchinfError::QueueFullError),
-            QueuePushResult::QueueClosed(_) => Err(BatchinfError::NoAvailableWorkersError),
+        // Try all workers if none are waiting.
+        for _ in 0..size {
+            let handle = &self.pool[sink];
+            match handle.push(msg) {
+                QueuePushResult::Success => return Ok(()),
+                QueuePushResult::QueueFull(m) => {
+                    msg = m;
+                    has_live_worker = true;
+                }
+                QueuePushResult::QueueClosed(m) => {
+                    msg = m;
+                }
+            }
+
+            sink = (sink + 1) % usize::from(self.size);
+        }
+
+        // Resolve error to user.
+        if has_live_worker {
+            Err(BatchinfError::QueueFullError)
+        } else {
+            Err(BatchinfError::NoAvailableWorkersError)
         }
     }
 

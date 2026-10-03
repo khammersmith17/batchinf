@@ -3,18 +3,11 @@ use crate::{
     observability::BatcherMetrics,
     pool::FunnelMessage,
     predictor::Predictor,
-    state::{WorkerRef, WorkerSnapshot, WorkerState, WorkerStatus},
+    state::{WorkerRef, WorkerState, WorkerStatus},
     worker::{InferenceWorker, run_worker},
 };
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicBool, Ordering},
-};
-use tokio::{
-    select,
-    sync::mpsc::{Receiver, Sender, channel},
-    time::{Duration, sleep},
-};
+use std::sync::{Arc, Weak};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 pub(crate) struct ControlPlane<P: Predictor + Send + Sync + 'static> {
     pub(crate) predictor: P,
@@ -38,66 +31,28 @@ async fn supervisor_loop<P: Predictor + Send + Sync + 'static>(control_plane: Co
         config,
         mut panic_rx,
     } = control_plane;
-    let shutdown_signal = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&shutdown_signal);
-
-    // Spawns shutdown signal handler.
-    tokio::task::spawn(async move { wait_for_shutdown(signal).await });
 
     loop {
-        if shutdown_signal.load(Ordering::Acquire) {
+        // Wake the control plane when a worker signals crash.
+        let Some(worker_id) = panic_rx.recv().await else {
             break;
-        }
+        };
 
+        // When there are no more strong references to the pool, no more requests will be forwarded
+        // to workers. Workers shutdown gracefully on their own.
         let Some(pool) = pool_weak.upgrade() else {
             return;
         };
 
-        select! {
-            // Wake the control plane loop when a worker signals a crash during panic.
-            signal = panic_rx.recv() => {
-                let Some(worker_id) = signal else {break};
-
-                let handle = &pool[usize::from(worker_id)];
-                crash_handler(predictor.clone(),  handle, obs.clone(), &config);
-            },
-            _ = sleep(Duration::from_millis(250)) => {}
+        let status = pool[worker_id as usize].snapshot().status;
+        // Avoid double restart if poll loop already handled crash restart.
+        if !matches!(status, WorkerStatus::Crashed) {
+            continue;
         }
 
-        let pool_size = pool.len();
-        // If all workers have exited, then the control plane also exits.
-        let mut exited = 0_usize;
-        let mut total_queue_depth = 0_usize;
-        for i in 0..pool_size {
-            let worker_snapshot = pool[i].snapshot();
-
-            let WorkerSnapshot { status, queue_len } = worker_snapshot;
-            total_queue_depth += queue_len as usize;
-
-            match status {
-                WorkerStatus::Crashed => {
-                    let handle = &pool[i];
-                    if !matches!(handle.snapshot().status, WorkerStatus::Crashed) {
-                        continue;
-                    }
-
-                    crash_handler(predictor.clone(), &handle, obs.clone(), &config);
-                }
-                WorkerStatus::Exit => exited += 1,
-                _ => {}
-            }
-        }
-
-        if exited == pool_size {
-            return;
-        }
-
-        if let Some(ref obs) = obs {
-            obs.on_queue_depth(total_queue_depth)
-        }
+        let handle = &pool[usize::from(worker_id)];
+        crash_handler(predictor.clone(), handle, obs.clone(), &config);
     }
-
-    shutdown_workers(pool_weak).await;
 }
 
 fn crash_handler<P: Predictor + Send + Sync + 'static>(
@@ -153,70 +108,5 @@ fn fill_queue_with_orphaned<Input, Output, Error>(
 fn emit_worker_panic(obs: Option<Arc<dyn BatcherMetrics>>) {
     if let Some(obs) = obs {
         obs.on_worker_panic()
-    }
-}
-
-#[cfg(unix)]
-async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let Ok(mut sig) = signal(SignalKind::terminate()) else {
-        flag.store(true, Ordering::Release);
-        return;
-    };
-    sig.recv().await;
-    flag.store(true, Ordering::Release);
-}
-
-#[cfg(windows)]
-async fn wait_for_shutdown(flag: Arc<AtomicBool>) {
-    use tokio::signal::windows::ctrl_shutdown;
-    let Ok(mut sig) = ctrl_shutdown() else {
-        flag.store(true, Ordering::Release);
-        return;
-    };
-    sig.recv().await;
-    flag.store(true, Ordering::Release);
-}
-
-// On platforms where no signal API is available, graceful shutdown via signal is unsupported.
-// The handler suspends indefinitely without consuming CPU.
-#[cfg(not(any(unix, windows)))]
-async fn wait_for_shutdown(_flag: Arc<AtomicBool>) {
-    std::future::pending::<()>().await;
-}
-
-// Set the state of each worker to Exit.
-// Poll the states to ensure they are not overwritten until the reference count of the worker pool
-// is 0.
-async fn shutdown_workers<Input, Output, Error>(pool_weak: Weak<[WorkerRef<Input, Output, Error>]>)
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
-    loop {
-        let mut exited = 0_usize;
-        let Some(pool) = pool_weak.upgrade() else {
-            return;
-        };
-
-        let pool_size = pool.len();
-
-        for worker in pool.iter() {
-            let snapshot = { worker.snapshot() };
-
-            if !matches!(snapshot.status, WorkerStatus::Exit) {
-                worker.set_exit();
-            } else {
-                exited += 1;
-            }
-        }
-
-        if exited == pool_size {
-            break;
-        }
-
-        // Sleep for half a second inbetween poll loops.
-        sleep(Duration::from_millis(500)).await;
     }
 }

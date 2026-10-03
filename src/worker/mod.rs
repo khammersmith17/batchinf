@@ -16,33 +16,14 @@ pub(crate) type OutputSender<P> =
 pub(crate) type InputReceiver<P> = Receiver<(<P as Predictor>::Input, OutputSender<P>)>;
 pub(crate) type InferenceResult<P> = Result<Vec<<P as Predictor>::Output>, <P as Predictor>::Error>;
 
-/// On crash, drain the receiver to capture inference requests that were queued while a worker was
-/// running inferece.
-///
-/// This batch of inference requests was not in the group that lead to a panic, thus they are not
-/// thrown away on the panic.
-fn drain_receiver<P: Predictor + Send + Sync + 'static>(
-    recv: &mut InputReceiver<P>,
-) -> Vec<(P::Input, OutputSender<P>)> {
-    let mut orphaned = Vec::new();
-    while let Ok(inp) = recv.try_recv() {
-        orphaned.push(inp);
-    }
-    orphaned
-}
-
 /// Handle the worker state on crash.
 /// Drain messages currently buffered during inference + signal crash to the control plane.
 fn handle_worker_panic<P: Predictor + Send + Sync + 'static>(
     state: &WorkerState<P::Input, P::Output, P::Error>,
     recv: &mut InputReceiver<P>,
 ) {
-    // Block writers before draining to minimise the window for new arrivals.
-    state.set_state(WorkerStatus::Crashed);
-
     // Drain requests that were queued since worker was dispatched for inference.
-    let orphaned = drain_receiver::<P>(recv);
-    state.queue_orphaned_messages(orphaned);
+    state.mark_crashed(recv);
 
     // Wake the control loop.
     state.signal_crash();
@@ -97,6 +78,11 @@ impl<P: Predictor + Send + Sync + 'static> InferenceWorker<P> {
     fn reset_next_inf(&self, ts: &mut Instant) {
         *ts = Instant::now() + self.state.timeout();
     }
+
+    fn set_running_and_emit(&self, trigger_type: BatchTrigger, batch_size: usize) {
+        self.state.set_state(WorkerStatus::Running);
+        self.emit_batch_start(trigger_type, batch_size);
+    }
 }
 
 /// Buffer for inference input and the senders.
@@ -111,6 +97,23 @@ impl<P: Predictor + Send + Sync + 'static> WorkerBuffer<P> {
     fn push(&mut self, request: P::Input, sender: OutputSender<P>) {
         self.sender_buffer.push(sender);
         self.input_buffer.push(request);
+    }
+
+    fn split(mut self, batch_size: usize) -> (WorkerBuffer<P>, Option<WorkerBuffer<P>>) {
+        if self.len() < batch_size {
+            return (self, None);
+        }
+
+        let sender_buffer = self.sender_buffer.split_off(batch_size);
+        let input_buffer = self.input_buffer.split_off(batch_size);
+
+        (
+            self,
+            Some(WorkerBuffer {
+                sender_buffer,
+                input_buffer,
+            }),
+        )
     }
 
     // Returns the number of items in the buffer.
@@ -137,6 +140,33 @@ impl<P: Predictor + Send + Sync + 'static> WorkerBuffer<P> {
         let cap = self.sender_buffer.capacity();
         self.input_buffer.clear();
         std::mem::replace(&mut self.sender_buffer, Vec::with_capacity(cap))
+    }
+}
+
+async fn drain_exited_recv<P: Predictor + Send + Sync + 'static>(
+    buffer: &mut WorkerBuffer<P>,
+    input_receiver: &mut InputReceiver<P>,
+) {
+    while let Some((request, sender)) = input_receiver.recv().await {
+        buffer.push(request, sender);
+    }
+}
+
+fn batch_inference_on_exit<P: Predictor + Send + Sync + 'static>(
+    worker: InferenceWorker<P>,
+    mut buffer: WorkerBuffer<P>,
+    mut recv: InputReceiver<P>,
+) {
+    worker.state.set_state(WorkerStatus::Exit);
+    let batch_cap = worker.state.capacity() as usize;
+    loop {
+        let (mut batch, rem) = buffer.split(batch_cap);
+        run_inference(&worker, &mut batch, &mut recv);
+
+        match rem {
+            Some(rem) => buffer = rem,
+            None => return,
+        }
     }
 }
 
@@ -167,7 +197,8 @@ async fn worker_loop<P: Predictor + Send + Sync + 'static>(
                 worker.state.reset_queue_len();
             }
             WorkerStatus::Exit => {
-                run_inference(&worker, &mut buffer, &mut input_receiver);
+                drain_exited_recv(&mut buffer, &mut input_receiver).await;
+                batch_inference_on_exit(worker, buffer, input_receiver);
                 break;
             }
             // Crashed state is handled in the inference handler.
@@ -200,6 +231,12 @@ async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
         return;
     }
 
+    // Batch size 1 is satisfied on first read.
+    if worker.state.capacity() == 1 {
+        worker.set_running_and_emit(BatchTrigger::Capacity, buffer.len());
+        return;
+    }
+
     loop {
         let timeout = time_until_timeout(next_inf);
         select! {
@@ -210,8 +247,7 @@ async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
                     worker.state.increment_len();
                     if buffer.len() == (worker.state.capacity() as usize){
                         // Set state and emit trigger.
-                        worker.state.set_state(WorkerStatus::Running);
-                        worker.emit_batch_start(BatchTrigger::Capacity, buffer.len());
+                        worker.set_running_and_emit(BatchTrigger::Capacity, buffer.len());
                         break;
                     }
 
@@ -227,8 +263,7 @@ async fn accumulate_next_batch<P: Predictor + Send + Sync + 'static>(
                     //
                     // Only log a timeout when the worker has not exited.
                     if matches!(worker.state.get_state(), WorkerStatus::Waiting) && !buffer.is_empty() {
-                        worker.state.set_state(WorkerStatus::Running);
-                        worker.emit_batch_start(BatchTrigger::Timeout, buffer.len());
+                        worker.set_running_and_emit(BatchTrigger::Timeout, buffer.len());
                     }
 
                     return;

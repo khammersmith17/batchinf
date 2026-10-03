@@ -5,15 +5,13 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
+use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 
 /// Exclusive access around the DL Queue buffer to recover orphaned requests on worker crash.
 type WorkerDlQueue<Input, Output, Error> = Mutex<VecDeque<FunnelMessage<Input, Output, Error>>>;
 
+// Mask the state bits to get the queue len.
 const QUEUE_MASK: u64 = !(0b11_u64 << 62);
-// Worker crashed is the highest state that should be observed.
-#[cfg(debug_assertions)]
-const MAX_WORKER_STATE_VALUE: u8 = 3_u8;
 
 pub(crate) enum QueuePushResult<Input, Output, Error>
 where
@@ -28,9 +26,17 @@ where
 // The 2 most significant bits store the status. Remaining 62 bits store the queue len.
 // [state bits] [remaining 62 bits]
 // These u8 values are never stored.
+// 0b00
+const WAITING: u8 = 0_u8;
+// 0b01
+const EXIT: u8 = 1_u8;
+// 0b10
+const RUNNING_INFERENCE: u8 = 2_u8;
+// 0b11
+const CRASHED: u8 = 3_u8;
 
 /// The operational state of an inference worker.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WorkerStatus {
     /// Accumulating requests into the next batch.
@@ -43,18 +49,24 @@ pub enum WorkerStatus {
     Crashed = 3,
 }
 
-/// Map the concrete enum variant to enum integer.
-impl From<WorkerStatus> for u8 {
-    fn from(state: WorkerStatus) -> u8 {
-        unsafe { std::mem::transmute(state) }
+impl WorkerStatus {
+    fn from_u8(state: u8) -> WorkerStatus {
+        match state {
+            WAITING => WorkerStatus::Waiting,
+            EXIT => WorkerStatus::Exit,
+            RUNNING_INFERENCE => WorkerStatus::Running,
+            CRASHED => WorkerStatus::Crashed,
+            _ => unreachable!("Invalid state code"),
+        }
     }
-}
 
-/// Map the enum integer to concrete enum variat.
-impl From<u8> for WorkerStatus {
-    fn from(state: u8) -> WorkerStatus {
-        debug_assert!(state <= MAX_WORKER_STATE_VALUE);
-        unsafe { std::mem::transmute(state) }
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Waiting => WAITING,
+            Self::Exit => EXIT,
+            Self::Running => RUNNING_INFERENCE,
+            Self::Crashed => CRASHED,
+        }
     }
 }
 
@@ -113,6 +125,29 @@ where
         }
     }
 
+    fn set_state(&self, state: WorkerStatus) {
+        let state_key: u8 = state.to_u8();
+        let state = u64::from(state_key) << 62;
+
+        // The 2 MSB need to be cleared here, and then ORed with the state value.
+        // So we need a CAS loop.
+        let mut current = self.state.load(Ordering::Relaxed);
+
+        // Update the state bits using a CAS loop.
+        loop {
+            let new = (current & QUEUE_MASK) | state;
+            match self.state.compare_exchange_weak(
+                current,
+                new,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// On worker crash, transmit sentinel signal, unit type, to the control plane loop to wake it
     /// up.
     fn signal_crash(&self) {
@@ -121,15 +156,17 @@ where
         let _ = self.panic_tx.try_send(self.worker_id);
     }
 
-    /// On worker crash, the workers buffer may have messages in its buffer that can no longer be
-    /// serviced by the worker given a crash.
+    /// On worker crash, buffer orphaned messages for the restarted worker and set the state to
+    /// [WorkerStatus::Crashed].
     ///
-    /// Those orphaned messages are buffered here while the worker is restarting.
-    fn queue_orphaned_messages(&self, mut buffer: Vec<FunnelMessage<Input, Output, Error>>) {
-        let items = buffer.drain(..);
+    /// The state is set while holding the DL queue lock. The control plane only restarts a worker
+    /// after observing [WorkerStatus::Crashed], and [Self::drain_dl_queue] blocks on the same lock,
+    /// so a restart always sees the complete set of orphaned messages.
+    fn mark_crashed(&self, recv: &mut Receiver<FunnelMessage<Input, Output, Error>>) {
         let mut handle = self.dl_queue.lock().unwrap();
-        for item in items {
-            handle.push_back(item);
+        self.set_state(WorkerStatus::Crashed);
+        while let Ok(inp) = recv.try_recv() {
+            handle.push_back(inp);
         }
     }
 
@@ -193,32 +230,13 @@ where
     }
 
     pub(crate) fn set_state(&self, state: WorkerStatus) {
-        let state_key: u8 = state.into();
-        let state = u64::from(state_key) << 62;
-
-        // The 2 MSB need to be cleared here, and then ORed with the state value.
-        // So we need a CAS loop.
-        let mut current = self.inner.state.load(Ordering::Relaxed);
-
-        // Update the state bits using a CAS loop.
-        loop {
-            let new = (current & QUEUE_MASK) | state;
-            match self.inner.state.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+        self.inner.set_state(state);
     }
 
     pub(crate) fn get_state(&self) -> WorkerStatus {
         let state_key = self.inner.state.load(Ordering::Acquire);
         // Ignore length bits to evaluate state.
-        ((state_key >> 62) as u8).into()
+        WorkerStatus::from_u8((state_key >> 62) as u8)
     }
 
     /// Get a snapshot of the worker state.
@@ -226,7 +244,7 @@ where
     /// Provides a `WorkerSnapshot`, which provides the current state and the size of the queue.
     pub(crate) fn snapshot(&self) -> WorkerSnapshot {
         let state = self.inner.state.load(Ordering::Acquire);
-        let status: WorkerStatus = ((state >> 62) as u8).into();
+        let status: WorkerStatus = WorkerStatus::from_u8((state >> 62) as u8);
         let queue_len = (state & QUEUE_MASK) as u32;
 
         WorkerSnapshot { status, queue_len }
@@ -241,12 +259,10 @@ where
         self.inner.signal_crash()
     }
 
-    /// On worker crash, the workers buffer may have messages in its buffer that can no longer be
-    /// serviced by the worker given a crash.
-    ///
-    /// Those orphaned messages are buffered here while the worker is restarting.
-    pub(crate) fn queue_orphaned_messages(&self, buffer: Vec<FunnelMessage<Input, Output, Error>>) {
-        self.inner.queue_orphaned_messages(buffer);
+    /// On worker crash, buffer orphaned messages for the restarted worker and set the state to
+    /// [WorkerStatus::Crashed]. See [WorkerStateInner::mark_crashed] for the locking invariant.
+    pub(crate) fn mark_crashed(&self, recv: &mut Receiver<FunnelMessage<Input, Output, Error>>) {
+        self.inner.mark_crashed(recv);
     }
 
     /// Drain all orphaned messages to queue them for the restarted worker.
@@ -333,68 +349,53 @@ where
     pub(crate) fn clone_worker_state(&self) -> WorkerState<Input, Output, Error> {
         self.state.clone()
     }
-
-    /// On shutdown, set the worker state to exit.
-    /// Replace the sender with a dummy channel, to drop the sender channel.
-    /// When the channel drops, the inference worker receiver channel also closes.
-    pub(crate) fn set_exit(&self) {
-        self.state.set_state(WorkerStatus::Exit);
-        let (tx, _) = channel(1);
-        self.replace_queue(tx);
-    }
 }
 
 /// Test that repr(u8) on [WorkerStatus] maintains correct behavior.
 #[cfg(test)]
 mod state_tests {
     use super::WorkerStatus;
-    // 0b00
-    const WAITING: u8 = 0_u8;
-    // 0b01
-    const EXIT: u8 = 1_u8;
-    // 0b10
-    const RUNNING_INFERENCE: u8 = 2_u8;
-    // 0b11
-    const CRASHED: u8 = 3_u8;
-    // Mask the state bits to get the queue len.
 
     #[test]
     fn waiting_status_from_u8() {
-        assert_eq!(WorkerStatus::from(WAITING), WorkerStatus::Waiting)
+        assert_eq!(WorkerStatus::from_u8(super::WAITING), WorkerStatus::Waiting)
     }
 
     #[test]
     fn exit_status_from_u8() {
-        assert_eq!(WorkerStatus::from(EXIT), WorkerStatus::Exit)
+        assert_eq!(WorkerStatus::from_u8(super::EXIT), WorkerStatus::Exit)
     }
 
     #[test]
     fn running_status_from_u8() {
-        assert_eq!(WorkerStatus::from(RUNNING_INFERENCE), WorkerStatus::Running)
+        assert_eq!(
+            WorkerStatus::from_u8(super::RUNNING_INFERENCE),
+            WorkerStatus::Running
+        )
     }
 
     #[test]
     fn crashed_status_from_u8() {
-        assert_eq!(WorkerStatus::from(CRASHED), WorkerStatus::Crashed)
+        assert_eq!(WorkerStatus::from_u8(super::CRASHED), WorkerStatus::Crashed)
     }
 
     #[test]
     fn waiting_status_to_u8() {
-        assert_eq!(u8::from(WorkerStatus::Waiting), WAITING)
+        assert_eq!(WorkerStatus::Waiting.to_u8(), super::WAITING)
     }
 
     #[test]
     fn exit_status_to_u8() {
-        assert_eq!(u8::from(WorkerStatus::Exit), EXIT)
+        assert_eq!(WorkerStatus::Exit.to_u8(), super::EXIT)
     }
 
     #[test]
     fn running_status_to_u8() {
-        assert_eq!(u8::from(WorkerStatus::Running), RUNNING_INFERENCE)
+        assert_eq!(WorkerStatus::Running.to_u8(), super::RUNNING_INFERENCE)
     }
 
     #[test]
     fn crashed_status_to_u8() {
-        assert_eq!(u8::from(WorkerStatus::Crashed), CRASHED)
+        assert_eq!(WorkerStatus::Crashed.to_u8(), super::CRASHED)
     }
 }
