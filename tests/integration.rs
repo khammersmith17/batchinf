@@ -31,7 +31,7 @@ impl Predictor for EchoPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
         Ok(inp.to_vec())
     }
 }
@@ -44,7 +44,7 @@ impl Predictor for MismatchPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
         Ok(vec![]) // always returns wrong number of outputs
     }
 }
@@ -57,7 +57,7 @@ impl Predictor for FailPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
         Err(TestError)
     }
 }
@@ -84,7 +84,7 @@ impl Predictor for CountingPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         Ok(inp.to_vec())
     }
@@ -189,6 +189,12 @@ fn with_obs(m: &Arc<TestMetrics>) -> Option<Arc<dyn BatcherMetrics>> {
     Some(m.clone())
 }
 
+/// Factory that hands each worker (and each rebuild) a clone of `predictor`. Clones share any
+/// `Arc` state, so counters and panic flags are observed across workers and rebuilds.
+fn factory<P: Clone + Send + Sync + 'static>(predictor: P) -> Arc<dyn Fn(usize) -> P + Send + Sync> {
+    Arc::new(move |_worker_id| predictor.clone())
+}
+
 async fn join<T: Send + 'static>(handles: Vec<tokio::task::JoinHandle<T>>) -> Vec<T> {
     let mut out = Vec::with_capacity(handles.len());
     for h in handles {
@@ -199,13 +205,13 @@ async fn join<T: Send + 'static>(handles: Vec<tokio::task::JoinHandle<T>>) -> Ve
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_single_request() {
-    let batcher = get_batcher(EchoPredictor, config(8, 100, 1), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(8, 100, 1), no_obs());
     assert_eq!(batcher.predict(42).await.unwrap(), 42);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_results_match_inputs() {
-    let batcher = get_batcher(EchoPredictor, config(8, 500, 1), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(8, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..8u64)
         .map(|i| {
@@ -222,7 +228,7 @@ async fn test_results_match_inputs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_capacity() {
     let predictor = CountingPredictor::new();
-    let batcher = get_batcher(predictor.clone(), config(4, 10_000, 1), no_obs());
+    let batcher = get_batcher(factory(predictor.clone()), config(4, 10_000, 1), no_obs());
 
     let start = Instant::now();
     let handles: Vec<_> = (0..4u64)
@@ -247,7 +253,7 @@ async fn test_batch_fires_at_capacity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_fires_at_timeout() {
     let timeout_ms = 50u64;
-    let batcher = get_batcher(EchoPredictor, config(8, timeout_ms, 1), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(8, timeout_ms, 1), no_obs());
 
     let start = Instant::now();
     let result = batcher.predict(99).await.unwrap();
@@ -264,13 +270,13 @@ async fn test_batch_fires_at_timeout() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_error_propagates_to_caller() {
-    let batcher = get_batcher(FailPredictor, config(1, 50, 1), no_obs());
+    let batcher = get_batcher(factory(FailPredictor), config(1, 50, 1), no_obs());
     assert!(batcher.predict(0).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_error_propagates_to_all_callers_in_batch() {
-    let batcher = get_batcher(FailPredictor, config(4, 500, 1), no_obs());
+    let batcher = get_batcher(factory(FailPredictor), config(4, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..4u64)
         .map(|_| {
@@ -289,7 +295,7 @@ async fn test_error_propagates_to_all_callers_in_batch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_requests_all_complete() {
     let n = 100u64;
-    let batcher = get_batcher(EchoPredictor, config(100, 50, 1), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(100, 50, 1), no_obs());
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -305,7 +311,7 @@ async fn test_concurrent_requests_all_complete() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multi_worker_correct_results() {
     let n = 64u64;
-    let batcher = get_batcher(EchoPredictor, config(16, 50, 4), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(16, 50, 4), no_obs());
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -322,7 +328,7 @@ async fn test_multi_worker_correct_results() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_sequential_batches() {
     let predictor = CountingPredictor::new();
-    let batcher = get_batcher(predictor.clone(), config(4, 500, 1), no_obs());
+    let batcher = get_batcher(factory(predictor.clone()), config(4, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..4u64)
         .map(|i| {
@@ -347,13 +353,13 @@ async fn test_multiple_sequential_batches() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pool_status_length_matches_pool_size() {
-    let batcher = get_batcher(EchoPredictor, config(4, 100, 3), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 100, 3), no_obs());
     assert_eq!(batcher.pool_status().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_workers_initially_waiting() {
-    let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 100, 2), no_obs());
     for WorkerSnapshot { status, queue_len } in batcher.pool_status() {
         assert_eq!(status, WorkerStatus::Waiting);
         assert_eq!(queue_len, 0);
@@ -362,21 +368,21 @@ async fn test_workers_initially_waiting() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_status_valid_index() {
-    let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 100, 2), no_obs());
     assert!(batcher.worker_status(0).is_some());
     assert!(batcher.worker_status(1).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_status_out_of_bounds() {
-    let batcher = get_batcher(EchoPredictor, config(4, 100, 2), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 100, 2), no_obs());
     assert!(batcher.worker_status(2).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_capacity_trigger() {
     let metrics = TestMetrics::new();
-    let batcher = get_batcher(EchoPredictor, config(4, 10_000, 1), with_obs(&metrics));
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 10_000, 1), with_obs(&metrics));
 
     let handles: Vec<_> = (0..4u64)
         .map(|i| {
@@ -395,7 +401,7 @@ async fn test_metrics_capacity_trigger() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_timeout_trigger() {
     let metrics = TestMetrics::new();
-    let batcher = get_batcher(EchoPredictor, config(8, 50, 1), with_obs(&metrics));
+    let batcher = get_batcher(factory(EchoPredictor), config(8, 50, 1), with_obs(&metrics));
 
     batcher.predict(1).await.unwrap();
 
@@ -408,7 +414,7 @@ async fn test_metrics_timeout_trigger() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_err_completion() {
     let metrics = TestMetrics::new();
-    let batcher = get_batcher(FailPredictor, config(1, 50, 1), with_obs(&metrics));
+    let batcher = get_batcher(factory(FailPredictor), config(1, 50, 1), with_obs(&metrics));
 
     let _ = batcher.predict(0).await;
 
@@ -420,7 +426,7 @@ async fn test_metrics_err_completion() {
 async fn test_metrics_request_timeout() {
     let metrics = TestMetrics::new();
     // Large batch_size and batch_timeout so the worker won't fire on its own.
-    let batcher = get_batcher(EchoPredictor, config(8, 10_000, 1), with_obs(&metrics));
+    let batcher = get_batcher(factory(EchoPredictor), config(8, 10_000, 1), with_obs(&metrics));
 
     let result = batcher
         .predict_with_timeout(0, Duration::from_millis(20))
@@ -435,7 +441,7 @@ async fn test_metrics_request_timeout() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_invalid_predictor_output_propagates_to_all_callers() {
-    let batcher = get_batcher(MismatchPredictor, config(4, 500, 1), no_obs());
+    let batcher = get_batcher(factory(MismatchPredictor), config(4, 500, 1), no_obs());
 
     let handles: Vec<_> = (0..4u64)
         .map(|_| {
@@ -471,7 +477,7 @@ impl Predictor for PanicOncePredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
         if !self.has_panicked.swap(true, Ordering::SeqCst) {
             panic!("intentional panic for crash recovery test");
         }
@@ -482,7 +488,7 @@ impl Predictor for PanicOncePredictor {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_restarts_after_panic() {
     let predictor = PanicOncePredictor::new();
-    let batcher = get_batcher(predictor, config(1, 50, 1), no_obs());
+    let batcher = get_batcher(factory(predictor), config(1, 50, 1), no_obs());
 
     // First request triggers the panic; callers in that batch receive InternalError.
     let first = batcher.predict(1).await;
@@ -511,7 +517,7 @@ impl Predictor for AlwaysPanicPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
         panic!("intentional panic");
     }
 }
@@ -520,7 +526,7 @@ impl Predictor for AlwaysPanicPredictor {
 async fn test_metrics_worker_panic() {
     let metrics = TestMetrics::new();
     let predictor = PanicOncePredictor::new();
-    let batcher = get_batcher(predictor, config(1, 50, 1), with_obs(&metrics));
+    let batcher = get_batcher(factory(predictor), config(1, 50, 1), with_obs(&metrics));
 
     // Trigger the panic.
     let _ = batcher.predict(1).await;
@@ -535,7 +541,7 @@ async fn test_metrics_worker_panic() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_predict_with_timeout_succeeds() {
-    let batcher = get_batcher(EchoPredictor, config(1, 50, 1), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(1, 50, 1), no_obs());
     let result = batcher
         .predict_with_timeout(42, Duration::from_millis(500))
         .await;
@@ -548,7 +554,7 @@ async fn test_predict_with_timeout_succeeds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_timed_out_request_does_not_block_subsequent() {
     // Large timeout so the batch only fires at capacity, not by time.
-    let batcher = get_batcher(EchoPredictor, config(8, 10_000, 1), no_obs());
+    let batcher = get_batcher(factory(EchoPredictor), config(8, 10_000, 1), no_obs());
 
     // Queue one request and let it time out. Its input stays in the worker buffer.
     let timed_out = batcher
@@ -574,7 +580,7 @@ async fn test_timed_out_request_does_not_block_subsequent() {
 async fn test_multi_worker_one_panic_others_serve() {
     // 4-worker pool; predictor panics exactly once.
     let predictor = PanicOncePredictor::new();
-    let batcher = get_batcher(predictor, config(1, 50, 4), no_obs());
+    let batcher = get_batcher(factory(predictor), config(1, 50, 4), no_obs());
 
     let handles: Vec<_> = (0..8u64)
         .map(|i| {
@@ -601,7 +607,7 @@ async fn test_multi_worker_one_panic_others_serve() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_batch_trigger_size() {
     let metrics = TestMetrics::new();
-    let batcher = get_batcher(EchoPredictor, config(4, 10_000, 1), with_obs(&metrics));
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 10_000, 1), with_obs(&metrics));
 
     let handles: Vec<_> = (0..4u64)
         .map(|i| {
@@ -623,7 +629,7 @@ async fn test_metrics_batch_trigger_size() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_metrics_queue_depth_emitted() {
     let metrics = TestMetrics::new();
-    let batcher = get_batcher(EchoPredictor, config(8, 500, 1), with_obs(&metrics));
+    let batcher = get_batcher(factory(EchoPredictor), config(8, 500, 1), with_obs(&metrics));
 
     // Keep the batcher alive past one control plane poll cycle (250ms).
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -638,7 +644,7 @@ async fn test_metrics_queue_depth_emitted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_no_available_workers_error() {
     // Single worker that always panics → crashes immediately.
-    let batcher = get_batcher(AlwaysPanicPredictor, config(1, 50, 1), no_obs());
+    let batcher = get_batcher(factory(AlwaysPanicPredictor), config(1, 50, 1), no_obs());
 
     // Crash the worker.
     let _ = batcher.predict(0).await;
@@ -664,7 +670,7 @@ impl Predictor for MarkedPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
         Ok(inp.to_vec())
     }
 }
@@ -675,7 +681,7 @@ async fn test_drop_releases_all_predictor_clones() {
     let predictor = MarkedPredictor {
         _marker: Arc::clone(&marker),
     };
-    let batcher = get_batcher(predictor, config(4, 10, 3), no_obs());
+    let batcher = get_batcher(factory(predictor), config(4, 10, 3), no_obs());
 
     assert_eq!(batcher.predict(1).await.unwrap(), 1);
     drop(batcher);
@@ -688,4 +694,33 @@ async fn test_drop_releases_all_predictor_clones() {
         1,
         "workers or control plane still hold predictor clones after the batcher was dropped"
     );
+}
+
+// Neither `Clone` nor `Send`: `Rc` is thread-local. This only compiles because each predictor is
+// built, used and dropped on its own inference thread.
+struct ThreadLocalPredictor {
+    calls: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl Predictor for ThreadLocalPredictor {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+        self.calls.set(self.calls.get() + 1);
+        Ok(inp.to_vec())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_non_send_non_clone_predictor() {
+    let batcher = get_batcher(
+        Arc::new(|_worker_id| ThreadLocalPredictor {
+            calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+        }),
+        config(4, 10, 2),
+        no_obs(),
+    );
+    assert_eq!(batcher.predict(7).await.unwrap(), 7);
 }

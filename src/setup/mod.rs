@@ -2,7 +2,6 @@ use crate::{
     batcher::Batchinf,
     config::BatcherConfig,
     config::InnerConfig,
-    control_plane::{ControlPlane, run_control_plane},
     observability,
     pool::{FunnelMessage, WorkerPool},
     predictor::Predictor,
@@ -11,6 +10,12 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
+
+pub type PredictorFactory<P> = Arc<dyn Fn(usize) -> P + Send + Sync>;
+type WorkerRefPairs<P> = (
+    Vec<(InferenceWorker<P>, InputReceiver<P>)>,
+    Vec<WorkerRef<<P as Predictor>::Input, <P as Predictor>::Output, <P as Predictor>::Error>>,
+);
 
 /*
 * Implementation:
@@ -25,20 +30,19 @@ use tokio::sync::mpsc::channel;
 * oneshot::Receiver.
 * */
 
-fn init_worker_ref_pairs<P: Predictor + Send + Sync + 'static>(
-    predictor: P,
-    state: &[WorkerState<P::Input, P::Output, P::Error>],
+fn init_worker_ref_pairs<P: Predictor + 'static>(
+    predictor_factory: PredictorFactory<P>,
+    state: &[WorkerState],
     channel_size: usize,
     obs: Option<Arc<dyn observability::BatcherMetrics>>,
-) -> (
-    Vec<(InferenceWorker<P>, InputReceiver<P>)>,
-    Vec<WorkerRef<P::Input, P::Output, P::Error>>,
-) {
+) -> WorkerRefPairs<P> {
     let mut inf_workers = Vec::with_capacity(state.len());
     let mut worker_refs = Vec::with_capacity(state.len());
-    for worker in state {
+    for (i, worker) in state.iter().enumerate() {
         let (tx, rx) = channel::<FunnelMessage<P::Input, P::Output, P::Error>>(channel_size);
-        let inf_worker = InferenceWorker::new(worker.clone(), predictor.clone(), obs.clone());
+        let obs = obs.clone();
+        let inf_worker =
+            InferenceWorker::new(worker.clone(), Arc::clone(&predictor_factory), obs, i);
         let worker_ref = WorkerRef::new(worker.clone(), tx);
         inf_workers.push((inf_worker, rx));
         worker_refs.push(worker_ref);
@@ -51,25 +55,24 @@ fn init_worker_ref_pairs<P: Predictor + Send + Sync + 'static>(
 /// Inference requests submitted via [`Batchinf::predict`] are accumulated and dispatched as a
 /// batch when either `config.batch_size` is reached or `config.batch_timeout` elapses, whichever
 /// comes first. Requests are distributed across `config.pool_size` workers using load-aware
-/// random-start routing.
+/// round-robin routing.
 ///
-/// # Runtime requirement
+/// # Threads
 ///
-/// Workers use [`tokio::task::block_in_place`] for inference and require the multi-thread Tokio
-/// runtime. Using `current_thread` will panic at inference time.
-///
-/// ```rust,ignore
-/// #[tokio::main(flavor = "multi_thread")]
-/// async fn main() { ... }
-/// ```
+/// Each worker runs batch accumulation as a `tokio` task and inference on its own dedicated OS
+/// thread, named `batchinf-worker-{id}`. Inference never blocks the async runtime, so both the
+/// multi-thread and current-thread runtimes are supported.
 ///
 /// # Parameters
 ///
-/// - `predictor`: The inference backend. Cloned once per pool worker at startup, plus once into the control plane for crash recovery restarts.
+/// - `predictor_factory`: Builds the predictor for a worker, given the worker's index
+///   (`0..pool_size`). Called on that worker's inference thread at startup, and again to rebuild
+///   the predictor after [`Predictor::predict_batch`] panics. Load model weights once outside the
+///   factory and capture them in the closure, rather than loading inside it.
 /// - `config`: Batching and pool configuration. See [`BatcherConfig`].
 /// - `observability`: Optional metrics hook. Pass `None` to disable. See [`observability::BatcherMetrics`].
-pub fn get_batcher<P: Predictor + Send + Sync + 'static>(
-    predictor: P,
+pub fn get_batcher<P: Predictor + 'static>(
+    predictor_factory: PredictorFactory<P>,
     config: BatcherConfig,
     observability: Option<Arc<dyn observability::BatcherMetrics>>,
 ) -> Batchinf<P::Input, P::Output, P::Error> {
@@ -77,17 +80,11 @@ pub fn get_batcher<P: Predictor + Send + Sync + 'static>(
     let pool_size = config.pool_size.get();
 
     let conf: InnerConfig = config.clone().into();
-    let (panic_tx, panic_rx) = channel::<u8>(usize::from(pool_size));
 
-    let workers: Vec<WorkerState<P::Input, P::Output, P::Error>> = (0..pool_size)
-        .map(|id| {
-            let tx = panic_tx.clone();
-            WorkerState::new(conf, tx, id)
-        })
-        .collect();
+    let workers: Vec<WorkerState> = (0..pool_size).map(|_| WorkerState::new(conf)).collect();
 
     let (inf_workers, worker_refs) = init_worker_ref_pairs(
-        predictor.clone(),
+        Arc::clone(&predictor_factory),
         &workers,
         batch_size as usize,
         observability.clone(),
@@ -97,16 +94,6 @@ pub fn get_batcher<P: Predictor + Send + Sync + 'static>(
     for (w, rx) in inf_workers {
         run_worker(w, rx);
     }
-
-    let control_plane = ControlPlane {
-        predictor,
-        pool_weak: pool.get_weak_ref(),
-        obs: observability.clone(),
-        config,
-        panic_rx,
-    };
-
-    run_control_plane(control_plane);
 
     Batchinf::new(pool, observability)
 }

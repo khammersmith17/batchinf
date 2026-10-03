@@ -3,9 +3,11 @@ use crate::{
     state::{QueuePushResult, WorkerRef, WorkerSnapshot, WorkerStatus},
 };
 use std::sync::{
-    Arc, Weak,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
+
+type PoolSlab<Input, Output, Error> = Arc<[WorkerRef<Input, Output, Error>]>;
 
 pub(crate) type FunnelMessage<Input, Output, Error> = (
     Input,
@@ -15,22 +17,22 @@ pub(crate) type FunnelMessage<Input, Output, Error> = (
 #[derive(Debug)]
 pub(crate) struct WorkerPool<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
-    // Arc over a fixed-size slice — pool slots are never added or removed. Crashed workers are
-    // restarted in-place by the control plane, which swaps the channel sender within the slot.
-    pool: Arc<[WorkerRef<Input, Output, Error>]>,
+    // Arc over a fixed-size slice — pool slots are never added or removed. Predictor rebuilds
+    // happen on each worker's inference thread, so a slot's channel sender never changes.
+    pool: PoolSlab<Input, Output, Error>,
     size: u8,
     start: Arc<AtomicUsize>,
 }
 
 impl<Input, Output, Error> Clone for WorkerPool<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
     fn clone(&self) -> Self {
         let pool = Arc::clone(&self.pool);
@@ -45,9 +47,9 @@ where
 
 impl<Input, Output, Error> WorkerPool<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
     pub(crate) fn new(
         pool: Vec<WorkerRef<Input, Output, Error>>,
@@ -61,15 +63,15 @@ where
         }
     }
 
-    pub(crate) fn get_weak_ref(&self) -> Weak<[WorkerRef<Input, Output, Error>]> {
-        Arc::downgrade(&self.pool)
-    }
-
     /// Load-aware round-robin routing.
     ///
-    /// Selects a start point via global round-robin and walks the pool until all workers are
-    /// exhausted. If no worker is ready to accept work, the first live worker not in
-    /// [WorkerStatus::Exit] or [WorkerStatus::Crashed] state is used as a fallback.
+    /// Selects a start point via global round-robin, then makes two passes over the pool from that
+    /// point. The first pass only tries [WorkerStatus::Waiting] workers. The second tries every
+    /// worker, so a busy worker with room in its channel can still take the request.
+    ///
+    /// Returns [`BatchinfError::QueueFullError`] if at least one worker is alive but every channel
+    /// is full, and [`BatchinfError::NoAvailableWorkersError`] if every worker has exited or
+    /// crashed.
     pub(crate) fn push(
         &self,
         mut msg: FunnelMessage<Input, Output, Error>,
@@ -89,11 +91,9 @@ where
         // First try uses global round robin.
         let mut sink = self.get_and_increment();
 
-        // Fallback is the first worker not in Exit or Crashed state that we observe when looking
-        // for a worker that can accept work.
         let size = self.pool_size();
 
-        // Select the first worker in the waiting state. Exhaust all workers.
+        // Pass 1: select the first worker in the waiting state. Exhaust all workers.
         for _ in 0..size {
             let handle = &self.pool[sink];
             let WorkerSnapshot { status, queue_len } = handle.snapshot();
@@ -108,8 +108,7 @@ where
                     // When the queue is closed due to either a worker crash or exit, messages get
                     // handed back and retried.
                     QueuePushResult::QueueClosed(m) => msg = m,
-                    // The resolved queue is full. Hand back message and set fallback sink.
-                    // The first live worker is set to be the fallback sink.
+                    // The resolved queue is full. Hand back the message; it is retried in pass 2.
                     QueuePushResult::QueueFull(m) => {
                         msg = m;
                     }

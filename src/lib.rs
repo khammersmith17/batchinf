@@ -10,14 +10,22 @@
 //! For high throughput ML services, single example inference can lead to lower throughput and low
 //! device utilization.
 //!
-//! This crate requires the multi-thread `tokio` runtime, and is built upon `tokio`
-//! primitives. It handles graceful termination and restarts workers that panic during inference.
+//! This crate is built upon `tokio` primitives and works with both the multi-thread and the
+//! current-thread runtime. Each worker runs inference on its own dedicated OS thread, so
+//! inference never blocks the async runtime. It handles graceful termination and rebuilds the
+//! predictor when inference panics.
 //!
 //! To use, implement a type to hold inference state, such as model weights or an instance of a
 //! model type in the framework the model is implemented in. Implement the [`Predictor`] trait on
 //! that type. This trait requires a defined input type, output type, and an error type that can
-//! bubble up when inference fails. Implement [`Predictor::predict_batch`], which takes a shared
-//! reference to the buffered inference inputs and returns a `Result<Vec<Output>, Error>`.
+//! bubble up when inference fails. Implement [`Predictor::predict_batch`], which takes the
+//! buffered inference inputs as a slice and returns a `Result<Vec<Output>, Error>`.
+//!
+//! Pass [`get_batcher`] a factory closure that builds the predictor for a given worker index. It
+//! is called on each worker's inference thread, so a predictor can bind to a device (for example
+//! `worker % n_gpus`) and does not need to be `Clone` or `Send`. The factory is called again to
+//! rebuild the predictor after a panic, so load or download model weights once outside the
+//! factory and capture them in the closure (for example as an `Arc`).
 //!
 //! Within a service endpoint handler, [`Batchinf`] can be used as service state. It is cheap to
 //! clone. This type handles all inference input dispatch and returns the inference result back to
@@ -30,6 +38,7 @@
 //! ```no_run
 //! use batchinf::{BatcherConfig, Predictor, get_batcher};
 //! use std::num::{NonZeroU8, NonZeroU32};
+//! use std::sync::Arc;
 //! use std::time::Duration;
 //!
 //! #[derive(Clone)]
@@ -51,7 +60,7 @@
 //!     type Output = Vec<f32>;
 //!     type Error = ModelError;
 //!
-//!     fn predict_batch(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, ModelError> {
+//!     fn predict_batch(&mut self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, ModelError> {
 //!         // Run your model here. Each output must correspond to the input at the same index.
 //!         Ok(inputs.to_vec())
 //!     }
@@ -60,7 +69,8 @@
 //! #[tokio::main(flavor = "multi_thread")]
 //! async fn main() {
 //!     let batcher = get_batcher(
-//!         EchoModel,
+//!         // Called on each worker's inference thread to build that worker's predictor.
+//!         Arc::new(|_worker_id| EchoModel),
 //!         BatcherConfig {
 //!             batch_size: NonZeroU32::new(32).unwrap(),
 //!             batch_timeout: Duration::from_millis(10),
@@ -78,7 +88,6 @@
 
 pub(crate) mod batcher;
 pub(crate) mod config;
-pub(crate) mod control_plane;
 pub(crate) mod error;
 pub(crate) mod observability;
 pub(crate) mod pool;

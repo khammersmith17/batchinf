@@ -5,7 +5,7 @@ use tokio::sync::oneshot::error::RecvError;
 #[derive(Debug, Error, Clone)]
 pub enum BatchinfError<E>
 where
-    E: std::error::Error + Clone + Sync + Send + 'static,
+    E: std::error::Error + Clone + Send + 'static,
 {
     /// [`Predictor::predict_batch`](`crate::Predictor`) returned an error. The error is propagated to every
     /// caller whose request was part of the failed batch.
@@ -35,7 +35,7 @@ where
 
 impl<E> From<RecvError> for BatchinfError<E>
 where
-    E: std::error::Error + Clone + Sync + Send + 'static,
+    E: std::error::Error + Clone + Send + 'static,
 {
     fn from(_err: RecvError) -> BatchinfError<E> {
         BatchinfError::InternalError

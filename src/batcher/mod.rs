@@ -18,9 +18,9 @@ use tokio::{
 #[derive(Debug)]
 pub struct Batchinf<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
     pool: WorkerPool<Input, Output, Error>,
     obs: Option<Arc<dyn BatcherMetrics>>,
@@ -28,9 +28,9 @@ where
 
 impl<Input, Output, Error> Clone for Batchinf<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
     fn clone(&self) -> Self {
         let obs = self.obs.clone();
@@ -41,9 +41,9 @@ where
 
 impl<Input, Output, Error> Batchinf<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
     pub(crate) fn new(
         pool: WorkerPool<Input, Output, Error>,

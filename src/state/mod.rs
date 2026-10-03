@@ -1,21 +1,17 @@
 use crate::{config::InnerConfig, pool::FunnelMessage};
 use std::{
-    collections::VecDeque,
     sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
-use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
-
-/// Exclusive access around the DL Queue buffer to recover orphaned requests on worker crash.
-type WorkerDlQueue<Input, Output, Error> = Mutex<VecDeque<FunnelMessage<Input, Output, Error>>>;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 
 // Mask the state bits to get the queue len.
 const QUEUE_MASK: u64 = !(0b11_u64 << 62);
 
 pub(crate) enum QueuePushResult<Input, Output, Error>
 where
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
     Success,
     QueueFull(FunnelMessage<Input, Output, Error>),
@@ -43,9 +39,11 @@ pub enum WorkerStatus {
     Waiting = 0,
     /// The worker has exited and is no longer accepting requests.
     Exit = 1,
-    /// Currently executing [`Predictor::predict_batch`](`crate::Predictor`).
+    /// A full batch is ready and is being handed to the inference thread. The worker stays in this
+    /// state while the inference thread is busy and already has a batch queued.
     Running = 2,
-    /// [`Predictor::predict_batch`](`crate::Predictor`) panicked. The control plane will restart the worker.
+    /// The worker's inference thread has stopped because the predictor factory failed repeatedly.
+    /// The worker no longer accepts requests.
     Crashed = 3,
 }
 
@@ -85,43 +83,19 @@ pub struct WorkerSnapshot {
 /// Struct to store inner worker state.
 /// State that will be shared and wrapped in Arc<T>.
 #[derive(Debug)]
-struct WorkerStateInner<Input, Output, Error>
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
+struct WorkerStateInner {
     // State is stored in the 2 MSB here atomic load/store.
     // The other 62 bits store the queue length.
     // Fused into a single atomic given both attributes may need to be updated in a single store.
     state: AtomicU64,
     config: InnerConfig,
-    // Collection to handle orphaned requests on crash.
-    dl_queue: WorkerDlQueue<Input, Output, Error>,
-    // Tx to signal crash to control loop with `worker_id`.
-    panic_tx: Sender<u8>,
-    // ID for random access in control plane during crash handling.
-    worker_id: u8,
 }
 
-impl<Input, Output, Error> WorkerStateInner<Input, Output, Error>
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
-    fn new(
-        config: InnerConfig,
-        panic_tx: Sender<u8>,
-        worker_id: u8,
-    ) -> WorkerStateInner<Input, Output, Error> {
-        let dl_queue = Mutex::new(VecDeque::new());
+impl WorkerStateInner {
+    fn new(config: InnerConfig) -> WorkerStateInner {
         WorkerStateInner {
             state: AtomicU64::new(0_u64),
             config,
-            dl_queue,
-            panic_tx,
-            worker_id,
         }
     }
 
@@ -147,71 +121,24 @@ where
             }
         }
     }
-
-    /// On worker crash, transmit sentinel signal, unit type, to the control plane loop to wake it
-    /// up.
-    fn signal_crash(&self) {
-        // Try send here.
-        // If this errors, the poll loop in the control plane will read the crash state.
-        let _ = self.panic_tx.try_send(self.worker_id);
-    }
-
-    /// On worker crash, buffer orphaned messages for the restarted worker and set the state to
-    /// [WorkerStatus::Crashed].
-    ///
-    /// The state is set while holding the DL queue lock. The control plane only restarts a worker
-    /// after observing [WorkerStatus::Crashed], and [Self::drain_dl_queue] blocks on the same lock,
-    /// so a restart always sees the complete set of orphaned messages.
-    fn mark_crashed(&self, recv: &mut Receiver<FunnelMessage<Input, Output, Error>>) {
-        let mut handle = self.dl_queue.lock().unwrap();
-        self.set_state(WorkerStatus::Crashed);
-        while let Ok(inp) = recv.try_recv() {
-            handle.push_back(inp);
-        }
-    }
-
-    /// Drain all orphaned messages to queue them for the restarted worker.
-    fn drain_dl_queue(&self) -> Vec<FunnelMessage<Input, Output, Error>> {
-        let mut handle = self.dl_queue.lock().unwrap();
-        handle.drain(..).collect()
-    }
 }
 
 /// Crate public wrapper type for [WorkerStateInner].
 #[derive(Debug)]
-pub(crate) struct WorkerState<Input, Output, Error>
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
-    inner: Arc<WorkerStateInner<Input, Output, Error>>,
+pub(crate) struct WorkerState {
+    inner: Arc<WorkerStateInner>,
 }
 
-impl<Input, Output, Error> Clone for WorkerState<Input, Output, Error>
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
+impl Clone for WorkerState {
     fn clone(&self) -> Self {
         let inner = Arc::clone(&self.inner);
         Self { inner }
     }
 }
 
-impl<Input, Output, Error> WorkerState<Input, Output, Error>
-where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
-    pub(crate) fn new(
-        config: InnerConfig,
-        crash_tx: Sender<u8>,
-        worker_id: u8,
-    ) -> WorkerState<Input, Output, Error> {
-        let inner = Arc::new(WorkerStateInner::new(config, crash_tx, worker_id));
+impl WorkerState {
+    pub(crate) fn new(config: InnerConfig) -> WorkerState {
+        let inner = Arc::new(WorkerStateInner::new(config));
 
         WorkerState { inner }
     }
@@ -254,48 +181,34 @@ where
     pub(crate) fn reset_queue_len(&self) {
         self.inner.state.store(0_u64, Ordering::Release);
     }
-
-    pub(crate) fn signal_crash(&self) {
-        self.inner.signal_crash()
-    }
-
-    /// On worker crash, buffer orphaned messages for the restarted worker and set the state to
-    /// [WorkerStatus::Crashed]. See [WorkerStateInner::mark_crashed] for the locking invariant.
-    pub(crate) fn mark_crashed(&self, recv: &mut Receiver<FunnelMessage<Input, Output, Error>>) {
-        self.inner.mark_crashed(recv);
-    }
-
-    /// Drain all orphaned messages to queue them for the restarted worker.
-    pub(crate) fn drain_dl_queue(&self) -> Vec<FunnelMessage<Input, Output, Error>> {
-        self.inner.drain_dl_queue()
-    }
 }
 
 #[derive(Debug)]
 pub(crate) struct WorkerRef<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
-    state: WorkerState<Input, Output, Error>,
-    // This type is already wrapped in Arc, no need for the extra indirection.
-    worker_queue: Mutex<Sender<FunnelMessage<Input, Output, Error>>>,
+    state: WorkerState,
+    // Fixed for the worker's lifetime: predictor rebuilds happen on the inference thread, so the
+    // request channel is never replaced.
+    worker_queue: Sender<FunnelMessage<Input, Output, Error>>,
 }
 
 impl<Input, Output, Error> WorkerRef<Input, Output, Error>
 where
-    Input: Send + Sync + 'static,
-    Output: Send + Sync + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Clone + Send + 'static,
 {
     pub(crate) fn new(
-        state: WorkerState<Input, Output, Error>,
+        state: WorkerState,
         worker_queue: Sender<FunnelMessage<Input, Output, Error>>,
     ) -> Self {
         Self {
             state,
-            worker_queue: Mutex::new(worker_queue),
+            worker_queue,
         }
     }
 
@@ -321,33 +234,11 @@ where
             return QueuePushResult::QueueClosed(msg);
         }
 
-        // Only hold the lock to clone the tx pointer.
-        let queue_handle = self.acquire_queue_handle();
-
-        match queue_handle.try_send(msg) {
+        match self.worker_queue.try_send(msg) {
             Ok(_) => QueuePushResult::Success,
             Err(TrySendError::Full(m)) => QueuePushResult::QueueFull(m),
             Err(TrySendError::Closed(m)) => QueuePushResult::QueueClosed(m),
         }
-    }
-
-    /// Acquire a pointer to the queue channel sender.
-    /// The critical section is only a pointer copy.
-    #[inline]
-    fn acquire_queue_handle(&self) -> Sender<FunnelMessage<Input, Output, Error>> {
-        self.worker_queue.lock().unwrap().clone()
-    }
-
-    /// Swap in a new sender channel.
-    /// This is called when a crashed worker is restarted, or during shutdown signal handling.
-    pub(crate) fn replace_queue(&self, worker_queue: Sender<FunnelMessage<Input, Output, Error>>) {
-        let mut handle = self.worker_queue.lock().unwrap();
-        let _ = std::mem::replace(&mut *handle, worker_queue);
-    }
-
-    /// Pull a clone of the worker state.
-    pub(crate) fn clone_worker_state(&self) -> WorkerState<Input, Output, Error> {
-        self.state.clone()
     }
 }
 
