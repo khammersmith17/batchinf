@@ -68,7 +68,11 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
 /// - `predictor_factory`: Builds the predictor for a worker, given the worker's index
 ///   (`0..pool_size`). Called on that worker's inference thread at startup, and again to rebuild
 ///   the predictor after [`Predictor::predict_batch`] panics. Load model weights once outside the
-///   factory and capture them in the closure, rather than loading inside it.
+///   factory and capture them in the closure, rather than loading inside it. Signal failure by
+///   panicking: a factory that keeps failing marks its worker
+///   [`PredictorStatus::Dead`](`crate::PredictorStatus::Dead`). This function still returns, the
+///   router skips that worker, and the failure is visible in
+///   [`Batchinf::pool_status`](`crate::Batchinf::pool_status`).
 /// - `config`: Batching and pool configuration. See [`BatcherConfig`].
 /// - `observability`: Optional metrics hook. Pass `None` to disable. See [`observability::BatcherMetrics`].
 pub fn get_batcher<P: Predictor + 'static>(
@@ -76,8 +80,8 @@ pub fn get_batcher<P: Predictor + 'static>(
     config: BatcherConfig,
     observability: Option<Arc<dyn observability::BatcherMetrics>>,
 ) -> Batchinf<P::Input, P::Output, P::Error> {
-    let batch_size = config.batch_size.get();
     let pool_size = config.pool_size.get();
+    let channel_size = config.queue_size.get();
 
     let conf: InnerConfig = config.clone().into();
 
@@ -86,7 +90,7 @@ pub fn get_batcher<P: Predictor + 'static>(
     let (inf_workers, worker_refs) = init_worker_ref_pairs(
         Arc::clone(&predictor_factory),
         &workers,
-        batch_size as usize,
+        channel_size as usize,
         observability.clone(),
     );
     let pool: WorkerPool<P::Input, P::Output, P::Error> = WorkerPool::new(worker_refs);

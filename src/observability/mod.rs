@@ -12,12 +12,25 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// batch.
     fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger);
 
-    /// Fires after a batch is complete and successful. Clocks how fast the
-    /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) runs on a batch size.
+    /// Fires after a batch completes successfully.
+    ///
+    /// `latency` is the wall-clock time spent inside
+    /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) only. It excludes
+    /// time queued in the batcher and result delivery, so it reflects the cost of the predictor
+    /// implementation at this batch size. Use it to profile and tune the predictor; measure
+    /// per-request latency around [`Batchinf::predict`](`crate::batcher::Batchinf::predict`)
+    /// instead.
     fn on_batch_complete_ok(&self, batch_size: usize, latency: tokio::time::Duration);
 
-    /// Fires after a batch completes with an error.
-    fn on_batch_complete_err(&self, batch_size: usize);
+    /// Fires after a batch completes with an error: either
+    /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) returned `Err`,
+    /// or it returned a different number of outputs than inputs.
+    ///
+    /// `latency` is measured the same way as in
+    /// [`on_batch_complete_ok`](BatcherMetrics::on_batch_complete_ok): time spent inside
+    /// `predict_batch` only. Slow failures, such as device timeouts or out-of-memory errors at
+    /// large batch sizes, show up here.
+    fn on_batch_complete_err(&self, batch_size: usize, latency: tokio::time::Duration);
 
     /// Fires when an inference request queued through
     /// [`Batchinf::predict_with_timeout`](`crate::batcher::Batchinf::predict_with_timeout`) times out.
@@ -43,9 +56,10 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
         self.on_batch_complete_ok(size, latency)
     }
 
-    // Emit and unsuccesful inference.
-    fn emit_inference_err(&self, size: usize) {
-        self.on_batch_complete_err(size)
+    // Emit an unsuccessful inference.
+    fn emit_inference_err(&self, metrics: InfBatchMetrics) {
+        let InfBatchMetrics { size, latency } = metrics;
+        self.on_batch_complete_err(size, latency)
     }
 }
 
@@ -72,9 +86,12 @@ pub(crate) mod emitters {
         }
     }
 
-    pub(crate) fn emit_inference_err(obs: Option<Arc<dyn BatcherMetrics>>, size: usize) {
+    pub(crate) fn emit_inference_err(
+        obs: Option<Arc<dyn BatcherMetrics>>,
+        metrics: InfBatchMetrics,
+    ) {
         if let Some(obs) = obs {
-            obs.emit_inference_err(size);
+            obs.emit_inference_err(metrics);
         }
     }
 

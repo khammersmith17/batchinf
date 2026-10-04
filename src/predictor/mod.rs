@@ -4,7 +4,7 @@
 pub trait Predictor {
     type Input: Send + 'static;
     type Output: Send + 'static;
-    type Error: std::error::Error + Clone + Send + 'static;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// This is where the magic happens.
     ///

@@ -75,6 +75,7 @@
 //!             batch_size: NonZeroU32::new(32).unwrap(),
 //!             batch_timeout: Duration::from_millis(10),
 //!             pool_size: NonZeroU8::new(1).unwrap(),
+//!             queue_size: NonZeroU32::new(32).unwrap(),
 //!         },
 //!         None,
 //!     );
@@ -102,4 +103,4 @@ pub use error::BatchinfError;
 pub use observability::{BatchTrigger, BatcherMetrics};
 pub use predictor::Predictor;
 pub use setup::get_batcher;
-pub use state::{WorkerSnapshot, WorkerStatus};
+pub use state::{PredictorStatus, WorkerSnapshot, WorkerStatus};

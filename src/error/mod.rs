@@ -1,16 +1,17 @@
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::oneshot::error::RecvError;
 
 /// Error returned by [`Batchinf::predict`](`crate::Batchinf`) and [`Batchinf::predict_with_timeout`](`crate::Batchinf`).
-#[derive(Debug, Error, Clone)]
+#[derive(Debug, Error)]
 pub enum BatchinfError<E>
 where
-    E: std::error::Error + Clone + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     /// [`Predictor::predict_batch`](`crate::Predictor`) returned an error. The error is propagated to every
     /// caller whose request was part of the failed batch.
     #[error("Unable to perform inference: {0}")]
-    InferenceError(E),
+    InferenceError(Arc<E>),
     /// The worker exited before returning a result, typically caused by a panic inside
     /// [`Predictor::predict_batch`](`crate::Predictor`).
     #[error("Internal Error")]
@@ -33,9 +34,28 @@ where
     InvalidPredictorOutput,
 }
 
+impl<E> Clone for BatchinfError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn clone(&self) -> BatchinfError<E> {
+        match self {
+            Self::InferenceError(e) => {
+                let err = Arc::clone(e);
+                Self::InferenceError(err)
+            }
+            Self::InternalError => Self::InternalError,
+            Self::TimeoutError => Self::TimeoutError,
+            Self::NoAvailableWorkersError => Self::NoAvailableWorkersError,
+            Self::QueueFullError => Self::QueueFullError,
+            Self::InvalidPredictorOutput => Self::InvalidPredictorOutput,
+        }
+    }
+}
+
 impl<E> From<RecvError> for BatchinfError<E>
 where
-    E: std::error::Error + Clone + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     fn from(_err: RecvError) -> BatchinfError<E> {
         BatchinfError::InternalError

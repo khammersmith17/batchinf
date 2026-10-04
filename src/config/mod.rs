@@ -22,24 +22,29 @@ pub struct BatcherConfig {
     pub batch_size: NonZeroU32,
     /// The number of workers defined in the pool.
     pub pool_size: NonZeroU8,
+    /// Capacity of each worker's request queue: the number of requests that can wait for a
+    /// worker before it is considered full. When every live worker's queue is full,
+    /// [`Batchinf::predict`](`crate::Batchinf::predict`) returns
+    /// [`BatchinfError::QueueFullError`](`crate::BatchinfError::QueueFullError`).
+    pub queue_size: NonZeroU32,
 }
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct InnerConfig {
     pub(crate) timeout: Duration,
-    pub(crate) size: u32,
+    pub(crate) batch_size: u32,
 }
 
 impl From<BatcherConfig> for InnerConfig {
     fn from(conf: BatcherConfig) -> InnerConfig {
         let BatcherConfig {
             batch_timeout: timeout,
-            batch_size: size,
+            batch_size,
             ..
         } = conf;
         InnerConfig {
             timeout,
-            size: size.into(),
+            batch_size: batch_size.into(),
         }
     }
 }

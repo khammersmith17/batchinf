@@ -20,7 +20,7 @@ pub struct Batchinf<Input, Output, Error>
 where
     Input: Send + 'static,
     Output: Send + 'static,
-    Error: std::error::Error + Clone + Send + 'static,
+    Error: std::error::Error + Send + Sync + 'static,
 {
     pool: WorkerPool<Input, Output, Error>,
     obs: Option<Arc<dyn BatcherMetrics>>,
@@ -30,7 +30,7 @@ impl<Input, Output, Error> Clone for Batchinf<Input, Output, Error>
 where
     Input: Send + 'static,
     Output: Send + 'static,
-    Error: std::error::Error + Clone + Send + 'static,
+    Error: std::error::Error + Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         let obs = self.obs.clone();
@@ -43,7 +43,7 @@ impl<Input, Output, Error> Batchinf<Input, Output, Error>
 where
     Input: Send + 'static,
     Output: Send + 'static,
-    Error: std::error::Error + Clone + Send + 'static,
+    Error: std::error::Error + Send + Sync + 'static,
 {
     pub(crate) fn new(
         pool: WorkerPool<Input, Output, Error>,

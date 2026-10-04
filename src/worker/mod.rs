@@ -32,7 +32,7 @@ const JOB_QUEUE_DEPTH: usize = 1;
 /// Type that holds state required to orchestrate and perform inference.
 pub(crate) struct InferenceWorker<P: Predictor> {
     state: WorkerState,
-    predictor: PredictorFactory<P>,
+    factory: PredictorFactory<P>,
     obs: Option<Arc<dyn BatcherMetrics>>,
     worker_id: usize,
 }
@@ -41,13 +41,13 @@ pub(crate) struct InferenceWorker<P: Predictor> {
 impl<P: Predictor> InferenceWorker<P> {
     pub(crate) fn new(
         state: WorkerState,
-        predictor: PredictorFactory<P>,
+        factory: PredictorFactory<P>,
         obs: Option<Arc<dyn BatcherMetrics>>,
         worker_id: usize,
     ) -> InferenceWorker<P> {
         InferenceWorker {
             state,
-            predictor,
+            factory,
             obs,
             worker_id,
         }
@@ -63,7 +63,7 @@ impl<P: Predictor> InferenceWorker<P> {
     }
 
     fn set_running_and_emit(&self, trigger_type: BatchTrigger, batch_size: usize) {
-        self.state.set_state(WorkerStatus::Running);
+        self.state.set_worker_state(WorkerStatus::Running);
         emitters::emit_batch_start(self.obs.clone(), trigger_type, batch_size);
     }
 }
@@ -87,23 +87,6 @@ impl<P: Predictor> WorkerBuffer<P> {
     fn push(&mut self, request: P::Input, sender: OutputSender<P>) {
         self.sender_buffer.push(sender);
         self.input_buffer.push(request);
-    }
-
-    fn split(mut self, batch_size: usize) -> (WorkerBuffer<P>, Option<WorkerBuffer<P>>) {
-        if self.len() < batch_size {
-            return (self, None);
-        }
-
-        let sender_buffer = self.sender_buffer.split_off(batch_size);
-        let input_buffer = self.input_buffer.split_off(batch_size);
-
-        (
-            self,
-            Some(WorkerBuffer {
-                sender_buffer,
-                input_buffer,
-            }),
-        )
     }
 
     // Returns the number of items in the buffer.
@@ -133,43 +116,14 @@ impl<P: Predictor> WorkerBuffer<P> {
     }
 }
 
-fn drain_exited_recv<P: Predictor>(
-    buffer: &mut WorkerBuffer<P>,
-    input_receiver: &mut InputReceiver<P>,
-) {
-    while let Ok((request, sender)) = input_receiver.try_recv() {
-        buffer.push(request, sender);
-    }
-}
-
-async fn batch_inference_on_exit<P: Predictor>(
-    worker: &mut InferenceWorker<P>,
-    mut buffer: WorkerBuffer<P>,
-    job_sender: &JobSender<P>,
-) {
-    worker.state.set_state(WorkerStatus::Exit);
-    let batch_cap = worker.state.capacity() as usize;
-    loop {
-        let (batch, rem) = buffer.split(batch_cap);
-        // If inference fails on final shutdown, exit and do not restart.
-        let alive = run_inference(batch, job_sender).await;
-        if alive.is_err() {
-            return;
-        }
-        match rem {
-            Some(rem) => buffer = rem,
-            None => return,
-        }
-    }
-}
-
 fn make_runner<P: Predictor + 'static>(
     factory: PredictorFactory<P>,
+    worker_state: WorkerState,
     worker_id: usize,
     obs: Option<Arc<dyn BatcherMetrics>>,
 ) -> JobSender<P> {
     let (job_tx, job_rx) = channel::<WorkerBuffer<P>>(JOB_QUEUE_DEPTH);
-    spawn_inference_runner(factory, job_rx, worker_id, obs);
+    spawn_inference_runner(factory, job_rx, worker_state, worker_id, obs);
     job_tx
 }
 
@@ -180,22 +134,23 @@ fn make_runner<P: Predictor + 'static>(
 //
 // After inference, the state is evaluated to determine if the worker should continue.
 async fn worker_loop<P: Predictor + 'static>(
-    mut worker: InferenceWorker<P>,
+    worker: InferenceWorker<P>,
     mut input_receiver: InputReceiver<P>,
 ) {
-    let cap = worker.state.capacity() as usize;
+    let cap = worker.state.batch_size() as usize;
     let mut next_inf = Instant::now();
     let mut buffer = WorkerBuffer::new(cap);
     let job_tx = make_runner(
-        Arc::clone(&worker.predictor),
+        Arc::clone(&worker.factory),
+        worker.state.clone(),
         worker.worker_id,
         worker.obs.clone(),
     );
 
     loop {
         accumulate_next_batch(&mut input_receiver, &worker, &mut buffer, &mut next_inf).await;
-        let mut live_buffer = std::mem::replace(&mut buffer, WorkerBuffer::new(cap));
-        match worker.state.get_state() {
+        let live_buffer = std::mem::replace(&mut buffer, WorkerBuffer::new(cap));
+        match worker.state.get_worker_state() {
             WorkerStatus::Waiting => unreachable!(),
             WorkerStatus::Running => {
                 // Waits here while the inference thread is busy and a batch is already queued.
@@ -203,15 +158,15 @@ async fn worker_loop<P: Predictor + 'static>(
                 if alive.is_err() {
                     // The inference thread is gone. Returning drops the request receiver, so the
                     // router sees this worker as closed and queued requests get InternalError.
-                    worker.state.set_state(WorkerStatus::Crashed);
+                    worker.state.set_worker_state(WorkerStatus::Crashed);
                     return;
                 }
                 // Batch handed off. Signal that this worker can accept a new batch.
                 worker.state.reset_queue_len();
             }
             WorkerStatus::Exit => {
-                drain_exited_recv(&mut live_buffer, &mut input_receiver);
-                batch_inference_on_exit(&mut worker, live_buffer, &job_tx).await;
+                // Ownership semantics ensure that no requests are still queued.
+                // If there are any tasks waiting on a oneshot recv, all worker non-crashed channels will still be open.
                 return;
             }
             // Only this loop sets Crashed, when the inference thread is gone, and it returns
@@ -239,12 +194,12 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
         worker.reset_next_inf(next_inf);
     } else {
         // None indicates the channel is closed. In this case set the state to exit.
-        worker.state.set_state(WorkerStatus::Exit);
+        worker.state.set_worker_state(WorkerStatus::Exit);
         return;
     }
 
     // Batch size 1 is satisfied on first read.
-    if worker.state.capacity() == 1 {
+    if worker.state.batch_size() == 1 {
         worker.set_running_and_emit(BatchTrigger::Capacity, buffer.len());
         return;
     }
@@ -257,14 +212,14 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
                     buffer.push(request, sender);
 
                     worker.state.increment_len();
-                    if buffer.len() == (worker.state.capacity() as usize){
+                    if buffer.len() == (worker.state.batch_size() as usize){
                         // Set state and emit trigger.
                         worker.set_running_and_emit(BatchTrigger::Capacity, buffer.len());
                         break;
                     }
 
                 } else {
-                    worker.state.set_state(WorkerStatus::Exit);
+                    worker.state.set_worker_state(WorkerStatus::Exit);
                     return;
                 };
 
@@ -274,7 +229,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
                     // Inference happens in an Exit state.
                     //
                     // Only log a timeout when the worker has not exited.
-                    if matches!(worker.state.get_state(), WorkerStatus::Waiting) && !buffer.is_empty() {
+                    if matches!(worker.state.get_worker_state(), WorkerStatus::Waiting) && !buffer.is_empty() {
                         worker.set_running_and_emit(BatchTrigger::Timeout, buffer.len());
                     }
 

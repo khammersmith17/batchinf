@@ -29,8 +29,9 @@ pub(super) fn send_output<P: Predictor>(
         Ok(b) => b,
         // User defined error, so P::Error is propogated forward.
         Err(e) => {
+            let err = Arc::new(e);
             send_errors::<P>(
-                BatchinfError::InferenceError(e),
+                BatchinfError::InferenceError(err),
                 senders,
                 metrics,
                 obs.clone(),
@@ -55,7 +56,17 @@ pub(super) fn send_errors<P: Predictor>(
     metrics: InfBatchMetrics,
     obs: Option<Arc<dyn BatcherMetrics>>,
 ) {
-    emitters::emit_inference_err(obs, metrics.size);
+    emitters::emit_inference_err(obs, metrics);
+    for sender in senders.into_iter() {
+        let e = Err(error.clone());
+        // Ignoring error here as receiver might have been closed due to timeout,
+        // which is a valid state.
+        let _ = sender.send(e);
+    }
+}
+
+pub(super) fn send_errors_on_crash<P: Predictor>(senders: Vec<OutputSender<P>>) {
+    let error = BatchinfError::InternalError;
     for sender in senders.into_iter() {
         let e = Err(error.clone());
         // Ignoring error here as receiver might have been closed due to timeout,
