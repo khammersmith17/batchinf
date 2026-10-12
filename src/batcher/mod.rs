@@ -70,6 +70,12 @@ where
         rx.await?
     }
 
+    pub fn blocking_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
+        let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
+        self.pool.push((input, tx))?;
+        rx.blocking_recv()?
+    }
+
     /// Submits an inference request with a caller-side deadline.
     ///
     /// Equivalent to [`predict`](Batchinf::predict) but returns [`BatchinfError::TimeoutError`]

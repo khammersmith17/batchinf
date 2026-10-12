@@ -36,10 +36,14 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// [`Batchinf::predict_with_timeout`](`crate::batcher::Batchinf::predict_with_timeout`) times out.
     fn on_request_timeout(&self);
 
-    /// Intended to report the total number of inference requests waiting to be serviced.
+    /// Reports the number of requests waiting in one worker's queue, not yet pulled into a batch.
     ///
-    /// Not currently emitted: queue-depth reporting is being reworked.
-    fn on_queue_depth(&self, queue_depth: usize);
+    /// Emitted per worker at batch boundaries: when a batch is handed to the inference thread,
+    /// and again once the hand-off completes, which captures any backlog that built up while the
+    /// inference thread was busy or rebuilding. Nothing is emitted while a worker is idle, so
+    /// treat this as a gauge that keeps its last value. Aggregate across workers as needed: the
+    /// maximum shows whether any single worker is backed up, the sum shows total backlog.
+    fn on_queue_depth(&self, worker_id: u8, queue_depth: usize);
 
     /// Fires on the worker's inference thread when
     /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) panics, before
@@ -98,6 +102,16 @@ pub(crate) mod emitters {
     pub(crate) fn emit_worker_panic(obs: Option<Arc<dyn BatcherMetrics>>) {
         if let Some(obs) = obs {
             obs.on_worker_panic();
+        }
+    }
+
+    pub(crate) fn emit_queue_depth(
+        obs: Option<Arc<dyn BatcherMetrics>>,
+        worker_id: u8,
+        depth: usize,
+    ) {
+        if let Some(obs) = obs {
+            obs.on_queue_depth(worker_id, depth);
         }
     }
 }

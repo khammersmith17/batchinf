@@ -27,6 +27,10 @@ pub struct BatcherConfig {
     /// [`Batchinf::predict`](`crate::Batchinf::predict`) returns
     /// [`BatchinfError::QueueFullError`](`crate::BatchinfError::QueueFullError`).
     pub queue_size: NonZeroU32,
+    pub worker_start_retries: u8,
+    pub worker_start_backoff_start: Duration,
+    pub max_worker_retry_wait: Duration,
+    pub startup_timeout: Duration,
 }
 
 #[derive(Debug, Copy, Clone)]

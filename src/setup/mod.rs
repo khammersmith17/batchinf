@@ -2,16 +2,24 @@ use crate::{
     batcher::Batchinf,
     config::BatcherConfig,
     config::InnerConfig,
+    error::StartupError,
     observability,
     pool::{FunnelMessage, WorkerPool},
     predictor::Predictor,
     state::{WorkerRef, WorkerState},
-    worker::{InferenceWorker, InputReceiver, run_worker},
+    worker::{InferenceWorker, InputReceiver, PredictorStartConfig, run_worker},
 };
-use std::sync::Arc;
-use tokio::sync::mpsc::channel;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    select,
+    sync::mpsc::{Receiver, channel},
+    time::sleep,
+};
 
-pub type PredictorFactory<P> = Arc<dyn Fn(usize) -> P + Send + Sync>;
+pub type PredictorFactory<P> = Arc<dyn Fn(u8) -> P + Send + Sync>;
 type WorkerRefPairs<P> = (
     Vec<(InferenceWorker<P>, InputReceiver<P>)>,
     Vec<WorkerRef<<P as Predictor>::Input, <P as Predictor>::Output, <P as Predictor>::Error>>,
@@ -42,12 +50,45 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
         let (tx, rx) = channel::<FunnelMessage<P::Input, P::Output, P::Error>>(channel_size);
         let obs = obs.clone();
         let inf_worker =
-            InferenceWorker::new(worker.clone(), Arc::clone(&predictor_factory), obs, i);
+            InferenceWorker::new(worker.clone(), Arc::clone(&predictor_factory), obs, i as u8);
         let worker_ref = WorkerRef::new(worker.clone(), tx);
         inf_workers.push((inf_worker, rx));
         worker_refs.push(worker_ref);
     }
     (inf_workers, worker_refs)
+}
+
+// TODO: Make this an mpsc channel of size `pool_size`.
+async fn poll_acks(mut rxs: Receiver<(u8, bool)>, pool_size: u8) -> Result<(), StartupError> {
+    let mut acked = 0_u8;
+    while let Some((worker_id, started)) = rxs.recv().await {
+        if !started {
+            return Err(StartupError::WorkerStartFailure { worker_id });
+        }
+        acked += 1;
+        // Done once every worker has reported. Don't wait for the channel to close: senders are
+        // still held by `get_batcher` and by the inference threads.
+        if acked == pool_size {
+            return Ok(());
+        }
+    }
+    // The channel closed before every worker reported, so a worker stopped without acking.
+    Err(StartupError::InternalError)
+}
+
+async fn collect_acks(
+    rxs: Receiver<(u8, bool)>,
+    pool_size: u8,
+    timeout: Duration,
+) -> Result<(), StartupError> {
+    select!(
+         res = poll_acks(rxs, pool_size) => {
+            res
+        }
+        _ = sleep(timeout) => {
+            Err(StartupError::Timeout)
+        }
+    )
 }
 
 /// Creates a [`Batchinf`] handle backed by the provided [`Predictor`].
@@ -75,11 +116,12 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
 ///   [`Batchinf::pool_status`](`crate::Batchinf::pool_status`).
 /// - `config`: Batching and pool configuration. See [`BatcherConfig`].
 /// - `observability`: Optional metrics hook. Pass `None` to disable. See [`observability::BatcherMetrics`].
-pub fn get_batcher<P: Predictor + 'static>(
+pub async fn get_batcher<P: Predictor + 'static>(
     predictor_factory: PredictorFactory<P>,
     config: BatcherConfig,
     observability: Option<Arc<dyn observability::BatcherMetrics>>,
-) -> Batchinf<P::Input, P::Output, P::Error> {
+) -> Result<Batchinf<P::Input, P::Output, P::Error>, StartupError> {
+    let start_ts = Instant::now();
     let pool_size = config.pool_size.get();
     let channel_size = config.queue_size.get();
 
@@ -95,9 +137,27 @@ pub fn get_batcher<P: Predictor + 'static>(
     );
     let pool: WorkerPool<P::Input, P::Output, P::Error> = WorkerPool::new(worker_refs);
 
+    let start = PredictorStartConfig {
+        retries: config.worker_start_retries,
+        backoff: config.worker_start_backoff_start,
+        max_wait: config.max_worker_retry_wait,
+    };
+
+    let (start_ack_tx, start_ack_rx) = channel::<(u8, bool)>(usize::from(pool_size));
     for (w, rx) in inf_workers {
-        run_worker(w, rx);
+        let tx = start_ack_tx.clone();
+        run_worker(w, rx, start, tx);
     }
 
-    Batchinf::new(pool, observability)
+    // Drop my copy so channel closes after workers drop.
+    drop(start_ack_tx);
+    let consumed = Instant::now().duration_since(start_ts);
+
+    collect_acks(
+        start_ack_rx,
+        pool_size,
+        config.startup_timeout.saturating_sub(consumed),
+    )
+    .await?;
+    Ok(Batchinf::new(pool, observability))
 }

@@ -42,7 +42,7 @@ pub(super) fn send_output<P: Predictor>(
 
     emitters::emit_inference_ok(obs, metrics);
 
-    for (res, send) in batch.into_iter().zip(senders.into_iter()) {
+    for (res, send) in batch.into_iter().zip(senders) {
         // Ignoring error here as receiver might have been closed due to timeout,
         // which is a valid state.
         let _ = send.send(Ok(res));
@@ -65,6 +65,7 @@ pub(super) fn send_errors<P: Predictor>(
     }
 }
 
+/// Send `BatchinfError::InternalError` when a worker crashes to all waiting senders.
 pub(super) fn send_errors_on_crash<P: Predictor>(senders: Vec<OutputSender<P>>) {
     let error = BatchinfError::InternalError;
     for sender in senders.into_iter() {

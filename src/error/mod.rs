@@ -32,6 +32,8 @@ where
     /// request was part of the affected batch.
     #[error("Predictor produced an invalid number of outputs for the given input")]
     InvalidPredictorOutput,
+    #[error("Inference workers unable to start within tim bounds")]
+    StartTimeout,
 }
 
 impl<E> Clone for BatchinfError<E>
@@ -49,6 +51,7 @@ where
             Self::NoAvailableWorkersError => Self::NoAvailableWorkersError,
             Self::QueueFullError => Self::QueueFullError,
             Self::InvalidPredictorOutput => Self::InvalidPredictorOutput,
+            Self::StartTimeout => Self::StartTimeout,
         }
     }
 }
@@ -60,4 +63,14 @@ where
     fn from(_err: RecvError) -> BatchinfError<E> {
         BatchinfError::InternalError
     }
+}
+
+#[derive(Debug, Error)]
+pub enum StartupError {
+    #[error("Workers did not start withing timeout bounds.")]
+    Timeout,
+    #[error("Worker {worker_id} failed to start.")]
+    WorkerStartFailure { worker_id: u8 },
+    #[error("Worker unable to start due to internal error")]
+    InternalError,
 }

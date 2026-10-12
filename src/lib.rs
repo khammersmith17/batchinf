@@ -76,9 +76,15 @@
 //!             batch_timeout: Duration::from_millis(10),
 //!             pool_size: NonZeroU8::new(1).unwrap(),
 //!             queue_size: NonZeroU32::new(32).unwrap(),
+//!             worker_start_retries: 3,
+//!             worker_start_backoff_start: Duration::from_millis(100),
+//!             max_worker_retry_wait: Duration::from_millis(3000),
+//!             startup_timeout: Duration::from_secs(60),
 //!         },
 //!         None,
-//!     );
+//!     )
+//!     .await
+//!     .expect("workers failed to start");
 //!
 //!     match batcher.predict(vec![1.0_f32, 2.0, 3.0]).await {
 //!         Ok(embedding) => println!("{embedding:?}"),
@@ -99,7 +105,7 @@ pub(crate) mod worker;
 
 pub use batcher::Batchinf;
 pub use config::BatcherConfig;
-pub use error::BatchinfError;
+pub use error::{BatchinfError, StartupError};
 pub use observability::{BatchTrigger, BatcherMetrics};
 pub use predictor::Predictor;
 pub use setup::get_batcher;

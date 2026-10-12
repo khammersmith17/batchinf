@@ -17,7 +17,7 @@ use tokio::{
 
 mod dispatch;
 mod inf;
-use inf::spawn_inference_runner;
+use inf::{InferenceRunnerArgs, spawn_inference_runner};
 
 pub(crate) type OutputSender<P> =
     OneshotSender<Result<<P as Predictor>::Output, BatchinfError<<P as Predictor>::Error>>>;
@@ -34,7 +34,7 @@ pub(crate) struct InferenceWorker<P: Predictor> {
     state: WorkerState,
     factory: PredictorFactory<P>,
     obs: Option<Arc<dyn BatcherMetrics>>,
-    worker_id: usize,
+    worker_id: u8,
 }
 
 /// Core behavior of the inference worker.
@@ -43,7 +43,7 @@ impl<P: Predictor> InferenceWorker<P> {
         state: WorkerState,
         factory: PredictorFactory<P>,
         obs: Option<Arc<dyn BatcherMetrics>>,
-        worker_id: usize,
+        worker_id: u8,
     ) -> InferenceWorker<P> {
         InferenceWorker {
             state,
@@ -53,10 +53,6 @@ impl<P: Predictor> InferenceWorker<P> {
         }
     }
 
-    // The emit methods below are no-ops when obs is None. Option<Arc<dyn BatcherMetrics>> uses
-    // the null pointer optimisation, so the None check is a single null pointer comparison.
-    // The only overhead when obs is Some is the virtual dispatch through the fat pointer.
-
     // Reset the inference timeout clock.
     fn reset_next_inf(&self, ts: &mut Instant) {
         *ts = Instant::now() + self.state.timeout();
@@ -65,6 +61,11 @@ impl<P: Predictor> InferenceWorker<P> {
     fn set_running_and_emit(&self, trigger_type: BatchTrigger, batch_size: usize) {
         self.state.set_worker_state(WorkerStatus::Running);
         emitters::emit_batch_start(self.obs.clone(), trigger_type, batch_size);
+    }
+
+    // Report the number of requests waiting in this worker's queue, not yet pulled into a batch.
+    fn emit_queue_depth(&self, input_receiver: &InputReceiver<P>) {
+        emitters::emit_queue_depth(self.obs.clone(), self.worker_id, input_receiver.len());
     }
 }
 
@@ -82,6 +83,26 @@ impl<P: Predictor> WorkerBuffer<P> {
             sender_buffer: Vec::with_capacity(cap),
             input_buffer: Vec::with_capacity(cap),
         }
+    }
+
+    // Filter out the requests that have been canceled.
+    // A request may be canceled when using the timeout api or a dropped predict future.
+    pub(crate) fn filter_canceled(&mut self) {
+        // Single pass and swap remove.
+        let mut i = 0_usize;
+        while i < self.len() {
+            if self.sender_buffer[i].is_closed() {
+                self.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn swap_remove(&mut self, idx: usize) {
+        self.input_buffer.swap_remove(idx);
+        self.sender_buffer.swap_remove(idx);
     }
 
     fn push(&mut self, request: P::Input, sender: OutputSender<P>) {
@@ -116,14 +137,34 @@ impl<P: Predictor> WorkerBuffer<P> {
     }
 }
 
+/// Settings for building a worker's predictor. Only needed to spawn the inference thread, so
+/// they are passed through to it by value rather than kept in the worker's shared state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PredictorStartConfig {
+    /// Number of factory attempts before giving up.
+    pub(crate) retries: u8,
+    /// Wait after the first failed attempt; doubles after each further failure.
+    pub(crate) backoff: Duration,
+    pub(crate) max_wait: Duration,
+}
+
 fn make_runner<P: Predictor + 'static>(
-    factory: PredictorFactory<P>,
-    worker_state: WorkerState,
-    worker_id: usize,
-    obs: Option<Arc<dyn BatcherMetrics>>,
+    worker: &InferenceWorker<P>,
+    start: PredictorStartConfig,
+    ready_tx: Sender<(u8, bool)>,
 ) -> JobSender<P> {
     let (job_tx, job_rx) = channel::<WorkerBuffer<P>>(JOB_QUEUE_DEPTH);
-    spawn_inference_runner(factory, job_rx, worker_state, worker_id, obs);
+    spawn_inference_runner(InferenceRunnerArgs {
+        factory: Arc::clone(&worker.factory),
+        recv: job_rx,
+        worker_state: worker.state.clone(),
+        worker_id: worker.worker_id,
+        retries: start.retries,
+        backoff: start.backoff,
+        max_wait: start.max_wait,
+        obs: worker.obs.clone(),
+        ready_tx,
+    });
     job_tx
 }
 
@@ -136,16 +177,13 @@ fn make_runner<P: Predictor + 'static>(
 async fn worker_loop<P: Predictor + 'static>(
     worker: InferenceWorker<P>,
     mut input_receiver: InputReceiver<P>,
+    start: PredictorStartConfig,
+    ready_tx: Sender<(u8, bool)>,
 ) {
     let cap = worker.state.batch_size() as usize;
     let mut next_inf = Instant::now();
     let mut buffer = WorkerBuffer::new(cap);
-    let job_tx = make_runner(
-        Arc::clone(&worker.factory),
-        worker.state.clone(),
-        worker.worker_id,
-        worker.obs.clone(),
-    );
+    let job_tx = make_runner(&worker, start, ready_tx);
 
     loop {
         accumulate_next_batch(&mut input_receiver, &worker, &mut buffer, &mut next_inf).await;
@@ -153,6 +191,8 @@ async fn worker_loop<P: Predictor + 'static>(
         match worker.state.get_worker_state() {
             WorkerStatus::Waiting => unreachable!(),
             WorkerStatus::Running => {
+                // Backlog behind the batch that is about to be handed off.
+                worker.emit_queue_depth(&input_receiver);
                 // Waits here while the inference thread is busy and a batch is already queued.
                 let alive = run_inference(live_buffer, &job_tx).await;
                 if alive.is_err() {
@@ -161,6 +201,8 @@ async fn worker_loop<P: Predictor + 'static>(
                     worker.state.set_worker_state(WorkerStatus::Crashed);
                     return;
                 }
+                // Backlog that built up while waiting on a busy or rebuilding inference thread.
+                worker.emit_queue_depth(&input_receiver);
                 // Batch handed off. Signal that this worker can accept a new batch.
                 worker.state.reset_queue_len();
             }
@@ -212,7 +254,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
                     buffer.push(request, sender);
 
                     worker.state.increment_len();
-                    if buffer.len() == (worker.state.batch_size() as usize){
+                    if buffer.len() == (worker.state.batch_size() as usize) {
                         // Set state and emit trigger.
                         worker.set_running_and_emit(BatchTrigger::Capacity, buffer.len());
                         break;
@@ -267,6 +309,144 @@ fn time_until_timeout(ts: &Instant) -> Duration {
 pub(crate) fn run_worker<P: Predictor + 'static>(
     worker: InferenceWorker<P>,
     receiver: InputReceiver<P>,
+    start: PredictorStartConfig,
+    ready_tx: Sender<(u8, bool)>,
 ) {
-    tokio::task::spawn(async { worker_loop(worker, receiver).await });
+    tokio::task::spawn(async move { worker_loop(worker, receiver, start, ready_tx).await });
+}
+
+#[cfg(test)]
+mod test_worker_buffer {
+    use super::WorkerBuffer;
+    use crate::predictor::Predictor;
+
+    #[derive(Debug)]
+    struct DummyError;
+
+    impl std::fmt::Display for DummyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Error")
+        }
+    }
+
+    impl std::error::Error for DummyError {}
+
+    struct Dummy;
+
+    impl Predictor for Dummy {
+        type Input = usize;
+        type Output = usize;
+        type Error = DummyError;
+
+        fn predict_batch(
+            &mut self,
+            input: &[Self::Input],
+        ) -> Result<Vec<Self::Output>, Self::Error> {
+            Ok((0..input.len()).collect())
+        }
+    }
+
+    #[test]
+    fn test_filter_event_count() {
+        let size = 24_usize;
+        // only even idxs
+        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
+
+        let mut recv_vec = Vec::new();
+
+        for i in 0..size {
+            let (tx, rx) = tokio::sync::oneshot::channel::<
+                Result<usize, crate::error::BatchinfError<DummyError>>,
+            >();
+            buffer.push(i, tx);
+            if i % 2 == 0 {
+                recv_vec.push(rx)
+            }
+        }
+        buffer.filter_canceled();
+
+        let WorkerBuffer {
+            mut input_buffer, ..
+        } = buffer;
+        let base: Vec<usize> = (0..size).filter(|v| v % 2 == 0).collect();
+        input_buffer.sort();
+        assert_eq!(base, input_buffer);
+    }
+
+    #[test]
+    fn test_filter_odd_count() {
+        let size = 25_usize;
+        // only even idxs
+        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
+
+        let mut recv_vec = Vec::new();
+
+        for i in 0..size {
+            let (tx, rx) = tokio::sync::oneshot::channel::<
+                Result<usize, crate::error::BatchinfError<DummyError>>,
+            >();
+            buffer.push(i, tx);
+            if i % 2 == 1 {
+                recv_vec.push(rx)
+            }
+        }
+        buffer.filter_canceled();
+
+        let WorkerBuffer {
+            mut input_buffer, ..
+        } = buffer;
+        let base: Vec<usize> = (0..size).filter(|v| v % 2 == 1).collect();
+        input_buffer.sort();
+        assert_eq!(base, input_buffer);
+    }
+
+    #[test]
+    fn test_filter_uneven() {
+        let size = 50_usize;
+        // only even idxs
+        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
+
+        let mut recv_vec = Vec::new();
+
+        for i in 0..size {
+            let (tx, rx) = tokio::sync::oneshot::channel::<
+                Result<usize, crate::error::BatchinfError<DummyError>>,
+            >();
+            buffer.push(i, tx);
+            if i % 3 == 0 {
+                recv_vec.push(rx)
+            }
+        }
+        buffer.filter_canceled();
+
+        let WorkerBuffer {
+            mut input_buffer, ..
+        } = buffer;
+        let base: Vec<usize> = (0..size).filter(|v| v % 3 == 0).collect();
+        input_buffer.sort();
+        assert_eq!(base, input_buffer);
+    }
+
+    #[test]
+    fn test_all_canceled() {
+        let size = 50_usize;
+        // only even idxs
+        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
+
+        for i in 0..size {
+            let (tx, _) = tokio::sync::oneshot::channel::<
+                Result<usize, crate::error::BatchinfError<DummyError>>,
+            >();
+            buffer.push(i, tx);
+        }
+        buffer.filter_canceled();
+
+        let WorkerBuffer {
+            mut input_buffer, ..
+        } = buffer;
+        let base: Vec<usize> = vec![];
+        input_buffer.sort();
+
+        assert_eq!(base, input_buffer);
+    }
 }

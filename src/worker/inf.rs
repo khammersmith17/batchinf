@@ -3,59 +3,167 @@ use crate::{
     observability::{BatcherMetrics, InfBatchMetrics, emitters},
     predictor::Predictor,
     setup::PredictorFactory,
-    state::{PredictorStatus, WorkerState, WorkerStatus},
+    state::{PredictorStatus, WorkerState},
 };
-use std::{sync::Arc, thread::Builder, time::Instant};
-use tokio::sync::mpsc::Receiver;
+use std::{
+    sync::Arc,
+    thread::Builder,
+    time::{Duration, Instant},
+};
+use tokio::sync::mpsc::{Receiver, Sender};
 
-type JobReceiver<P> = Receiver<WorkerBuffer<P>>;
+pub(super) type JobReceiver<P> = Receiver<WorkerBuffer<P>>;
 
-// TODO: determine the number of retries here + add backoff
-fn get_predictor_from_factory<P: Predictor>(
-    factory: PredictorFactory<P>,
-    worker_id: usize,
+pub(super) struct InferenceRunnerArgs<P: Predictor> {
+    pub(super) factory: PredictorFactory<P>,
+    pub(super) recv: JobReceiver<P>,
+    pub(super) worker_state: WorkerState,
+    pub(super) worker_id: u8,
+    pub(super) retries: u8,
+    pub(super) backoff: Duration,
+    pub(super) max_wait: Duration,
+    pub(super) obs: Option<Arc<dyn BatcherMetrics>>,
+    pub(super) ready_tx: Sender<(u8, bool)>,
+}
+
+fn backoff_schedule(
+    attempts: u8,
+    base_backoff: Duration,
+    max_wait: Duration,
+) -> impl Iterator<Item = Duration> {
+    let mut next = base_backoff.min(max_wait);
+    (0..attempts).map(move |i| {
+        let wait = next;
+        next = next.saturating_mul(2).min(max_wait);
+        if i == attempts - 1 {
+            Duration::ZERO
+        } else {
+            wait
+        }
+    })
+}
+
+fn try_make_predictor<P: Predictor>(
+    f: PredictorFactory<P>,
+    worker_id: u8,
+    wait: Duration,
 ) -> Result<P, ()> {
-    for _ in 0..5 {
-        let wid = worker_id;
-        let f = Arc::clone(&factory);
-        if let Ok(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(wid))) {
-            return Ok(p);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(worker_id)))
+        .map_err(|_e| ());
+    if res.is_err() {
+        // Last wait is no-op.
+        std::thread::sleep(wait)
+    }
+    res
+}
+
+fn startup_predictor<P: Predictor>(
+    factory: PredictorFactory<P>,
+    worker_id: u8,
+    total_attempts: u8,
+    backoff: Duration,
+    max_wait: Duration,
+    tx: &Sender<(u8, bool)>,
+) -> Result<P, ()> {
+    for wait in backoff_schedule(total_attempts, backoff, max_wait) {
+        if tx.is_closed() {
+            return Err(());
+        }
+        let p = try_make_predictor(Arc::clone(&factory), worker_id, wait);
+
+        if p.is_ok() {
+            return p;
         }
     }
     Err(())
 }
 
-pub(super) fn spawn_inference_runner<P: Predictor + 'static>(
+fn respawn_predictor<P: Predictor>(
     factory: PredictorFactory<P>,
-    recv: JobReceiver<P>,
-    worker_state: WorkerState,
-    worker_id: usize,
-    obs: Option<Arc<dyn BatcherMetrics>>,
-) {
+    worker_id: u8,
+    total_attempts: u8,
+    backoff: Duration,
+    max_wait: Duration,
+) -> Result<P, ()> {
+    for wait in backoff_schedule(total_attempts, backoff, max_wait) {
+        let p = try_make_predictor(Arc::clone(&factory), worker_id, wait);
+
+        if p.is_ok() {
+            return p;
+        }
+    }
+    Err(())
+}
+
+pub(super) fn spawn_inference_runner<P: Predictor + 'static>(args: InferenceRunnerArgs<P>) {
+    let worker_id = args.worker_id;
     let name = format!("batchinf-worker-{worker_id}");
+
     Builder::new()
         .name(name)
-        .spawn(move || inference_runner(factory, recv, worker_state, worker_id, obs))
+        .spawn(move || inference_runner(args))
         .expect("Unable to spawn thread");
 }
 
-fn inference_runner<P: Predictor>(
-    factory: PredictorFactory<P>,
-    mut recv: JobReceiver<P>,
-    worker_state: WorkerState,
-    worker_id: usize,
-    obs: Option<Arc<dyn BatcherMetrics>>,
-) {
+fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
+    let InferenceRunnerArgs {
+        factory,
+        mut recv,
+        worker_state,
+        worker_id,
+        retries,
+        backoff,
+        max_wait,
+        obs,
+        ready_tx,
+    } = args;
+
+    // ****** Start up ******
+    let total_attempts = retries.saturating_add(1);
+
     // A factory that keeps failing at startup marks this worker Dead. It shows up in
     // `pool_status()`, and the router skips it.
-    let Ok(mut predictor) = get_predictor_from_factory(Arc::clone(&factory), worker_id) else {
-        worker_state.set_predictor_state(PredictorStatus::Dead);
-        worker_state.set_worker_state(WorkerStatus::Exit);
+    let Ok(mut predictor) = startup_predictor(
+        Arc::clone(&factory),
+        worker_id,
+        total_attempts,
+        backoff,
+        max_wait,
+        &ready_tx,
+    ) else {
+        let _ = ready_tx.blocking_send((worker_id, false));
+        worker_state.set_dead();
         return;
+    };
+
+    // If send failures, the startup timed out or another worker failed to start and we should exit.
+    if ready_tx.blocking_send((worker_id, true)).is_err() {
+        return;
+    };
+    drop(ready_tx);
+
+    // ****** Start Inference Runner ******
+
+    // Fn closure to generate a new predictor on panic.
+    let generator = move || {
+        respawn_predictor(
+            Arc::clone(&factory),
+            worker_id,
+            total_attempts,
+            backoff,
+            max_wait,
+        )
     };
 
     // `blocking_recv` is fine here: this is a dedicated OS thread, not a runtime thread.
     while let Some(mut buffer) = recv.blocking_recv() {
+        // Filter out any canceled (timed out) requests.
+        buffer.filter_canceled();
+
+        // All request might have been canceled.
+        if buffer.is_empty() {
+            continue;
+        }
         // Capture panic signal to handle crash and restart.
         let panic_signal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             predict(&mut predictor, buffer.input())
@@ -75,9 +183,8 @@ fn inference_runner<P: Predictor>(
                 // They will no be retried here.
                 let senders = buffer.clear_and_take_senders();
                 dispatch::send_errors_on_crash::<P>(senders);
-                let Ok(new_predictor) = get_predictor_from_factory(Arc::clone(&factory), worker_id)
-                else {
-                    worker_state.set_predictor_state(PredictorStatus::Dead);
+                let Ok(new_predictor) = generator() else {
+                    worker_state.set_dead();
                     return;
                 };
                 predictor = new_predictor;
@@ -111,4 +218,111 @@ fn predict<P: Predictor>(
     };
 
     (metrics, inf_results)
+}
+
+#[cfg(test)]
+mod backoff_schedule_tests {
+    use super::backoff_schedule;
+    use std::time::Duration;
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// The waits produced for the given settings, in milliseconds.
+    fn waits_ms(attempts: u8, base_ms: u64, max_ms: u64) -> Vec<u128> {
+        backoff_schedule(attempts, ms(base_ms), ms(max_ms))
+            .map(|wait| wait.as_millis())
+            .collect()
+    }
+
+    #[test]
+    fn yields_one_entry_per_attempt_with_ascending_indices() {
+        let attempts: Vec<Duration> = backoff_schedule(4, ms(10), ms(1_000)).collect();
+        assert_eq!(attempts.len(), 4);
+    }
+
+    #[test]
+    fn zero_attempts_yields_nothing() {
+        assert!(waits_ms(0, 50, 1_000).is_empty());
+    }
+
+    #[test]
+    fn first_wait_is_the_base_backoff() {
+        assert_eq!(waits_ms(2, 50, 1_000), vec![50, 0]);
+    }
+
+    #[test]
+    fn wait_doubles_after_each_attempt() {
+        assert_eq!(waits_ms(4, 50, 10_000), vec![50, 100, 200, 0]);
+    }
+
+    #[test]
+    fn wait_is_capped_at_max_wait() {
+        assert_eq!(waits_ms(5, 20, 30), vec![20, 30, 30, 30, 0]);
+    }
+
+    #[test]
+    fn wait_stops_growing_exactly_at_the_cap() {
+        // 25 → 50 → 100 reaches the cap without overshooting it.
+        assert_eq!(waits_ms(5, 25, 100), vec![25, 50, 100, 100, 0]);
+    }
+
+    #[test]
+    fn base_above_the_cap_is_clamped_from_the_first_wait() {
+        assert_eq!(waits_ms(3, 500, 100), vec![100, 100, 0]);
+    }
+
+    #[test]
+    fn zero_base_backoff_never_waits() {
+        assert_eq!(waits_ms(4, 0, 1_000), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn zero_max_wait_never_waits() {
+        assert_eq!(waits_ms(4, 50, 0), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn waits_never_decrease_and_never_exceed_the_cap() {
+        for (base, max) in [(1, 1_000), (7, 500), (50, 50), (300, 100), (0, 10)] {
+            let mut waits = waits_ms(u8::MAX, base, max);
+            // Ignore no-op wait.
+            waits.pop();
+            assert_eq!(waits.len(), usize::from(u8::MAX) - 1);
+            assert!(
+                waits.windows(2).all(|pair| pair[0] <= pair[1]),
+                "waits decreased for base {base}ms, max {max}ms"
+            );
+            assert!(
+                waits.iter().all(|wait| *wait <= u128::from(max)),
+                "a wait exceeded the cap for base {base}ms, max {max}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_attempts_settle_at_the_cap() {
+        let waits: Vec<Duration> =
+            backoff_schedule(u8::MAX, Duration::from_secs(1), Duration::from_secs(30)).collect();
+
+        let mut rev = waits.into_iter().rev();
+        let _ = rev.next();
+        let last = rev.next();
+        assert_eq!(last, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn uncapped_backoff_does_not_overflow() {
+        // `Duration::MAX` as the cap means "no cap". Doubling 255 times must saturate rather
+        // than panic.
+        let waits: Vec<Duration> =
+            backoff_schedule(u8::MAX, Duration::from_secs(1), Duration::MAX).collect();
+        assert_eq!(waits[0], Duration::from_secs(1));
+        assert_eq!(waits[10], Duration::from_secs(1 << 10));
+        let mut rev = waits.iter().rev();
+        let _ = rev.next();
+        let last = rev.next();
+        assert_eq!(last, Some(&Duration::MAX));
+    }
 }
