@@ -27,9 +27,24 @@ pub struct BatcherConfig {
     /// [`Batchinf::predict`](`crate::Batchinf::predict`) returns
     /// [`BatchinfError::QueueFullError`](`crate::BatchinfError::QueueFullError`).
     pub queue_size: NonZeroU32,
+    /// Number of times a worker retries the predictor factory after a failed call, so the
+    /// factory is called at most `worker_start_retries + 1` times. `0` means a single attempt.
+    /// A factory call fails when it panics. Applies both at startup and when rebuilding the
+    /// predictor after [`Predictor::predict_batch`](`crate::Predictor::predict_batch`) panics.
     pub worker_start_retries: u8,
+    /// Time a worker waits after the first failed factory call before retrying. The wait
+    /// doubles after each further failure, up to
+    /// [`max_worker_retry_wait`](BatcherConfig::max_worker_retry_wait).
     pub worker_start_backoff_start: Duration,
+    /// Upper bound on the wait between two factory calls. A
+    /// [`worker_start_backoff_start`](BatcherConfig::worker_start_backoff_start) above this
+    /// value is clamped to it.
     pub max_worker_retry_wait: Duration,
+    /// How long [`get_batcher`](`crate::get_batcher`) waits for every worker to build its
+    /// predictor before returning [`StartupError::Timeout`](`crate::StartupError::Timeout`).
+    /// Set it above the worst case for one worker: the factory's run time multiplied by
+    /// `worker_start_retries + 1`, plus the waits in between. Otherwise a slow start that would
+    /// have succeeded is cut off.
     pub startup_timeout: Duration,
 }
 

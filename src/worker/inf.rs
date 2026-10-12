@@ -57,35 +57,18 @@ fn try_make_predictor<P: Predictor>(
     res
 }
 
-fn startup_predictor<P: Predictor>(
+fn spawn_predictor<P: Predictor>(
     factory: PredictorFactory<P>,
     worker_id: u8,
     total_attempts: u8,
     backoff: Duration,
     max_wait: Duration,
-    tx: &Sender<(u8, bool)>,
+    exit_cond: impl Fn() -> bool,
 ) -> Result<P, ()> {
     for wait in backoff_schedule(total_attempts, backoff, max_wait) {
-        if tx.is_closed() {
+        if exit_cond() {
             return Err(());
         }
-        let p = try_make_predictor(Arc::clone(&factory), worker_id, wait);
-
-        if p.is_ok() {
-            return p;
-        }
-    }
-    Err(())
-}
-
-fn respawn_predictor<P: Predictor>(
-    factory: PredictorFactory<P>,
-    worker_id: u8,
-    total_attempts: u8,
-    backoff: Duration,
-    max_wait: Duration,
-) -> Result<P, ()> {
-    for wait in backoff_schedule(total_attempts, backoff, max_wait) {
         let p = try_make_predictor(Arc::clone(&factory), worker_id, wait);
 
         if p.is_ok() {
@@ -98,11 +81,16 @@ fn respawn_predictor<P: Predictor>(
 pub(super) fn spawn_inference_runner<P: Predictor + 'static>(args: InferenceRunnerArgs<P>) {
     let worker_id = args.worker_id;
     let name = format!("batchinf-worker-{worker_id}");
+    let ready_tx = args.ready_tx.clone();
 
-    Builder::new()
+    if Builder::new()
         .name(name)
         .spawn(move || inference_runner(args))
-        .expect("Unable to spawn thread");
+        .is_err()
+    {
+        let _ = ready_tx.try_send((worker_id, false));
+    }
+    drop(ready_tx);
 }
 
 fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
@@ -121,15 +109,17 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
     // ****** Start up ******
     let total_attempts = retries.saturating_add(1);
 
-    // A factory that keeps failing at startup marks this worker Dead. It shows up in
-    // `pool_status()`, and the router skips it.
-    let Ok(mut predictor) = startup_predictor(
+    let tx_ref = &ready_tx;
+
+    // Report the outcome of the first build to `get_batcher`. If the factory keeps failing,
+    // startup as a whole fails.
+    let Ok(mut predictor) = spawn_predictor(
         Arc::clone(&factory),
         worker_id,
         total_attempts,
         backoff,
         max_wait,
-        &ready_tx,
+        move || tx_ref.is_closed(),
     ) else {
         let _ = ready_tx.blocking_send((worker_id, false));
         worker_state.set_dead();
@@ -146,12 +136,13 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
 
     // Fn closure to generate a new predictor on panic.
     let generator = move || {
-        respawn_predictor(
+        spawn_predictor(
             Arc::clone(&factory),
             worker_id,
             total_attempts,
             backoff,
             max_wait,
+            || false,
         )
     };
 
@@ -173,14 +164,14 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
         let (metrics, inf_result) = match panic_signal {
             Ok((m, ir)) => (m, ir),
             Err(_) => {
-                // Set the worker state to Crashed, route requests elsewhere.
+                // Mark the predictor as rebuilding, so new requests are routed elsewhere.
                 worker_state.set_predictor_state(PredictorStatus::Rebuilding);
 
                 // Emit a worker panic.
                 emitters::emit_worker_panic(obs.clone());
 
                 // Dispatch the internal error. Requests should not wait on a worker to restart.
-                // They will no be retried here.
+                // They will not be retried here.
                 let senders = buffer.clear_and_take_senders();
                 dispatch::send_errors_on_crash::<P>(senders);
                 let Ok(new_predictor) = generator() else {

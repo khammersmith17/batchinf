@@ -1,7 +1,9 @@
 /// Enum describing what triggered a batch to fire.
 #[derive(Debug, Clone, Copy)]
 pub enum BatchTrigger {
+    /// The batch reached `batch_size` requests.
     Capacity,
+    /// `batch_timeout` elapsed since the first request of the batch, before it filled up.
     Timeout,
 }
 
@@ -10,6 +12,12 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger].
     /// This may provide some information that can help tune the batch size and the timeout for a
     /// batch.
+    ///
+    /// `batch_size` is the number of requests accumulated when the batch fired. Requests that
+    /// were cancelled while waiting are removed just before inference, so the size reported by
+    /// [`on_batch_complete_ok`](BatcherMetrics::on_batch_complete_ok) and
+    /// [`on_batch_complete_err`](BatcherMetrics::on_batch_complete_err) can be smaller, and a
+    /// batch whose requests were all cancelled reports no completion at all.
     fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger);
 
     /// Fires after a batch completes successfully.
@@ -49,22 +57,6 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) panics, before
     /// the predictor is rebuilt from the factory.
     fn on_worker_panic(&self);
-
-    fn emit_batch_start(&self, trigger_type: BatchTrigger, size: usize) {
-        self.on_batch_trigger(size, trigger_type)
-    }
-
-    // Emit a succesful inference.
-    fn emit_inference_ok(&self, metrics: InfBatchMetrics) {
-        let InfBatchMetrics { size, latency } = metrics;
-        self.on_batch_complete_ok(size, latency)
-    }
-
-    // Emit an unsuccessful inference.
-    fn emit_inference_err(&self, metrics: InfBatchMetrics) {
-        let InfBatchMetrics { size, latency } = metrics;
-        self.on_batch_complete_err(size, latency)
-    }
 }
 
 pub(crate) mod emitters {
@@ -77,7 +69,7 @@ pub(crate) mod emitters {
         size: usize,
     ) {
         if let Some(obs) = obs {
-            obs.emit_batch_start(trigger_type, size);
+            obs.on_batch_trigger(size, trigger_type);
         }
     }
 
@@ -86,7 +78,8 @@ pub(crate) mod emitters {
         metrics: InfBatchMetrics,
     ) {
         if let Some(obs) = obs {
-            obs.emit_inference_ok(metrics);
+            let InfBatchMetrics { size, latency } = metrics;
+            obs.on_batch_complete_ok(size, latency)
         }
     }
 
@@ -95,7 +88,8 @@ pub(crate) mod emitters {
         metrics: InfBatchMetrics,
     ) {
         if let Some(obs) = obs {
-            obs.emit_inference_err(metrics);
+            let InfBatchMetrics { size, latency } = metrics;
+            obs.on_batch_complete_err(size, latency)
         }
     }
 
@@ -116,7 +110,7 @@ pub(crate) mod emitters {
     }
 }
 
-pub struct InfBatchMetrics {
+pub(crate) struct InfBatchMetrics {
     pub(crate) size: usize,
     pub(crate) latency: tokio::time::Duration,
 }

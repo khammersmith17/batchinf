@@ -284,7 +284,7 @@ async fn test_batch_fires_at_timeout() {
 
     assert_eq!(result, 99);
     assert!(
-        elapsed >= Duration::from_millis(u64::from(timeout_ms)),
+        elapsed >= Duration::from_millis(timeout_ms),
         "should have waited at least {}ms for timeout, took {:?}",
         timeout_ms,
         elapsed

@@ -2,8 +2,15 @@
 /// to [`get_batcher`](`crate::get_batcher`). The predictor is created, used and dropped on that
 /// thread, so it does not need to be `Clone`, `Send` or `Sync`.
 pub trait Predictor {
+    /// A single inference request, as passed to [`Batchinf::predict`](`crate::Batchinf::predict`).
+    /// Sent from the caller to the worker's inference thread.
     type Input: Send + 'static;
+    /// The result for a single request. Sent from the inference thread back to the caller.
     type Output: Send + 'static;
+    /// The error [`predict_batch`](Predictor::predict_batch) returns when a whole batch fails.
+    /// One instance is shared by every caller in the failed batch, as
+    /// [`BatchinfError::InferenceError`](`crate::BatchinfError::InferenceError`), which is why it
+    /// must be `Sync`.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// This is where the magic happens.
@@ -26,5 +33,8 @@ pub trait Predictor {
     /// discards this predictor and builds a fresh one from the factory. Requests queued behind the
     /// panicking batch are not affected. To make panics visible, install a panic hook via
     /// [`std::panic::set_hook`] before starting the batcher.
+    ///
+    /// This recovery relies on unwinding. In a binary built with `panic = "abort"`, a panic here
+    /// terminates the whole process instead.
     fn predict_batch(&mut self, inp: &[Self::Input]) -> Result<Vec<Self::Output>, Self::Error>;
 }

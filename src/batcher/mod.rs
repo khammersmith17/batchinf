@@ -64,12 +64,29 @@ where
     /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
     /// - [`BatchinfError::QueueFullError`] — all worker queues are full; the caller should retry or apply backpressure.
     /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed.
+    pub async fn try_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
+        let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
+        self.pool.push((input, tx))?;
+        rx.await?
+    }
+
+    // TODO: implement notify here
     pub async fn predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         self.pool.push((input, tx))?;
         rx.await?
     }
 
+    /// Submits an inference request and blocks the current thread until the result arrives.
+    ///
+    /// The blocking counterpart of [`predict`](Batchinf::predict), for callers that are not in
+    /// async code, such as a plain OS thread. Returns the same errors as
+    /// [`predict`](Batchinf::predict).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an asynchronous execution context, such as inside an async
+    /// function running on a Tokio runtime. Use [`predict`](Batchinf::predict) there instead.
     pub fn blocking_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         self.pool.push((input, tx))?;

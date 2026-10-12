@@ -108,5 +108,5 @@ pub use config::BatcherConfig;
 pub use error::{BatchinfError, StartupError};
 pub use observability::{BatchTrigger, BatcherMetrics};
 pub use predictor::Predictor;
-pub use setup::get_batcher;
+pub use setup::{PredictorFactory, get_batcher};
 pub use state::{PredictorStatus, WorkerSnapshot, WorkerStatus};

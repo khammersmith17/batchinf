@@ -58,7 +58,7 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
     (inf_workers, worker_refs)
 }
 
-// TODO: Make this an mpsc channel of size `pool_size`.
+// Waits for every worker to report the outcome of its first predictor build.
 async fn poll_acks(mut rxs: Receiver<(u8, bool)>, pool_size: u8) -> Result<(), StartupError> {
     let mut acked = 0_u8;
     while let Some((worker_id, started)) = rxs.recv().await {
@@ -66,8 +66,7 @@ async fn poll_acks(mut rxs: Receiver<(u8, bool)>, pool_size: u8) -> Result<(), S
             return Err(StartupError::WorkerStartFailure { worker_id });
         }
         acked += 1;
-        // Done once every worker has reported. Don't wait for the channel to close: senders are
-        // still held by `get_batcher` and by the inference threads.
+        // Done once every worker has reported. No need to wait for the channel to close.
         if acked == pool_size {
             return Ok(());
         }
@@ -110,12 +109,25 @@ async fn collect_acks(
 ///   (`0..pool_size`). Called on that worker's inference thread at startup, and again to rebuild
 ///   the predictor after [`Predictor::predict_batch`] panics. Load model weights once outside the
 ///   factory and capture them in the closure, rather than loading inside it. Signal failure by
-///   panicking: a factory that keeps failing marks its worker
-///   [`PredictorStatus::Dead`](`crate::PredictorStatus::Dead`). This function still returns, the
-///   router skips that worker, and the failure is visible in
-///   [`Batchinf::pool_status`](`crate::Batchinf::pool_status`).
+///   panicking. A failed call is retried as configured by
+///   [`BatcherConfig::worker_start_retries`]. If the factory keeps failing at startup, this
+///   function returns an error. If it keeps failing during a later rebuild, that worker is
+///   marked [`PredictorStatus::Dead`](`crate::PredictorStatus::Dead`), the router skips it, and
+///   the failure is visible in [`Batchinf::pool_status`](`crate::Batchinf::pool_status`).
 /// - `config`: Batching and pool configuration. See [`BatcherConfig`].
 /// - `observability`: Optional metrics hook. Pass `None` to disable. See [`observability::BatcherMetrics`].
+///
+/// # Errors
+///
+/// Returns once every worker has built its predictor, or as soon as startup fails:
+///
+/// - [`StartupError::WorkerStartFailure`] — a worker's factory failed on every attempt.
+/// - [`StartupError::Timeout`] — not every worker was ready within
+///   [`BatcherConfig::startup_timeout`].
+/// - [`StartupError::InternalError`] — a worker stopped before reporting, for example because
+///   its inference thread could not be spawned.
+///
+/// On error the workers that did start are shut down.
 pub async fn get_batcher<P: Predictor + 'static>(
     predictor_factory: PredictorFactory<P>,
     config: BatcherConfig,

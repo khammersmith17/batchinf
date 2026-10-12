@@ -32,8 +32,6 @@ where
     /// request was part of the affected batch.
     #[error("Predictor produced an invalid number of outputs for the given input")]
     InvalidPredictorOutput,
-    #[error("Inference workers unable to start within tim bounds")]
-    StartTimeout,
 }
 
 impl<E> Clone for BatchinfError<E>
@@ -51,7 +49,6 @@ where
             Self::NoAvailableWorkersError => Self::NoAvailableWorkersError,
             Self::QueueFullError => Self::QueueFullError,
             Self::InvalidPredictorOutput => Self::InvalidPredictorOutput,
-            Self::StartTimeout => Self::StartTimeout,
         }
     }
 }
@@ -65,12 +62,26 @@ where
     }
 }
 
-#[derive(Debug, Error)]
+/// Error returned by [`get_batcher`](`crate::get_batcher`) when the worker pool fails to start.
+///
+/// When startup fails, every worker that did start is shut down again. A predictor factory call
+/// that is already running cannot be interrupted, so it runs to completion in the background and
+/// its predictor is then dropped.
+#[derive(Debug, Error, Copy, Clone, PartialEq, Eq)]
 pub enum StartupError {
-    #[error("Workers did not start withing timeout bounds.")]
+    /// Not every worker built its predictor within
+    /// [`BatcherConfig::startup_timeout`](`crate::BatcherConfig::startup_timeout`).
+    #[error("Workers did not start within timeout bounds.")]
     Timeout,
+    /// A worker's predictor factory failed on every attempt. See
+    /// [`BatcherConfig::worker_start_retries`](`crate::BatcherConfig::worker_start_retries`).
     #[error("Worker {worker_id} failed to start.")]
-    WorkerStartFailure { worker_id: u8 },
+    WorkerStartFailure {
+        /// Index of the worker whose factory failed, in `0..pool_size`.
+        worker_id: u8,
+    },
+    /// A worker stopped before reporting whether its predictor was built, for example because
+    /// its inference thread could not be spawned.
     #[error("Worker unable to start due to internal error")]
     InternalError,
 }

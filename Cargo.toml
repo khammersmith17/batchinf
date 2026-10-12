@@ -7,4 +7,8 @@ license = "MIT"
 
 [dependencies]
 thiserror = "2.0.20"
-tokio = {version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+# The tests and the doc example run on the multi-thread runtime.
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }

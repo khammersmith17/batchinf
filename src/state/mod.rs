@@ -258,7 +258,6 @@ impl WorkerState {
 
     pub(crate) fn set_dead(&self) {
         self.set_predictor_state(PredictorStatus::Dead);
-        self.set_worker_state(WorkerStatus::Exit);
     }
 
     pub(crate) fn set_worker_state(&self, state: WorkerStatus) {

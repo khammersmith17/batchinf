@@ -72,7 +72,7 @@ impl<P: Predictor> InferenceWorker<P> {
 /// Buffer for inference input and the senders.
 ///
 /// Inference requests and sender to hand back are element wise pairs.
-struct WorkerBuffer<P: Predictor> {
+pub(crate) struct WorkerBuffer<P: Predictor> {
     sender_buffer: Vec<OutputSender<P>>,
     input_buffer: Vec<P::Input>,
 }
@@ -87,6 +87,7 @@ impl<P: Predictor> WorkerBuffer<P> {
 
     // Filter out the requests that have been canceled.
     // A request may be canceled when using the timeout api or a dropped predict future.
+    #[inline]
     pub(crate) fn filter_canceled(&mut self) {
         // Single pass and swap remove.
         let mut i = 0_usize;
@@ -99,6 +100,7 @@ impl<P: Predictor> WorkerBuffer<P> {
         }
     }
 
+    // Swap remove both items in each pair.
     #[inline]
     fn swap_remove(&mut self, idx: usize) {
         self.input_buffer.swap_remove(idx);
@@ -141,10 +143,11 @@ impl<P: Predictor> WorkerBuffer<P> {
 /// they are passed through to it by value rather than kept in the worker's shared state.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PredictorStartConfig {
-    /// Number of factory attempts before giving up.
+    /// Number of retries after the first failed factory call.
     pub(crate) retries: u8,
     /// Wait after the first failed attempt; doubles after each further failure.
     pub(crate) backoff: Duration,
+    /// Upper bound on the wait between two attempts.
     pub(crate) max_wait: Duration,
 }
 
