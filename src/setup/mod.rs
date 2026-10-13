@@ -15,7 +15,10 @@ use std::{
 };
 use tokio::{
     select,
-    sync::mpsc::{Receiver, channel},
+    sync::{
+        Notify,
+        mpsc::{Receiver, channel},
+    },
     time::sleep,
 };
 
@@ -43,14 +46,20 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
     state: &[WorkerState],
     channel_size: usize,
     obs: Option<Arc<dyn observability::BatcherMetrics>>,
+    signal: &Arc<Notify>,
 ) -> WorkerRefPairs<P> {
     let mut inf_workers = Vec::with_capacity(state.len());
     let mut worker_refs = Vec::with_capacity(state.len());
     for (i, worker) in state.iter().enumerate() {
         let (tx, rx) = channel::<FunnelMessage<P::Input, P::Output, P::Error>>(channel_size);
         let obs = obs.clone();
-        let inf_worker =
-            InferenceWorker::new(worker.clone(), Arc::clone(&predictor_factory), obs, i as u8);
+        let inf_worker = InferenceWorker::new(
+            worker.clone(),
+            Arc::clone(&predictor_factory),
+            obs,
+            i as u8,
+            Arc::clone(&signal),
+        );
         let worker_ref = WorkerRef::new(worker.clone(), tx);
         inf_workers.push((inf_worker, rx));
         worker_refs.push(worker_ref);
@@ -141,13 +150,18 @@ pub async fn get_batcher<P: Predictor + 'static>(
 
     let workers: Vec<WorkerState> = (0..pool_size).map(|_| WorkerState::new(conf)).collect();
 
+    let signal = Arc::new(Notify::new());
+
     let (inf_workers, worker_refs) = init_worker_ref_pairs(
         Arc::clone(&predictor_factory),
         &workers,
         channel_size as usize,
         observability.clone(),
+        &signal,
     );
-    let pool: WorkerPool<P::Input, P::Output, P::Error> = WorkerPool::new(worker_refs);
+
+    let pool: WorkerPool<P::Input, P::Output, P::Error> =
+        WorkerPool::new(worker_refs, Arc::clone(&signal));
 
     let start = PredictorStartConfig {
         retries: config.worker_start_retries,

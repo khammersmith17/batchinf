@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use tokio::sync::{Notify, futures::Notified};
 
 type PoolSlab<Input, Output, Error> = Arc<[WorkerRef<Input, Output, Error>]>;
 
@@ -25,6 +26,7 @@ where
     // happen on each worker's inference thread, so a slot's channel sender never changes.
     pool: PoolSlab<Input, Output, Error>,
     size: u8,
+    signal: Arc<Notify>,
     start: Arc<AtomicUsize>,
 }
 
@@ -37,9 +39,11 @@ where
     fn clone(&self) -> Self {
         let pool = Arc::clone(&self.pool);
         let start = Arc::clone(&self.start);
+        let signal = Arc::clone(&self.signal);
         Self {
             pool,
             size: self.size,
+            signal,
             start,
         }
     }
@@ -53,14 +57,27 @@ where
 {
     pub(crate) fn new(
         pool: Vec<WorkerRef<Input, Output, Error>>,
+        signal: Arc<Notify>,
     ) -> WorkerPool<Input, Output, Error> {
         let size = pool.len() as u8;
         let start = AtomicUsize::new(0_usize);
         WorkerPool {
             pool: pool.into(),
             size,
+            signal,
             start: start.into(),
         }
+    }
+
+    pub(crate) fn get_notified(&self) -> Notified<'_> {
+        self.signal.notified()
+    }
+
+    pub(crate) fn push(
+        &self,
+        msg: FunnelMessage<Input, Output, Error>,
+    ) -> Result<(), BatchinfError<Error>> {
+        self.try_push(msg).map_err(|(_, e)| e)
     }
 
     /// Load-aware round-robin routing.
@@ -72,25 +89,27 @@ where
     /// Returns [`BatchinfError::QueueFullError`] if at least one worker is alive but every channel
     /// is full, and [`BatchinfError::NoAvailableWorkersError`] if every worker has exited or
     /// crashed.
-    pub(crate) fn push(
+    pub(crate) fn try_push(
         &self,
         mut msg: FunnelMessage<Input, Output, Error>,
-    ) -> Result<(), BatchinfError<Error>> {
+    ) -> Result<(), (FunnelMessage<Input, Output, Error>, BatchinfError<Error>)> {
         // If the pool only has a single worker, then it is just dispatched.
         if self.is_single_worker() {
             let handle = &self.pool[0];
             if !handle.can_accept_secondary() {
                 if handle.is_rebuilding() {
-                    return Err(BatchinfError::QueueFullError);
+                    return Err((msg, BatchinfError::QueueFullError));
                 } else {
-                    return Err(BatchinfError::NoAvailableWorkersError);
+                    return Err((msg, BatchinfError::NoAvailableWorkersError));
                 };
             }
             match handle.push(msg) {
                 QueuePushResult::Success => return Ok(()),
-                QueuePushResult::QueueFull(_) => return Err(BatchinfError::QueueFullError),
-                QueuePushResult::QueueClosed(_) => {
-                    return Err(BatchinfError::NoAvailableWorkersError);
+                QueuePushResult::QueueFull(msg) => {
+                    return Err((msg, BatchinfError::QueueFullError));
+                }
+                QueuePushResult::QueueClosed(msg) => {
+                    return Err((msg, BatchinfError::NoAvailableWorkersError));
                 }
             }
         }
@@ -147,9 +166,9 @@ where
 
         // Resolve error to user.
         if has_live_worker || has_rebuilding_worker {
-            Err(BatchinfError::QueueFullError)
+            Err((msg, BatchinfError::QueueFullError))
         } else {
-            Err(BatchinfError::NoAvailableWorkersError)
+            Err((msg, BatchinfError::NoAvailableWorkersError))
         }
     }
 

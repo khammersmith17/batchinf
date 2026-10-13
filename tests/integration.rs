@@ -1019,8 +1019,9 @@ async fn test_timeout_batch_during_rebuild_is_served() {
     );
 }
 
-// While a single worker's predictor is rebuilding, new requests are rejected as temporarily full,
-// not as permanently unavailable. Once the rebuild finishes, requests succeed again.
+// While a single worker's predictor is rebuilding, `try_predict` rejects new requests as
+// temporarily full, not as permanently unavailable. `predict` waits for the rebuild instead and
+// then succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rebuilding_single_worker_returns_queue_full() {
     let batcher = get_batcher(
@@ -1048,18 +1049,169 @@ async fn test_rebuilding_single_worker_returns_queue_full() {
         .await,
         "predictor should be rebuilding after the panic"
     );
-    let during = batcher.predict(2).await;
+
+    // Fail-fast variant: rejected immediately while the rebuild is in progress.
+    let rejected = batcher.try_predict(2).await;
     assert!(
-        matches!(during, Err(BatchinfError::QueueFullError)),
-        "expected QueueFullError while rebuilding, got {during:?}"
+        matches!(rejected, Err(BatchinfError::QueueFullError)),
+        "expected QueueFullError from try_predict while rebuilding, got {rejected:?}"
     );
 
-    assert!(
-        wait_for_predictor_status(&batcher, 0, PredictorStatus::Alive, Duration::from_secs(2))
-            .await,
-        "predictor should come back after the rebuild"
+    // Waiting variant: issued during the rebuild, completes once the predictor is back. The
+    // timeout turns a missed wake-up into a failure instead of a hang.
+    let waited = tokio::time::timeout(Duration::from_secs(2), batcher.predict(3))
+        .await
+        .expect("predict should be woken when the rebuild finishes");
+    assert_eq!(waited.unwrap(), 3);
+    assert_eq!(
+        batcher.worker_status(0).unwrap().predictor_status,
+        PredictorStatus::Alive
     );
-    assert_eq!(batcher.predict(3).await.unwrap(), 3);
+}
+
+// With a slow single worker and room for one queued request, a burst overflows the queue.
+// `try_predict` reports that as QueueFullError; `predict` waits for room and every request
+// completes. Runs with batch sizes 1 and 2: with a batch size of 1, the only dequeue that can
+// wake a waiter is the first request of each batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_predict_waits_for_queue_capacity() {
+    for batch_size in [1u32, 2] {
+        let batcher = get_batcher(
+            factory(SlowEchoPredictor),
+            BatcherConfig {
+                queue_size: NonZeroU32::new(1).unwrap(),
+                ..config(batch_size, 5, 1)
+            },
+            no_obs(),
+        )
+        .await
+        .unwrap();
+
+        // Premise: this burst really does overflow the queue.
+        let handles: Vec<_> = (0..20u64)
+            .map(|i| {
+                let b = batcher.clone();
+                tokio::spawn(async move { b.try_predict(i).await })
+            })
+            .collect();
+        let rejected = join(handles)
+            .await
+            .iter()
+            .filter(|r| matches!(r, Err(BatchinfError::QueueFullError)))
+            .count();
+        assert!(
+            rejected > 0,
+            "batch_size {batch_size}: the burst should overflow the queue for try_predict"
+        );
+
+        // The same burst through `predict` waits for room instead of failing.
+        let handles: Vec<_> = (0..20u64)
+            .map(|i| {
+                let b = batcher.clone();
+                tokio::spawn(async move { (i, b.predict(i).await) })
+            })
+            .collect();
+        let results = tokio::time::timeout(Duration::from_secs(10), join(handles))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("batch_size {batch_size}: a waiting predict was never woken")
+            });
+        for (input, result) in results {
+            assert_eq!(
+                result.unwrap(),
+                input,
+                "batch_size {batch_size}: every waiting request should complete"
+            );
+        }
+    }
+}
+
+// A caller waiting in `predict` for a rebuilding worker must be woken when the rebuild gives up,
+// and get NoAvailableWorkersError rather than waiting forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_waiting_predict_fails_when_last_worker_dies() {
+    let builds = Arc::new(AtomicU32::new(0));
+    let batcher = get_batcher(
+        Arc::new(move |_worker_id| {
+            // The first build succeeds; every rebuild attempt fails.
+            if builds.fetch_add(1, Ordering::SeqCst) > 0 {
+                panic!("intentional factory failure during rebuild");
+            }
+            MaybePanicPredictor {
+                always_panics: true,
+            }
+        }),
+        // Rebuild attempts at 0ms, 50ms and 150ms after the panic, then the worker is Dead.
+        retry_config(2, 50, 1_000),
+        no_obs(),
+    )
+    .await
+    .unwrap();
+
+    // Trigger the panic and the (failing) rebuild.
+    let first = batcher.predict(1).await;
+    assert!(
+        matches!(first, Err(BatchinfError::InternalError)),
+        "{first:?}"
+    );
+
+    // Issued while the worker is rebuilding (or just after it died): waits, then is told that
+    // no worker is left.
+    let waited = tokio::time::timeout(Duration::from_secs(2), batcher.predict(2))
+        .await
+        .expect("a waiting predict should be woken when the last worker dies");
+    assert!(
+        matches!(waited, Err(BatchinfError::NoAvailableWorkersError)),
+        "expected NoAvailableWorkersError, got {waited:?}"
+    );
+    assert_eq!(
+        batcher.worker_status(0).unwrap().predictor_status,
+        PredictorStatus::Dead
+    );
+}
+
+// `predict_with_timeout` bounds the wait for room as well as the wait for the result.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_predict_with_timeout_bounds_wait_for_capacity() {
+    let batcher = get_batcher(
+        slow_rebuild_factory(Duration::from_millis(500), Duration::ZERO),
+        config(1, 10, 1),
+        no_obs(),
+    )
+    .await
+    .unwrap();
+
+    // Trigger the panic and a 500ms rebuild.
+    let first = batcher.predict(1).await;
+    assert!(
+        matches!(first, Err(BatchinfError::InternalError)),
+        "{first:?}"
+    );
+    assert!(
+        wait_for_predictor_status(
+            &batcher,
+            0,
+            PredictorStatus::Rebuilding,
+            Duration::from_millis(200)
+        )
+        .await
+    );
+
+    // There is no room until the rebuild finishes, so this waits and then times out.
+    let start = Instant::now();
+    let result = batcher
+        .predict_with_timeout(2, Duration::from_millis(50))
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(result, Err(BatchinfError::TimeoutError)),
+        "expected TimeoutError while waiting for room, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "the timeout should interrupt the wait for room, took {elapsed:?}"
+    );
 }
 
 // Records which worker ran each batch, and takes long enough that workers overlap.

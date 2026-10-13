@@ -70,11 +70,28 @@ where
         rx.await?
     }
 
-    // TODO: implement notify here
-    pub async fn predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
-        let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
-        self.pool.push((input, tx))?;
-        rx.await?
+    pub async fn predict(&self, mut input: Input) -> Result<Output, BatchinfError<Error>> {
+        let (mut tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
+        (input, tx) = match self.pool.try_push((input, tx)) {
+            Ok(_) => return rx.await?,
+            Err((msg, BatchinfError::QueueFullError)) => msg,
+            Err((_, err)) => return Err(err),
+        };
+
+        loop {
+            let notification = self.pool.get_notified();
+            tokio::pin!(notification);
+
+            notification.as_mut().enable();
+
+            (input, tx) = match self.pool.try_push((input, tx)) {
+                Ok(_) => return rx.await?,
+                Err((msg, BatchinfError::QueueFullError)) => msg,
+                Err((_, err)) => return Err(err),
+            };
+
+            notification.await;
+        }
     }
 
     /// Submits an inference request and blocks the current thread until the result arrives.

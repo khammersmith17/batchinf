@@ -10,7 +10,10 @@ use std::{
     thread::Builder,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{
+    Notify,
+    mpsc::{Receiver, Sender},
+};
 
 pub(super) type JobReceiver<P> = Receiver<WorkerBuffer<P>>;
 
@@ -24,6 +27,7 @@ pub(super) struct InferenceRunnerArgs<P: Predictor> {
     pub(super) max_wait: Duration,
     pub(super) obs: Option<Arc<dyn BatcherMetrics>>,
     pub(super) ready_tx: Sender<(u8, bool)>,
+    pub(super) signal: Arc<Notify>,
 }
 
 fn backoff_schedule(
@@ -104,6 +108,7 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
         max_wait,
         obs,
         ready_tx,
+        signal,
     } = args;
 
     // ****** Start up ******
@@ -166,6 +171,7 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
             Err(_) => {
                 // Mark the predictor as rebuilding, so new requests are routed elsewhere.
                 worker_state.set_predictor_state(PredictorStatus::Rebuilding);
+                signal.notify_waiters();
 
                 // Emit a worker panic.
                 emitters::emit_worker_panic(obs.clone());
@@ -176,10 +182,12 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
                 dispatch::send_errors_on_crash::<P>(senders);
                 let Ok(new_predictor) = generator() else {
                     worker_state.set_dead();
+                    signal.notify_waiters();
                     return;
                 };
                 predictor = new_predictor;
                 worker_state.set_predictor_state(PredictorStatus::Alive);
+                signal.notify_waiters();
                 continue;
             }
         };

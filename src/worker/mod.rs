@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::{
     select,
     sync::{
+        Notify,
         mpsc::{Receiver, Sender, channel},
         oneshot::Sender as OneshotSender,
     },
@@ -35,6 +36,7 @@ pub(crate) struct InferenceWorker<P: Predictor> {
     factory: PredictorFactory<P>,
     obs: Option<Arc<dyn BatcherMetrics>>,
     worker_id: u8,
+    signal: Arc<Notify>,
 }
 
 /// Core behavior of the inference worker.
@@ -44,12 +46,14 @@ impl<P: Predictor> InferenceWorker<P> {
         factory: PredictorFactory<P>,
         obs: Option<Arc<dyn BatcherMetrics>>,
         worker_id: u8,
+        signal: Arc<Notify>,
     ) -> InferenceWorker<P> {
         InferenceWorker {
             state,
             factory,
             obs,
             worker_id,
+            signal,
         }
     }
 
@@ -66,6 +70,10 @@ impl<P: Predictor> InferenceWorker<P> {
     // Report the number of requests waiting in this worker's queue, not yet pulled into a batch.
     fn emit_queue_depth(&self, input_receiver: &InputReceiver<P>) {
         emitters::emit_queue_depth(self.obs.clone(), self.worker_id, input_receiver.len());
+    }
+
+    fn notify_waiters(&self) {
+        self.signal.notify_waiters()
     }
 }
 
@@ -85,7 +93,7 @@ impl<P: Predictor> WorkerBuffer<P> {
         }
     }
 
-    // Filter out the requests that have been canceled.
+    // Filter out the requests that have been canceled in place.
     // A request may be canceled when using the timeout api or a dropped predict future.
     #[inline]
     pub(crate) fn filter_canceled(&mut self) {
@@ -167,6 +175,7 @@ fn make_runner<P: Predictor + 'static>(
         max_wait: start.max_wait,
         obs: worker.obs.clone(),
         ready_tx,
+        signal: Arc::clone(&worker.signal),
     });
     job_tx
 }
@@ -234,6 +243,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
 ) {
     // Wait for first item in batch to start batch timer.
     if let Some((request, sender)) = receiver.recv().await {
+        worker.notify_waiters();
         buffer.push(request, sender);
         worker.state.increment_len();
         worker.reset_next_inf(next_inf);
@@ -254,6 +264,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
         select! {
             user_input = receiver.recv() => {
                 if let Some((request, sender)) = user_input {
+                    worker.notify_waiters();
                     buffer.push(request, sender);
 
                     worker.state.increment_len();
