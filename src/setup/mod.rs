@@ -6,8 +6,9 @@ use crate::{
     observability,
     pool::{FunnelMessage, WorkerPool},
     predictor::Predictor,
+    shutdown::shutdown_channel,
     state::{WorkerRef, WorkerState},
-    worker::{InferenceWorker, InputReceiver, PredictorStartConfig, run_worker},
+    worker::{InferenceWorker, InputReceiver, PredictorStartConfig, RunnerHandoff, run_worker},
 };
 use std::{
     sync::Arc,
@@ -34,21 +35,25 @@ use tokio::{
 /// factory, and capture them in the closure (for example as an `Arc`) rather than fetching them
 /// on every call.
 ///
-/// Signal failure by panicking. A failed call is retried as configured by
-/// [`BatcherConfig::worker_start_retries`].
+/// Signal failure by returning `Err`. A panic is also treated as a failure. A failed call is
+/// retried as configured by [`BatcherConfig::worker_start_retries`]. If every attempt fails at
+/// startup, the error from the last attempt is returned by [`get_batcher`] as
+/// [`StartupError::WorkerStartFailure`]. Errors from a rebuild after a panic have no caller to
+/// return to, so they are discarded.
 ///
 /// ```
 /// # use batchinf::PredictorFactory;
 /// # use std::sync::Arc;
 /// # struct MyModel { device: u8 }
+/// # #[derive(Debug)] struct LoadError;
 /// let n_gpus = 4;
-/// let factory: PredictorFactory<MyModel> = Arc::new(move |worker_id| MyModel {
-///     device: worker_id % n_gpus,
+/// let factory: PredictorFactory<MyModel, LoadError> = Arc::new(move |worker_id| {
+///     Ok(MyModel { device: worker_id % n_gpus })
 /// });
 /// ```
-pub type PredictorFactory<P> = Arc<dyn Fn(u8) -> P + Send + Sync>;
+pub type PredictorFactory<P, E> = Arc<dyn Fn(u8) -> Result<P, E> + Send + Sync>;
 type WorkerRefPairs<P> = (
-    Vec<(InferenceWorker<P>, InputReceiver<P>)>,
+    Vec<(InferenceWorker, InputReceiver<P>)>,
     Vec<WorkerRef<<P as Predictor>::Input, <P as Predictor>::Output, <P as Predictor>::Error>>,
 );
 
@@ -66,7 +71,6 @@ type WorkerRefPairs<P> = (
 * */
 
 fn init_worker_ref_pairs<P: Predictor + 'static>(
-    predictor_factory: PredictorFactory<P>,
     state: &[WorkerState],
     channel_size: usize,
     obs: Option<Arc<dyn observability::BatcherMetrics>>,
@@ -77,13 +81,7 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
     for (i, worker) in state.iter().enumerate() {
         let (tx, rx) = channel::<FunnelMessage<P::Input, P::Output, P::Error>>(channel_size);
         let obs = obs.clone();
-        let inf_worker = InferenceWorker::new(
-            worker.clone(),
-            Arc::clone(&predictor_factory),
-            obs,
-            i as u8,
-            Arc::clone(signal),
-        );
+        let inf_worker = InferenceWorker::new(worker.clone(), obs, i as u8, Arc::clone(signal));
         let worker_ref = WorkerRef::new(worker.clone(), tx);
         inf_workers.push((inf_worker, rx));
         worker_refs.push(worker_ref);
@@ -92,12 +90,14 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
 }
 
 // Waits for every worker to report the outcome of its first predictor build.
-async fn poll_acks(mut rxs: Receiver<(u8, bool)>, pool_size: u8) -> Result<(), StartupError> {
+async fn poll_acks<E>(
+    mut rxs: Receiver<Result<(), StartupError<E>>>,
+    pool_size: u8,
+) -> Result<(), StartupError<E>> {
     let mut acked = 0_u8;
-    while let Some((worker_id, started)) = rxs.recv().await {
-        if !started {
-            return Err(StartupError::WorkerStartFailure { worker_id });
-        }
+    while let Some(ack) = rxs.recv().await {
+        // Fail on the first worker that could not start.
+        ack?;
         acked += 1;
         // Done once every worker has reported. No need to wait for the channel to close.
         if acked == pool_size {
@@ -108,11 +108,11 @@ async fn poll_acks(mut rxs: Receiver<(u8, bool)>, pool_size: u8) -> Result<(), S
     Err(StartupError::InternalError)
 }
 
-async fn collect_acks(
-    rxs: Receiver<(u8, bool)>,
+async fn collect_acks<E>(
+    rxs: Receiver<Result<(), StartupError<E>>>,
     pool_size: u8,
     timeout: Duration,
-) -> Result<(), StartupError> {
+) -> Result<(), StartupError<E>> {
     select!(
          res = poll_acks(rxs, pool_size) => {
             res
@@ -142,7 +142,7 @@ async fn collect_acks(
 ///   (`0..pool_size`). Called on that worker's inference thread at startup, and again to rebuild
 ///   the predictor after [`Predictor::predict_batch`] panics. Load model weights once outside the
 ///   factory and capture them in the closure, rather than loading inside it. Signal failure by
-///   panicking. A failed call is retried as configured by
+///   returning `Err`; a panic also counts as a failure. A failed call is retried as configured by
 ///   [`BatcherConfig::worker_start_retries`]. If the factory keeps failing at startup, this
 ///   function returns an error. If it keeps failing during a later rebuild, that worker is
 ///   marked [`PredictorStatus::Dead`](`crate::PredictorStatus::Dead`), the router skips it, and
@@ -154,18 +154,28 @@ async fn collect_acks(
 ///
 /// Returns once every worker has built its predictor, or as soon as startup fails:
 ///
-/// - [`StartupError::WorkerStartFailure`] — a worker's factory failed on every attempt.
+/// - [`StartupError::WorkerStartFailure`] — a worker's factory returned `Err` on its last
+///   attempt. Carries that error.
+/// - [`StartupError::WorkerStartPanic`] — a worker's factory panicked on its last attempt.
 /// - [`StartupError::Timeout`] — not every worker was ready within
 ///   [`BatcherConfig::startup_timeout`].
 /// - [`StartupError::InternalError`] — a worker stopped before reporting, for example because
 ///   its inference thread could not be spawned.
 ///
 /// On error the workers that did start are shut down.
-pub async fn get_batcher<P: Predictor + 'static>(
-    predictor_factory: PredictorFactory<P>,
+pub async fn get_batcher<P: Predictor + 'static, E: Send + 'static>(
+    predictor_factory: PredictorFactory<P, E>,
     config: BatcherConfig,
     observability: Option<Arc<dyn observability::BatcherMetrics>>,
-) -> Result<Batchinf<P::Input, P::Output, P::Error>, StartupError> {
+) -> Result<Batchinf<P::Input, P::Output, P::Error>, StartupError<E>> {
+    // Assert that input and output are not ZST at compile time. This will break in the accumulator and predictor
+    // threads.
+    const {
+        assert!(
+            std::mem::size_of::<P::Input>() != 0,
+            "Predictor::Input cannot be zero sized"
+        );
+    }
     let start_ts = Instant::now();
     let pool_size = config.pool_size.get();
     let channel_size = config.queue_size.get();
@@ -176,8 +186,7 @@ pub async fn get_batcher<P: Predictor + 'static>(
 
     let signal = Arc::new(Notify::new());
 
-    let (inf_workers, worker_refs) = init_worker_ref_pairs(
-        Arc::clone(&predictor_factory),
+    let (inf_workers, worker_refs) = init_worker_ref_pairs::<P>(
         &workers,
         channel_size as usize,
         observability.clone(),
@@ -193,14 +202,22 @@ pub async fn get_batcher<P: Predictor + 'static>(
         max_wait: config.max_worker_retry_wait,
     };
 
-    let (start_ack_tx, start_ack_rx) = channel::<(u8, bool)>(usize::from(pool_size));
+    let (start_ack_tx, start_ack_rx) =
+        channel::<Result<(), StartupError<E>>>(usize::from(pool_size));
+    let (shutdown_tx, shutdown_rx) = shutdown_channel();
     for (w, rx) in inf_workers {
-        let tx = start_ack_tx.clone();
-        run_worker(w, rx, start, tx);
+        let handoff = RunnerHandoff {
+            factory: Arc::clone(&predictor_factory),
+            start,
+            ready_tx: start_ack_tx.clone(),
+            shutdown_tx: Arc::clone(&shutdown_tx),
+        };
+        run_worker(w, rx, handoff);
     }
 
-    // Drop my copy so channel closes after workers drop.
+    // Drop my copies so each channel closes once the workers drop theirs.
     drop(start_ack_tx);
+    drop(shutdown_tx);
     let consumed = Instant::now().duration_since(start_ts);
 
     collect_acks(
@@ -209,5 +226,5 @@ pub async fn get_batcher<P: Predictor + 'static>(
         config.startup_timeout.saturating_sub(consumed),
     )
     .await?;
-    Ok(Batchinf::new(pool, observability))
+    Ok(Batchinf::new(pool, observability, shutdown_rx))
 }

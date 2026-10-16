@@ -25,7 +25,9 @@
 //! is called on each worker's inference thread, so a predictor can bind to a device (for example
 //! `worker % n_gpus`) and does not need to be `Clone` or `Send`. The factory is called again to
 //! rebuild the predictor after a panic, so load or download model weights once outside the
-//! factory and capture them in the closure (for example as an `Arc`).
+//! factory and capture them in the closure (for example as an `Arc`). The factory returns a
+//! `Result`; if it keeps failing at startup, its error is returned from [`get_batcher`] as
+//! [`StartupError::WorkerStartFailure`].
 //!
 //! Within a service endpoint handler, [`Batchinf`] can be used as service state. It is cheap to
 //! clone. This type handles all inference input dispatch and returns the inference result back to
@@ -70,7 +72,7 @@
 //! async fn main() {
 //!     let batcher = get_batcher(
 //!         // Called on each worker's inference thread to build that worker's predictor.
-//!         Arc::new(|_worker_id| EchoModel),
+//!         Arc::new(|_worker_id| Ok::<_, ModelError>(EchoModel)),
 //!         // Batches of up to 32 requests; a partial batch fires after 10ms. Every other option
 //!         // has a default, see `BatcherConfig::builder`.
 //!         BatcherConfig::builder(NonZeroU32::new(32).unwrap(), Duration::from_millis(10))
@@ -95,6 +97,7 @@ pub(crate) mod observability;
 pub(crate) mod pool;
 pub(crate) mod predictor;
 pub(crate) mod setup;
+pub(crate) mod shutdown;
 pub(crate) mod state;
 pub(crate) mod worker;
 
@@ -104,4 +107,5 @@ pub use error::{BatchinfError, StartupError};
 pub use observability::{BatchTrigger, BatcherMetrics};
 pub use predictor::Predictor;
 pub use setup::{PredictorFactory, get_batcher};
+pub use shutdown::ShutdownWaiter;
 pub use state::{PredictorStatus, WorkerSnapshot, WorkerStatus};

@@ -1,10 +1,11 @@
 use crate::{
-    error::BatchinfError, observability::BatcherMetrics, pool::WorkerPool, state::WorkerSnapshot,
+    error::BatchinfError, observability::BatcherMetrics, pool::WorkerPool,
+    shutdown::ShutdownWaiter, state::WorkerSnapshot,
 };
 use std::sync::Arc;
 use tokio::{
     select,
-    sync::oneshot::channel as oneshot_channel,
+    sync::{oneshot::channel as oneshot_channel, watch},
     time::{Duration, sleep},
 };
 
@@ -14,7 +15,11 @@ use tokio::{
 /// Each clone can independently submit requests and query worker status.
 ///
 /// Dropping all `Batchinf` clones triggers graceful shutdown: the pool stops accepting new
-/// requests and each worker flushes its in-progress batch before exiting.
+/// requests, each worker's inference thread finishes the batch it is running and any batch
+/// already handed to it, then drops its predictor and exits. Requests still being accumulated
+/// are dropped; no caller can be waiting on them, since every waiting request holds a handle.
+/// Shutdown runs in the background. To wait for it to complete, use
+/// [`shutdown_waiter`](Batchinf::shutdown_waiter).
 #[derive(Debug)]
 pub struct Batchinf<Input, Output, Error>
 where
@@ -22,20 +27,35 @@ where
     Output: Send + 'static,
     Error: std::error::Error + Send + Sync + 'static,
 {
+    inner: Arc<BatchinfInner<Input, Output, Error>>,
+}
+
+/// State shared by every clone of a [`Batchinf`]. Dropping the last clone drops the pool, which
+/// closes every worker's request channel and starts shutdown.
+#[derive(Debug)]
+struct BatchinfInner<Input, Output, Error>
+where
+    Input: Send + 'static,
+    Output: Send + 'static,
+    Error: std::error::Error + Send + Sync + 'static,
+{
     pool: WorkerPool<Input, Output, Error>,
     obs: Option<Arc<dyn BatcherMetrics>>,
+    // Only the receiver is kept here, so a `ShutdownWaiter` cloned from it never keeps the pool
+    // alive.
+    shutdown_rx: watch::Receiver<()>,
 }
 
 impl<Input, Output, Error> Clone for Batchinf<Input, Output, Error>
 where
     Input: Send + 'static,
     Output: Send + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
+    Error: std::error::Error + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
-        let obs = self.obs.clone();
-        let pool = self.pool.clone();
-        Batchinf { pool, obs }
+        Batchinf {
+            inner: Arc::clone(&self.inner),
+        }
     }
 }
 
@@ -48,8 +68,16 @@ where
     pub(crate) fn new(
         pool: WorkerPool<Input, Output, Error>,
         obs: Option<Arc<dyn BatcherMetrics>>,
+        shutdown_rx: watch::Receiver<()>,
     ) -> Self {
-        Self { pool, obs }
+        let inner = BatchinfInner {
+            pool,
+            obs,
+            shutdown_rx,
+        };
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Submits an inference request and awaits the result, failing immediately if no worker has
@@ -71,7 +99,7 @@ where
     /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
     pub async fn try_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
-        self.pool.push((input, tx))?;
+        self.inner.pool.push((input, tx))?;
         rx.await?
     }
 
@@ -99,19 +127,19 @@ where
     /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
     pub async fn predict(&self, mut input: Input) -> Result<Output, BatchinfError<Error>> {
         let (mut tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
-        (input, tx) = match self.pool.try_push((input, tx)) {
+        (input, tx) = match self.inner.pool.try_push((input, tx)) {
             Ok(_) => return rx.await?,
             Err((msg, BatchinfError::QueueFullError)) => msg,
             Err((_, err)) => return Err(err),
         };
 
         loop {
-            let notification = self.pool.get_notified();
+            let notification = self.inner.pool.get_notified();
             tokio::pin!(notification);
 
             notification.as_mut().enable();
 
-            (input, tx) = match self.pool.try_push((input, tx)) {
+            (input, tx) = match self.inner.pool.try_push((input, tx)) {
                 Ok(_) => return rx.await?,
                 Err((msg, BatchinfError::QueueFullError)) => msg,
                 Err((_, err)) => return Err(err),
@@ -135,7 +163,7 @@ where
     /// [`try_predict`](Batchinf::try_predict) there instead.
     pub fn blocking_try_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
-        self.pool.push((input, tx))?;
+        self.inner.pool.push((input, tx))?;
         rx.blocking_recv()?
     }
 
@@ -164,18 +192,27 @@ where
         }
     }
 
+    /// Returns a [`ShutdownWaiter`] that resolves once this batcher has fully shut down: every
+    /// handle has been dropped, and every worker's inference thread has exited and dropped its
+    /// predictor.
+    ///
+    /// The waiter does not keep the batcher alive. Get it before dropping the last handle.
+    pub fn shutdown_waiter(&self) -> ShutdownWaiter {
+        ShutdownWaiter::new(self.inner.shutdown_rx.clone())
+    }
+
     /// Returns a snapshot of every worker in the pool, indexed by worker position.
     pub fn pool_status(&self) -> Vec<WorkerSnapshot> {
-        self.pool.pool_status()
+        self.inner.pool.pool_status()
     }
 
     /// Returns a snapshot of the worker at `idx`, or `None` if out of bounds.
     pub fn worker_status(&self, idx: usize) -> Option<WorkerSnapshot> {
-        self.pool.worker_status(idx)
+        self.inner.pool.worker_status(idx)
     }
 
     fn emit_timeout(&self) {
-        if let Some(ref obs) = self.obs {
+        if let Some(ref obs) = self.inner.obs {
             obs.on_request_timeout();
         }
     }

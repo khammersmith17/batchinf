@@ -1,8 +1,9 @@
 use crate::{
-    error::BatchinfError,
+    error::{BatchinfError, StartupError},
     observability::{BatchTrigger, BatcherMetrics, emitters},
     predictor::Predictor,
     setup::PredictorFactory,
+    shutdown::ShutdownSender,
     state::{WorkerState, WorkerStatus},
 };
 use std::sync::Arc;
@@ -25,32 +26,31 @@ pub(crate) type OutputSender<P> =
 pub(crate) type InputReceiver<P> = Receiver<(<P as Predictor>::Input, OutputSender<P>)>;
 pub(crate) type InferenceResult<P> = Result<Vec<<P as Predictor>::Output>, <P as Predictor>::Error>;
 type JobSender<P> = Sender<WorkerBuffer<P>>;
+/// Reports the outcome of a worker's first predictor build to `get_batcher`.
+pub(crate) type StartAckSender<E> = Sender<Result<(), StartupError<E>>>;
 
 // One batch queued while one runs on the inference thread. When both slots are taken, the
 // accumulator waits on `send`, its request channel fills, and the router moves on to other workers.
 const JOB_QUEUE_DEPTH: usize = 1;
 
-/// Type that holds state required to orchestrate and perform inference.
-pub(crate) struct InferenceWorker<P: Predictor> {
+/// State the accumulator task holds for its whole lifetime.
+pub(crate) struct InferenceWorker {
     state: WorkerState,
-    factory: PredictorFactory<P>,
     obs: Option<Arc<dyn BatcherMetrics>>,
     worker_id: u8,
     signal: Arc<Notify>,
 }
 
 /// Core behavior of the inference worker.
-impl<P: Predictor> InferenceWorker<P> {
+impl InferenceWorker {
     pub(crate) fn new(
         state: WorkerState,
-        factory: PredictorFactory<P>,
         obs: Option<Arc<dyn BatcherMetrics>>,
         worker_id: u8,
         signal: Arc<Notify>,
-    ) -> InferenceWorker<P> {
+    ) -> InferenceWorker {
         InferenceWorker {
             state,
-            factory,
             obs,
             worker_id,
             signal,
@@ -68,12 +68,12 @@ impl<P: Predictor> InferenceWorker<P> {
     }
 
     // Report the number of requests waiting in this worker's queue, not yet pulled into a batch.
-    fn emit_queue_depth(&self, input_receiver: &InputReceiver<P>) {
+    fn emit_queue_depth<T>(&self, input_receiver: &Receiver<T>) {
         emitters::emit_queue_depth(self.obs.clone(), self.worker_id, input_receiver.len());
     }
 
-    fn notify_waiters(&self) {
-        self.signal.notify_waiters()
+    fn notify_one(&self) {
+        self.signal.notify_one()
     }
 }
 
@@ -91,6 +91,12 @@ impl<P: Predictor> WorkerBuffer<P> {
             sender_buffer: Vec::with_capacity(cap),
             input_buffer: Vec::with_capacity(cap),
         }
+    }
+
+    #[inline]
+    fn swap_replace(&mut self) -> WorkerBuffer<P> {
+        let cap = self.cap();
+        std::mem::replace(self, WorkerBuffer::new(cap))
     }
 
     // Filter out the requests that have been canceled in place.
@@ -126,6 +132,13 @@ impl<P: Predictor> WorkerBuffer<P> {
         self.input_buffer.len()
     }
 
+    // Returns the number of items in the buffer.
+    #[inline]
+    fn cap(&self) -> usize {
+        debug_assert_eq!(self.input_buffer.capacity(), self.sender_buffer.capacity());
+        self.input_buffer.capacity()
+    }
+
     // Returns true if the buffer is empty.
     fn is_empty(&self) -> bool {
         debug_assert_eq!(self.input_buffer.len(), self.sender_buffer.len());
@@ -137,13 +150,12 @@ impl<P: Predictor> WorkerBuffer<P> {
         &self.input_buffer
     }
 
-    // Takes the held senders, and replaces the container with a fresh sender buffer. Sending
-    // takes ownership, so this provides an own `Vec<Sender<T>>`, replaces it and clears the input
-    // buffer.
-    fn clear_and_take_senders(&mut self) -> Vec<OutputSender<P>> {
-        let cap = self.sender_buffer.capacity();
-        self.input_buffer.clear();
-        std::mem::replace(&mut self.sender_buffer, Vec::with_capacity(cap))
+    // Takes the held senders
+    fn take_senders(&mut self) -> Vec<OutputSender<P>> {
+        // drop the input buffer.
+        let _ = std::mem::take(&mut self.input_buffer);
+        // hand back the sender buffer.
+        std::mem::take(&mut self.sender_buffer)
     }
 }
 
@@ -159,24 +171,45 @@ pub(crate) struct PredictorStartConfig {
     pub(crate) max_wait: Duration,
 }
 
-fn make_runner<P: Predictor + 'static>(
-    worker: &InferenceWorker<P>,
-    start: PredictorStartConfig,
-    ready_tx: Sender<(u8, bool)>,
+/// Everything a worker hands to its inference thread when spawning it. Passed by value from
+/// `get_batcher` straight through to the thread, so the accumulator task never keeps any of it:
+/// the factory (and any model weights it captures) and the shutdown sender live exactly as long
+/// as the inference thread.
+pub(crate) struct RunnerHandoff<P: Predictor, E> {
+    pub(crate) factory: PredictorFactory<P, E>,
+    pub(crate) start: PredictorStartConfig,
+    // Acks readiness before returning handle to user.
+    pub(crate) ready_tx: StartAckSender<E>,
+    // Notifies on shutdown.
+    pub(crate) shutdown_tx: ShutdownSender,
+}
+
+fn make_runner<P: Predictor + 'static, E: Send + 'static>(
+    worker: &InferenceWorker,
+    handoff: RunnerHandoff<P, E>,
 ) -> JobSender<P> {
-    let (job_tx, job_rx) = channel::<WorkerBuffer<P>>(JOB_QUEUE_DEPTH);
-    spawn_inference_runner(InferenceRunnerArgs {
-        factory: Arc::clone(&worker.factory),
-        recv: job_rx,
-        worker_state: worker.state.clone(),
-        worker_id: worker.worker_id,
-        retries: start.retries,
-        backoff: start.backoff,
-        max_wait: start.max_wait,
-        obs: worker.obs.clone(),
+    let RunnerHandoff {
+        factory,
+        start,
         ready_tx,
-        signal: Arc::clone(&worker.signal),
-    });
+        shutdown_tx,
+    } = handoff;
+    let (job_tx, job_rx) = channel::<WorkerBuffer<P>>(JOB_QUEUE_DEPTH);
+    spawn_inference_runner(
+        InferenceRunnerArgs {
+            factory,
+            batch_recv: job_rx,
+            worker_state: worker.state.clone(),
+            worker_id: worker.worker_id,
+            retries: start.retries,
+            backoff: start.backoff,
+            max_wait: start.max_wait,
+            obs: worker.obs.clone(),
+            ready_tx,
+            signal: Arc::clone(&worker.signal),
+        },
+        shutdown_tx,
+    );
     job_tx
 }
 
@@ -186,20 +219,19 @@ fn make_runner<P: Predictor + 'static>(
 // then dispatch inference.
 //
 // After inference, the state is evaluated to determine if the worker should continue.
-async fn worker_loop<P: Predictor + 'static>(
-    worker: InferenceWorker<P>,
+async fn worker_loop<P: Predictor + 'static, E: Send + 'static>(
+    worker: InferenceWorker,
     mut input_receiver: InputReceiver<P>,
-    start: PredictorStartConfig,
-    ready_tx: Sender<(u8, bool)>,
+    handoff: RunnerHandoff<P, E>,
 ) {
     let cap = worker.state.batch_size() as usize;
     let mut next_inf = Instant::now();
     let mut buffer = WorkerBuffer::new(cap);
-    let job_tx = make_runner(&worker, start, ready_tx);
+    let job_tx = make_runner(&worker, handoff);
 
     loop {
         accumulate_next_batch(&mut input_receiver, &worker, &mut buffer, &mut next_inf).await;
-        let live_buffer = std::mem::replace(&mut buffer, WorkerBuffer::new(cap));
+        let live_buffer = buffer.swap_replace();
         match worker.state.get_worker_state() {
             WorkerStatus::Waiting => unreachable!(),
             WorkerStatus::Running => {
@@ -237,13 +269,13 @@ async fn worker_loop<P: Predictor + 'static>(
 /// Sets state to Running when the batch is ready, or Exit when the channel closes.
 async fn accumulate_next_batch<P: Predictor + 'static>(
     receiver: &mut InputReceiver<P>,
-    worker: &InferenceWorker<P>,
+    worker: &InferenceWorker,
     buffer: &mut WorkerBuffer<P>,
     next_inf: &mut Instant,
 ) {
     // Wait for first item in batch to start batch timer.
     if let Some((request, sender)) = receiver.recv().await {
-        worker.notify_waiters();
+        worker.notify_one();
         buffer.push(request, sender);
         worker.state.increment_len();
         worker.reset_next_inf(next_inf);
@@ -264,7 +296,8 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
         select! {
             user_input = receiver.recv() => {
                 if let Some((request, sender)) = user_input {
-                    worker.notify_waiters();
+                    // Only one requester gets notified when a slot opens.
+                    worker.notify_one();
                     buffer.push(request, sender);
 
                     worker.state.increment_len();
@@ -320,13 +353,12 @@ fn time_until_timeout(ts: &Instant) -> Duration {
 }
 
 /// Entry point to worker lifecycle.
-pub(crate) fn run_worker<P: Predictor + 'static>(
-    worker: InferenceWorker<P>,
+pub(crate) fn run_worker<P: Predictor + 'static, E: Send + 'static>(
+    worker: InferenceWorker,
     receiver: InputReceiver<P>,
-    start: PredictorStartConfig,
-    ready_tx: Sender<(u8, bool)>,
+    handoff: RunnerHandoff<P, E>,
 ) {
-    tokio::task::spawn(async move { worker_loop(worker, receiver, start, ready_tx).await });
+    tokio::task::spawn(async move { worker_loop(worker, receiver, handoff).await });
 }
 
 #[cfg(test)]

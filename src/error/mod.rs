@@ -79,16 +79,24 @@ where
 /// that is already running cannot be interrupted, so it runs to completion in the background and
 /// its predictor is then dropped.
 #[derive(Debug, Error, Copy, Clone, PartialEq, Eq)]
-pub enum StartupError {
+pub enum StartupError<E> {
     /// Not every worker built its predictor within
     /// [`BatcherConfig::startup_timeout`](`crate::BatcherConfig::startup_timeout`).
     #[error("Workers did not start within timeout bounds.")]
     Timeout,
-    /// A worker's predictor factory failed on every attempt. See
-    /// [`BatcherConfig::worker_start_retries`](`crate::BatcherConfig::worker_start_retries`).
-    #[error("Worker {worker_id} failed to start.")]
+    /// A worker's predictor factory failed on every attempt, returning `Err` on the last one.
+    /// See [`BatcherConfig::worker_start_retries`](`crate::BatcherConfig::worker_start_retries`).
+    #[error("Worker {worker_id} failed to start: {err}")]
     WorkerStartFailure {
         /// Index of the worker whose factory failed, in `0..pool_size`.
+        worker_id: u8,
+        /// The error the factory returned on its last attempt.
+        err: E,
+    },
+    /// A worker's predictor factory failed on every attempt, panicking on the last one.
+    #[error("Worker {worker_id} failed to start: the predictor factory panicked")]
+    WorkerStartPanic {
+        /// Index of the worker whose factory panicked, in `0..pool_size`.
         worker_id: u8,
     },
     /// A worker stopped before reporting whether its predictor was built, for example because

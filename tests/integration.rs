@@ -212,8 +212,10 @@ fn with_obs(m: &Arc<TestMetrics>) -> Option<Arc<dyn BatcherMetrics>> {
 
 /// Factory that hands each worker (and each rebuild) a clone of `predictor`. Clones share any
 /// `Arc` state, so counters and panic flags are observed across workers and rebuilds.
-fn factory<P: Clone + Send + Sync + 'static>(predictor: P) -> Arc<dyn Fn(u8) -> P + Send + Sync> {
-    Arc::new(move |_worker_id| predictor.clone())
+fn factory<P: Clone + Send + Sync + 'static>(
+    predictor: P,
+) -> Arc<dyn Fn(u8) -> Result<P, TestError> + Send + Sync> {
+    Arc::new(move |_worker_id| Ok(predictor.clone()))
 }
 
 async fn join<T: Send + 'static>(handles: Vec<tokio::task::JoinHandle<T>>) -> Vec<T> {
@@ -818,15 +820,112 @@ async fn test_drop_releases_all_predictor_clones() {
         .unwrap();
 
     assert_eq!(batcher.predict(1).await.unwrap(), 1);
+    let waiter = batcher.shutdown_waiter();
     drop(batcher);
 
-    // Workers and the control plane exit asynchronously once the last handle is dropped.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Workers exit asynchronously once the last handle is dropped.
+    tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+        .await
+        .expect("shutdown should complete once the last handle is dropped");
 
     assert_eq!(
         Arc::strong_count(&marker),
         1,
-        "workers or control plane still hold predictor clones after the batcher was dropped"
+        "workers still hold predictor clones after shutdown completed"
+    );
+}
+
+// The waiter must not resolve while any handle is alive, and must not itself keep the batcher
+// alive.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_waiter_waits_for_every_handle() {
+    let marker = Arc::new(());
+    let predictor = MarkedPredictor {
+        _marker: Arc::clone(&marker),
+    };
+    let batcher = get_batcher(factory(predictor), config(4, 10, 2), no_obs())
+        .await
+        .unwrap();
+    let clone = batcher.clone();
+    let waiter = batcher.shutdown_waiter();
+
+    drop(batcher);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), waiter.clone().wait())
+            .await
+            .is_err(),
+        "shutdown must not complete while a clone is alive"
+    );
+    assert!(!waiter.is_shutdown());
+    assert_eq!(clone.predict(5).await.unwrap(), 5, "the clone still serves");
+
+    drop(clone);
+    tokio::time::timeout(Duration::from_secs(2), waiter.clone().wait())
+        .await
+        .expect("shutdown should complete once the last handle is dropped");
+    assert!(waiter.is_shutdown());
+    assert_eq!(Arc::strong_count(&marker), 1);
+}
+
+/// Sleeps in `predict_batch` and holds `marker` until dropped.
+struct SlowMarkedPredictor {
+    _marker: Arc<()>,
+    delay: Duration,
+}
+
+impl Predictor for SlowMarkedPredictor {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+        std::thread::sleep(self.delay);
+        Ok(inp.to_vec())
+    }
+}
+
+// A batch already running when the last handle is dropped finishes first; the waiter resolves
+// only after that, once the predictor has been dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_waiter_waits_for_running_batch() {
+    let marker = Arc::new(());
+    let factory_marker = Arc::clone(&marker);
+    let batcher = get_batcher(
+        Arc::new(move |_worker_id| {
+            Ok::<_, TestError>(SlowMarkedPredictor {
+                _marker: Arc::clone(&factory_marker),
+                delay: Duration::from_millis(300),
+            })
+        }),
+        config(1, 10, 1),
+        no_obs(),
+    )
+    .await
+    .unwrap();
+    let waiter = batcher.shutdown_waiter();
+
+    // Batch size 1, so the request goes to the inference thread right away. The caller gives up
+    // while inference is still running.
+    let start = Instant::now();
+    let res = batcher
+        .predict_with_timeout(1, Duration::from_millis(50))
+        .await;
+    assert!(matches!(res, Err(BatchinfError::TimeoutError)));
+    drop(batcher);
+
+    tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+        .await
+        .expect("shutdown should complete after the running batch");
+    assert!(
+        start.elapsed() >= Duration::from_millis(250),
+        "shutdown completed before the running batch finished, after {:?}",
+        start.elapsed()
+    );
+    // Holds only if the factory closure (which holds a clone) is gone too.
+    assert_eq!(
+        Arc::strong_count(&marker),
+        1,
+        "the predictor or factory outlived shutdown"
     );
 }
 
@@ -850,8 +949,10 @@ impl Predictor for ThreadLocalPredictor {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_non_send_non_clone_predictor() {
     let batcher = get_batcher(
-        Arc::new(|_worker_id| ThreadLocalPredictor {
-            calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+        Arc::new(|_worker_id| {
+            Ok::<_, TestError>(ThreadLocalPredictor {
+                calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+            })
         }),
         config(4, 10, 2),
         no_obs(),
@@ -912,9 +1013,9 @@ async fn test_dead_worker_is_skipped_by_router() {
             if worker_id == 0 && worker_zero_builds.fetch_add(1, Ordering::SeqCst) > 0 {
                 panic!("intentional factory failure rebuilding worker 0");
             }
-            MaybePanicPredictor {
+            Ok::<_, TestError>(MaybePanicPredictor {
                 always_panics: worker_id == 0,
-            }
+            })
         }),
         // Room for the whole burst on the two healthy workers, so any rejection is a routing bug
         // rather than backpressure.
@@ -976,17 +1077,17 @@ impl Predictor for SlowPanicOncePredictor {
 fn slow_rebuild_factory(
     rebuild_delay: Duration,
     panic_delay: Duration,
-) -> Arc<dyn Fn(u8) -> SlowPanicOncePredictor + Send + Sync> {
+) -> Arc<dyn Fn(u8) -> Result<SlowPanicOncePredictor, TestError> + Send + Sync> {
     let has_panicked = Arc::new(AtomicBool::new(false));
     let built_once = Arc::new(AtomicBool::new(false));
     Arc::new(move |_worker_id| {
         if built_once.swap(true, Ordering::SeqCst) {
             std::thread::sleep(rebuild_delay);
         }
-        SlowPanicOncePredictor {
+        Ok(SlowPanicOncePredictor {
             has_panicked: Arc::clone(&has_panicked),
             delay: panic_delay,
-        }
+        })
     })
 }
 
@@ -1140,9 +1241,9 @@ async fn test_waiting_predict_fails_when_last_worker_dies() {
             if builds.fetch_add(1, Ordering::SeqCst) > 0 {
                 panic!("intentional factory failure during rebuild");
             }
-            MaybePanicPredictor {
+            Ok::<_, TestError>(MaybePanicPredictor {
                 always_panics: true,
-            }
+            })
         }),
         // Rebuild attempts at 0ms, 50ms and 150ms after the panic, then the worker is Dead.
         retry_config(2, 50, 1_000),
@@ -1247,9 +1348,11 @@ async fn test_saturation_spreads_load_across_workers() {
     let counts = Arc::clone(&batches_per_worker);
 
     let batcher = get_batcher(
-        Arc::new(move |worker_id| RecordingPredictor {
-            worker_id,
-            batches_per_worker: Arc::clone(&counts),
+        Arc::new(move |worker_id| {
+            Ok::<_, TestError>(RecordingPredictor {
+                worker_id,
+                batches_per_worker: Arc::clone(&counts),
+            })
         }),
         // Room for the whole burst, so any rejection would be a routing bug.
         config_builder(4, 5, pool_size as u8)
@@ -1289,14 +1392,14 @@ fn retry_config(retries: u8, backoff_ms: u64, max_wait_ms: u64) -> BatcherConfig
         .build()
 }
 
-/// Factory that panics on every call and counts how often it was called.
+/// Factory that returns an error on every call and counts how often it was called.
 fn always_failing_factory(
     calls: &Arc<AtomicU32>,
-) -> Arc<dyn Fn(u8) -> EchoPredictor + Send + Sync> {
+) -> Arc<dyn Fn(u8) -> Result<EchoPredictor, TestError> + Send + Sync> {
     let calls = Arc::clone(calls);
-    Arc::new(move |_worker_id| -> EchoPredictor {
+    Arc::new(move |_worker_id| {
         calls.fetch_add(1, Ordering::SeqCst);
-        panic!("intentional factory failure");
+        Err(TestError)
     })
 }
 
@@ -1318,7 +1421,10 @@ async fn test_factory_retries_with_doubling_backoff() {
     assert!(
         matches!(
             result,
-            Err(StartupError::WorkerStartFailure { worker_id: 0 })
+            Err(StartupError::WorkerStartFailure {
+                worker_id: 0,
+                err: TestError
+            })
         ),
         "startup should fail once the factory's retries are used up"
     );
@@ -1349,7 +1455,10 @@ async fn test_factory_backoff_is_capped() {
 
     assert!(matches!(
         result,
-        Err(StartupError::WorkerStartFailure { worker_id: 0 })
+        Err(StartupError::WorkerStartFailure {
+            worker_id: 0,
+            err: TestError
+        })
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 5, "1 attempt + 4 retries");
     assert!(
@@ -1377,7 +1486,10 @@ async fn test_zero_retries_is_a_single_attempt() {
 
     assert!(matches!(
         result,
-        Err(StartupError::WorkerStartFailure { worker_id: 0 })
+        Err(StartupError::WorkerStartFailure {
+            worker_id: 0,
+            err: TestError
+        })
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(
@@ -1392,9 +1504,9 @@ async fn test_startup_fails_when_one_worker_cannot_start() {
     let result = get_batcher(
         Arc::new(|worker_id: u8| {
             if worker_id == 1 {
-                panic!("intentional factory failure for worker 1");
+                return Err(TestError);
             }
-            EchoPredictor
+            Ok(EchoPredictor)
         }),
         config(4, 10, 3),
         no_obs(),
@@ -1404,7 +1516,10 @@ async fn test_startup_fails_when_one_worker_cannot_start() {
     assert!(
         matches!(
             result,
-            Err(StartupError::WorkerStartFailure { worker_id: 1 })
+            Err(StartupError::WorkerStartFailure {
+                worker_id: 1,
+                err: TestError
+            })
         ),
         "startup should fail and name the worker that could not build its predictor"
     );
@@ -1418,7 +1533,7 @@ async fn test_startup_times_out_with_slow_factory() {
     let result = get_batcher(
         Arc::new(|_worker_id| {
             std::thread::sleep(Duration::from_millis(400));
-            EchoPredictor
+            Ok::<_, TestError>(EchoPredictor)
         }),
         config_builder(4, 10, 1)
             .startup_timeout(Duration::from_millis(50))
@@ -1448,7 +1563,7 @@ async fn test_factory_succeeds_on_a_retry() {
             if counter.fetch_add(1, Ordering::SeqCst) < 2 {
                 panic!("intentional factory failure");
             }
-            EchoPredictor
+            Ok::<_, TestError>(EchoPredictor)
         }),
         retry_config(3, 5, 100),
         no_obs(),
@@ -1481,10 +1596,10 @@ async fn test_rebuild_after_panic_retries_factory() {
             if counter.fetch_add(1, Ordering::SeqCst) == 1 {
                 panic!("intentional factory failure during rebuild");
             }
-            SlowPanicOncePredictor {
+            Ok::<_, TestError>(SlowPanicOncePredictor {
                 has_panicked: Arc::clone(&has_panicked),
                 delay: Duration::ZERO,
-            }
+            })
         }),
         {
             // The fields are public, so a built config can still be adjusted.
@@ -1545,13 +1660,15 @@ impl Predictor for BatchRecordingPredictor {
 /// Factory for [`BatchRecordingPredictor`] plus a handle to the batches it records.
 #[allow(clippy::type_complexity)]
 fn batch_recording_factory() -> (
-    Arc<dyn Fn(u8) -> BatchRecordingPredictor + Send + Sync>,
+    Arc<dyn Fn(u8) -> Result<BatchRecordingPredictor, TestError> + Send + Sync>,
     Arc<std::sync::Mutex<Vec<Vec<u64>>>>,
 ) {
     let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = Arc::clone(&batches);
-    let factory = Arc::new(move |_worker_id| BatchRecordingPredictor {
-        batches: Arc::clone(&recorded),
+    let factory = Arc::new(move |_worker_id| {
+        Ok(BatchRecordingPredictor {
+            batches: Arc::clone(&recorded),
+        })
     });
     (factory, batches)
 }
@@ -1861,4 +1978,58 @@ async fn test_default_built_config_starts_a_batcher() {
 
     assert_eq!(batcher.pool_status().len(), 1);
     assert_eq!(batcher.predict(5).await.unwrap(), 5);
+}
+
+// A factory that panics on every attempt is reported as a panic, not as a returned error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_factory_panic_reports_worker_start_panic() {
+    let calls = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&calls);
+    let result = get_batcher(
+        Arc::new(move |_worker_id| -> Result<EchoPredictor, TestError> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            panic!("intentional factory panic");
+        }),
+        retry_config(1, 0, 0),
+        no_obs(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(StartupError::WorkerStartPanic { worker_id: 0 })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "1 attempt + 1 retry");
+}
+
+// The error the factory returns on its last attempt reaches the caller of `get_batcher`, and the
+// factory's error type does not need to implement `Clone`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_factory_error_is_returned_to_caller() {
+    #[derive(Debug, PartialEq)]
+    struct LoadError(u32);
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&attempts);
+    let result = get_batcher(
+        Arc::new(move |_worker_id| -> Result<EchoPredictor, LoadError> {
+            Err(LoadError(counter.fetch_add(1, Ordering::SeqCst)))
+        }),
+        retry_config(2, 0, 0),
+        no_obs(),
+    )
+    .await;
+
+    match result {
+        Err(StartupError::WorkerStartFailure { worker_id, err }) => {
+            assert_eq!(worker_id, 0);
+            assert_eq!(
+                err,
+                LoadError(2),
+                "the error from the last attempt is returned"
+            );
+        }
+        Err(other) => panic!("unexpected startup error: {other:?}"),
+        Ok(_) => panic!("startup should fail"),
+    }
 }

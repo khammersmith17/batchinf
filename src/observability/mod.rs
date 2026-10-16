@@ -8,6 +8,9 @@ pub enum BatchTrigger {
 }
 
 /// This trait provides the contract for emitting observability metrics. Implement the backend.
+/// The implementations defined here are called inline. The implement observability orchestration
+/// called inline should be cheap and should not panic. If a panic occurs here, it will be
+/// unrecoverable, unlike panics in the [Predictor](crate::predictor::Predictor).
 pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger].
     /// This may provide some information that can help tune the batch size and the timeout for a

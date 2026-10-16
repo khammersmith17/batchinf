@@ -1,8 +1,10 @@
-use super::{WorkerBuffer, dispatch};
+use super::{StartAckSender, WorkerBuffer, dispatch};
 use crate::{
+    error::StartupError,
     observability::{BatcherMetrics, InfBatchMetrics, emitters},
     predictor::Predictor,
     setup::PredictorFactory,
+    shutdown::ShutdownSender,
     state::{PredictorStatus, WorkerState},
 };
 use std::{
@@ -10,23 +12,22 @@ use std::{
     thread::Builder,
     time::{Duration, Instant},
 };
-use tokio::sync::{
-    Notify,
-    mpsc::{Receiver, Sender},
-};
+use tokio::sync::{Notify, mpsc::Receiver};
 
+// Type alias for the receiver where work is passed from the accumulator.
 pub(super) type JobReceiver<P> = Receiver<WorkerBuffer<P>>;
 
-pub(super) struct InferenceRunnerArgs<P: Predictor> {
-    pub(super) factory: PredictorFactory<P>,
-    pub(super) recv: JobReceiver<P>,
+// Fat struct that contains all that is needed to start/run the inference thread.
+pub(super) struct InferenceRunnerArgs<P: Predictor, E> {
+    pub(super) factory: PredictorFactory<P, E>,
+    pub(super) batch_recv: JobReceiver<P>,
     pub(super) worker_state: WorkerState,
     pub(super) worker_id: u8,
     pub(super) retries: u8,
     pub(super) backoff: Duration,
     pub(super) max_wait: Duration,
     pub(super) obs: Option<Arc<dyn BatcherMetrics>>,
-    pub(super) ready_tx: Sender<(u8, bool)>,
+    pub(super) ready_tx: StartAckSender<E>,
     pub(super) signal: Arc<Notify>,
 }
 
@@ -47,60 +48,82 @@ fn backoff_schedule(
     })
 }
 
-fn try_make_predictor<P: Predictor>(
-    f: PredictorFactory<P>,
-    worker_id: u8,
-    wait: Duration,
-) -> Result<P, ()> {
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(worker_id)))
-        .map_err(|_e| ());
-    if res.is_err() {
-        // Last wait is no-op.
-        std::thread::sleep(wait)
-    }
-    res
+/// Why a predictor could not be built.
+enum BuildFailure<E> {
+    /// The factory returned an error on the last attempt.
+    Error(E),
+    /// The factory panicked on the last attempt.
+    Panic,
+    /// The exit condition was met before the next attempt; nobody is waiting for the result.
+    Cancelled,
 }
 
-fn spawn_predictor<P: Predictor>(
-    factory: PredictorFactory<P>,
+fn try_make_predictor<P: Predictor, E>(
+    f: PredictorFactory<P, E>,
+    worker_id: u8,
+    wait: Duration,
+) -> Result<P, BuildFailure<E>> {
+    let failure = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(worker_id)))
+    {
+        Ok(Ok(predictor)) => return Ok(predictor),
+        Ok(Err(e)) => BuildFailure::Error(e),
+        Err(_) => BuildFailure::Panic,
+    };
+    // Last wait is no-op.
+    std::thread::sleep(wait);
+    Err(failure)
+}
+
+fn spawn_predictor<P: Predictor, E>(
+    factory: PredictorFactory<P, E>,
     worker_id: u8,
     total_attempts: u8,
     backoff: Duration,
     max_wait: Duration,
     exit_cond: impl Fn() -> bool,
-) -> Result<P, ()> {
+) -> Result<P, BuildFailure<E>> {
+    let mut last_failure = BuildFailure::Cancelled;
     for wait in backoff_schedule(total_attempts, backoff, max_wait) {
         if exit_cond() {
-            return Err(());
+            return Err(BuildFailure::Cancelled);
         }
-        let p = try_make_predictor(Arc::clone(&factory), worker_id, wait);
-
-        if p.is_ok() {
-            return p;
+        match try_make_predictor(Arc::clone(&factory), worker_id, wait) {
+            Ok(predictor) => return Ok(predictor),
+            Err(failure) => last_failure = failure,
         }
     }
-    Err(())
+    Err(last_failure)
 }
 
-pub(super) fn spawn_inference_runner<P: Predictor + 'static>(args: InferenceRunnerArgs<P>) {
+pub(super) fn spawn_inference_runner<P: Predictor + 'static, E: Send + 'static>(
+    args: InferenceRunnerArgs<P, E>,
+    shutdown_tx: ShutdownSender,
+) {
     let worker_id = args.worker_id;
     let name = format!("batchinf-worker-{worker_id}");
     let ready_tx = args.ready_tx.clone();
 
     if Builder::new()
         .name(name)
-        .spawn(move || inference_runner(args))
+        .spawn(move || {
+            inference_runner(args);
+            // `inference_runner` owned the predictor, the factory (and any weights it captures)
+            // and every channel end, so all of it has been dropped by now. Only then release the
+            // shutdown sender, which lets a `ShutdownWaiter` resolve. If the runner panics,
+            // unwinding drops its frame first and then this one, so the order still holds.
+            drop(shutdown_tx);
+        })
         .is_err()
     {
-        let _ = ready_tx.try_send((worker_id, false));
+        let _ = ready_tx.try_send(Err(StartupError::InternalError));
     }
     drop(ready_tx);
 }
 
-fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
+fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
     let InferenceRunnerArgs {
         factory,
-        mut recv,
+        mut batch_recv,
         worker_state,
         worker_id,
         retries,
@@ -118,41 +141,39 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
 
     // Report the outcome of the first build to `get_batcher`. If the factory keeps failing,
     // startup as a whole fails.
-    let Ok(mut predictor) = spawn_predictor(
+    let mut predictor = match spawn_predictor(
         Arc::clone(&factory),
         worker_id,
         total_attempts,
         backoff,
         max_wait,
         move || tx_ref.is_closed(),
-    ) else {
-        let _ = ready_tx.blocking_send((worker_id, false));
-        worker_state.set_dead();
-        return;
+    ) {
+        Ok(predictor) => predictor,
+        Err(failure) => {
+            worker_state.set_dead();
+            let err = match failure {
+                BuildFailure::Error(err) => StartupError::WorkerStartFailure { worker_id, err },
+                BuildFailure::Panic => StartupError::WorkerStartPanic { worker_id },
+                // Startup already ended (timeout or another worker failed), so nobody is
+                // waiting for this worker's result.
+                BuildFailure::Cancelled => return,
+            };
+            let _ = ready_tx.blocking_send(Err(err));
+            return;
+        }
     };
 
     // If send failures, the startup timed out or another worker failed to start and we should exit.
-    if ready_tx.blocking_send((worker_id, true)).is_err() {
+    if ready_tx.blocking_send(Ok(())).is_err() {
         return;
     };
     drop(ready_tx);
 
     // ****** Start Inference Runner ******
 
-    // Fn closure to generate a new predictor on panic.
-    let generator = move || {
-        spawn_predictor(
-            Arc::clone(&factory),
-            worker_id,
-            total_attempts,
-            backoff,
-            max_wait,
-            || false,
-        )
-    };
-
     // `blocking_recv` is fine here: this is a dedicated OS thread, not a runtime thread.
-    while let Some(mut buffer) = recv.blocking_recv() {
+    while let Some(mut buffer) = batch_recv.blocking_recv() {
         // Filter out any canceled (timed out) requests.
         buffer.filter_canceled();
 
@@ -177,24 +198,34 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
 
                 // Dispatch the internal error. Requests should not wait on a worker to restart.
                 // They will not be retried here.
-                let senders = buffer.clear_and_take_senders();
+                let senders = buffer.take_senders();
                 dispatch::send_errors_on_crash::<P>(senders);
-                let Ok(new_predictor) = generator() else {
+
+                // Drop predictor while new one is being rebuilt.
+                // Otherwise, memory footprint on the predictor would 2x.
+                drop(predictor);
+                let Ok(new_predictor) = spawn_predictor(
+                    Arc::clone(&factory),
+                    worker_id,
+                    total_attempts,
+                    backoff,
+                    max_wait,
+                    || batch_recv.is_closed(),
+                ) else {
                     worker_state.set_dead();
-                    // If this is the only worker, notify a caller that there are no longer workers
-                    // available.
+                    // Allows requesters to get a `NoAvailableWorkers`.
                     signal.notify_waiters();
                     return;
                 };
                 predictor = new_predictor;
                 worker_state.set_predictor_state(PredictorStatus::Alive);
-                // This worker can accept work again, in the case others are blocked.
+                // This worker can accept work again.
                 signal.notify_waiters();
                 continue;
             }
         };
 
-        let senders = buffer.clear_and_take_senders();
+        let senders = buffer.take_senders();
         dispatch::send_output::<P>(inf_result, senders, metrics, obs.clone());
     }
 }

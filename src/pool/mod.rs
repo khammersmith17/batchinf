@@ -8,7 +8,7 @@ use std::sync::{
 };
 use tokio::sync::{Notify, futures::Notified};
 
-type PoolSlab<Input, Output, Error> = Arc<[WorkerRef<Input, Output, Error>]>;
+type PoolSlab<Input, Output, Error> = Box<[WorkerRef<Input, Output, Error>]>;
 
 pub(crate) type FunnelMessage<Input, Output, Error> = (
     Input,
@@ -18,6 +18,7 @@ pub(crate) type FunnelMessage<Input, Output, Error> = (
 pub(crate) type TryPushResult<Input, Output, Error> =
     Result<(), (FunnelMessage<Input, Output, Error>, BatchinfError<Error>)>;
 
+/// Type that holds references to all workers in the pool.
 #[derive(Debug)]
 pub(crate) struct WorkerPool<Input, Output, Error>
 where
@@ -25,31 +26,12 @@ where
     Output: Send + 'static,
     Error: std::error::Error + Send + Sync + 'static,
 {
-    // Arc over a fixed-size slice — pool slots are never added or removed. Predictor rebuilds
-    // happen on each worker's inference thread, so a slot's channel sender never changes.
+    // Fixed-size slice — pool slots are never added or removed. Predictor rebuilds happen on each
+    // worker's inference thread, so a slot's channel sender never changes. Shared between
+    // `Batchinf` clones through `BatchinfInner`, so it needs no `Arc` of its own.
     pool: PoolSlab<Input, Output, Error>,
-    size: u8,
     signal: Arc<Notify>,
-    start: Arc<AtomicUsize>,
-}
-
-impl<Input, Output, Error> Clone for WorkerPool<Input, Output, Error>
-where
-    Input: Send + 'static,
-    Output: Send + 'static,
-    Error: std::error::Error + Clone + Send + Sync + 'static,
-{
-    fn clone(&self) -> Self {
-        let pool = Arc::clone(&self.pool);
-        let start = Arc::clone(&self.start);
-        let signal = Arc::clone(&self.signal);
-        Self {
-            pool,
-            size: self.size,
-            signal,
-            start,
-        }
-    }
+    start: AtomicUsize,
 }
 
 impl<Input, Output, Error> WorkerPool<Input, Output, Error>
@@ -62,13 +44,11 @@ where
         pool: Vec<WorkerRef<Input, Output, Error>>,
         signal: Arc<Notify>,
     ) -> WorkerPool<Input, Output, Error> {
-        let size = pool.len() as u8;
         let start = AtomicUsize::new(0_usize);
         WorkerPool {
             pool: pool.into(),
-            size,
             signal,
-            start: start.into(),
+            start,
         }
     }
 
@@ -140,7 +120,7 @@ where
 
             // Subsequent attempts to resolve worker is thread local walk the worker search space
             // linearly.
-            sink = (sink + 1) % usize::from(self.size);
+            sink = (sink + 1) % usize::from(self.pool_size());
         }
 
         let mut has_live_worker = false;
@@ -164,7 +144,7 @@ where
                 has_rebuilding_worker = true;
             }
 
-            sink = (sink + 1) % usize::from(self.size);
+            sink = (sink + 1) % usize::from(self.pool_size());
         }
 
         // Resolve error to user.
@@ -194,19 +174,20 @@ where
         Some(self.pool[idx].snapshot())
     }
 
+    #[inline]
     fn is_single_worker(&self) -> bool {
         self.pool_size() == 1_usize
     }
 
+    #[inline]
     fn pool_size(&self) -> usize {
         self.pool.len()
     }
 
     /// Get thread start position for worker resolution.
-    ///
     /// Search space start is round robin among threads.
     #[inline]
     fn get_and_increment(&self) -> usize {
-        self.start.fetch_add(1, Ordering::AcqRel) % usize::from(self.size)
+        self.start.fetch_add(1, Ordering::AcqRel) % usize::from(self.pool_size())
     }
 }
