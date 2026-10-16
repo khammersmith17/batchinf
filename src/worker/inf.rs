@@ -171,7 +171,6 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
             Err(_) => {
                 // Mark the predictor as rebuilding, so new requests are routed elsewhere.
                 worker_state.set_predictor_state(PredictorStatus::Rebuilding);
-                signal.notify_waiters();
 
                 // Emit a worker panic.
                 emitters::emit_worker_panic(obs.clone());
@@ -182,11 +181,14 @@ fn inference_runner<P: Predictor>(args: InferenceRunnerArgs<P>) {
                 dispatch::send_errors_on_crash::<P>(senders);
                 let Ok(new_predictor) = generator() else {
                     worker_state.set_dead();
+                    // If this is the only worker, notify a caller that there are no longer workers
+                    // available.
                     signal.notify_waiters();
                     return;
                 };
                 predictor = new_predictor;
                 worker_state.set_predictor_state(PredictorStatus::Alive);
+                // This worker can accept work again, in the case others are blocked.
                 signal.notify_waiters();
                 continue;
             }
@@ -244,6 +246,26 @@ mod backoff_schedule_tests {
     #[test]
     fn zero_attempts_yields_nothing() {
         assert!(waits_ms(0, 50, 1_000).is_empty());
+    }
+
+    #[test]
+    fn single_attempt_never_waits() {
+        // `worker_start_retries: 0` gives one attempt: try once, and do not wait afterwards,
+        // whatever the configured backoff is.
+        assert_eq!(waits_ms(1, 50, 1_000), vec![0]);
+        assert_eq!(waits_ms(1, 60_000, 60_000), vec![0]);
+    }
+
+    #[test]
+    fn last_wait_is_always_zero() {
+        // There is nothing to wait for after the final attempt.
+        for attempts in [1u8, 2, 3, 10, u8::MAX] {
+            assert_eq!(
+                waits_ms(attempts, 50, 1_000).last(),
+                Some(&0),
+                "the wait after the final attempt should be zero for {attempts} attempts"
+            );
+        }
     }
 
     #[test]

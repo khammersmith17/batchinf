@@ -6,8 +6,8 @@ use std::{
 };
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 
-// Mask the state bits to get the queue len.
-const QUEUE_MASK: u64 = !(0b11_u64 << 62);
+// Mask the state bits to get the batch len.
+const BATCH_LEN_MASK: u64 = !(0b11_u64 << 62);
 
 pub(crate) enum QueuePushResult<Input, Output, Error>
 where
@@ -19,8 +19,8 @@ where
 }
 
 mod worker_codes {
-    // These mappings allow for the state and queue size to be stored in a single atomic.
-    // The 2 most significant bits store the status. Remaining 62 bits store the queue len.
+    // These mappings allow for the state and batch length to be stored in a single atomic.
+    // The 2 most significant bits store the status. Remaining 62 bits store the batch len.
     // [state bits] [remaining 62 bits]
     // These u8 values are never stored.
     // 0b00
@@ -122,7 +122,7 @@ pub struct WorkerSnapshot {
     /// The state of the worker's predictor on its inference thread.
     pub predictor_status: PredictorStatus,
     /// Number of requests accumulated in the current batch, up to `batch_size`.
-    pub queue_len: u32,
+    pub batch_len: u32,
 }
 
 /// Struct to store inner worker state.
@@ -130,7 +130,7 @@ pub struct WorkerSnapshot {
 #[derive(Debug)]
 struct WorkerStateInner {
     // State is stored in the 2 MSB here atomic load/store.
-    // The other 62 bits store the queue length.
+    // The other 62 bits store the batch length.
     // Fused into a single atomic given both attributes may need to be updated in a single store.
     worker_state: AtomicU64,
     predictor_state: AtomicU8,
@@ -156,7 +156,7 @@ impl WorkerStateInner {
 
         // Update the state bits using a CAS loop.
         loop {
-            let new = (current & QUEUE_MASK) | state;
+            let new = (current & BATCH_LEN_MASK) | state;
             match self.worker_state.compare_exchange_weak(
                 current,
                 new,
@@ -189,17 +189,17 @@ impl WorkerStateInner {
     fn snapshot(&self) -> WorkerSnapshot {
         let worker_state = self.worker_state.load(Ordering::Acquire);
         let worker_status: WorkerStatus = WorkerStatus::from_u8((worker_state >> 62) as u8);
-        let queue_len = (worker_state & QUEUE_MASK) as u32;
+        let batch_len = (worker_state & BATCH_LEN_MASK) as u32;
         let predictor_status = self.get_predictor_state();
 
         WorkerSnapshot {
             worker_status,
             predictor_status,
-            queue_len,
+            batch_len,
         }
     }
 
-    fn reset_queue_len(&self) {
+    fn reset_batch_len(&self) {
         self.worker_state.store(0_u64, Ordering::Release);
     }
 
@@ -207,7 +207,7 @@ impl WorkerStateInner {
         let snapshot = self.snapshot();
         snapshot.worker_status == WorkerStatus::Waiting
             && snapshot.predictor_status == PredictorStatus::Alive
-            && snapshot.queue_len < self.config.batch_size
+            && snapshot.batch_len < self.config.batch_size
     }
 
     pub(crate) fn can_accept_secondary(&self) -> bool {
@@ -286,14 +286,14 @@ impl WorkerState {
 
     /// Get a snapshot of the worker state.
     ///
-    /// Provides a `WorkerSnapshot`, which provides the current state and the size of the queue.
+    /// Provides a `WorkerSnapshot`, which provides the current state and the length of the batch being built.
     pub(crate) fn snapshot(&self) -> WorkerSnapshot {
         self.inner.snapshot()
     }
 
-    // Resetting the queue len to 0 also puts the worker state back to Waiting.
-    pub(crate) fn reset_queue_len(&self) {
-        self.inner.reset_queue_len()
+    // Resetting the batch len to 0 also puts the worker state back to Waiting.
+    pub(crate) fn reset_batch_len(&self) {
+        self.inner.reset_batch_len()
     }
 }
 

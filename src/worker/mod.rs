@@ -216,7 +216,7 @@ async fn worker_loop<P: Predictor + 'static>(
                 // Backlog that built up while waiting on a busy or rebuilding inference thread.
                 worker.emit_queue_depth(&input_receiver);
                 // Batch handed off. Signal that this worker can accept a new batch.
-                worker.state.reset_queue_len();
+                worker.state.reset_batch_len();
             }
             WorkerStatus::Exit => {
                 // Ownership semantics ensure that no requests are still queued.

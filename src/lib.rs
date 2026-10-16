@@ -71,16 +71,11 @@
 //!     let batcher = get_batcher(
 //!         // Called on each worker's inference thread to build that worker's predictor.
 //!         Arc::new(|_worker_id| EchoModel),
-//!         BatcherConfig {
-//!             batch_size: NonZeroU32::new(32).unwrap(),
-//!             batch_timeout: Duration::from_millis(10),
-//!             pool_size: NonZeroU8::new(1).unwrap(),
-//!             queue_size: NonZeroU32::new(32).unwrap(),
-//!             worker_start_retries: 3,
-//!             worker_start_backoff_start: Duration::from_millis(100),
-//!             max_worker_retry_wait: Duration::from_millis(3000),
-//!             startup_timeout: Duration::from_secs(60),
-//!         },
+//!         // Batches of up to 32 requests; a partial batch fires after 10ms. Every other option
+//!         // has a default, see `BatcherConfig::builder`.
+//!         BatcherConfig::builder(NonZeroU32::new(32).unwrap(), Duration::from_millis(10))
+//!             .pool_size(NonZeroU8::new(1).unwrap())
+//!             .build(),
 //!         None,
 //!     )
 //!     .await
@@ -104,7 +99,7 @@ pub(crate) mod state;
 pub(crate) mod worker;
 
 pub use batcher::Batchinf;
-pub use config::BatcherConfig;
+pub use config::{BatcherConfig, BatcherConfigBuilder};
 pub use error::{BatchinfError, StartupError};
 pub use observability::{BatchTrigger, BatcherMetrics};
 pub use predictor::Predictor;

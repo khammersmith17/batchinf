@@ -1,6 +1,6 @@
 use batchinf::{
-    BatchTrigger, BatcherConfig, BatcherMetrics, Batchinf, BatchinfError, Predictor,
-    PredictorStatus, StartupError, WorkerSnapshot, WorkerStatus, get_batcher,
+    BatchTrigger, BatcherConfig, BatcherConfigBuilder, BatcherMetrics, Batchinf, BatchinfError,
+    Predictor, PredictorStatus, StartupError, WorkerSnapshot, WorkerStatus, get_batcher,
 };
 use std::{
     num::{NonZeroU8, NonZeroU32},
@@ -180,20 +180,26 @@ impl BatcherMetrics for TestMetrics {
     }
 }
 
-fn config(batch_size: u32, timeout_ms: u64, pool_size: u8) -> BatcherConfig {
-    BatcherConfig {
-        batch_size: NonZeroU32::new(batch_size).unwrap(),
-        batch_timeout: Duration::from_millis(timeout_ms),
-        pool_size: NonZeroU8::new(pool_size).unwrap(),
-        // Same as batch_size: one batch of backlog per worker.
-        queue_size: NonZeroU32::new(batch_size).unwrap(),
+/// Builder with the settings most tests share. `queue_size` is left at its default, which is the
+/// same as `batch_size`: one batch of backlog per worker.
+fn config_builder(batch_size: u32, timeout_ms: u64, pool_size: u8) -> BatcherConfigBuilder {
+    let mut builder = BatcherConfig::builder(
+        NonZeroU32::new(batch_size).unwrap(),
+        Duration::from_millis(timeout_ms),
+    );
+    builder
+        .pool_size(NonZeroU8::new(pool_size).unwrap())
         // Short and few, so tests with a failing factory finish quickly.
-        worker_start_retries: 3,
-        worker_start_backoff_start: Duration::from_millis(1),
-        max_worker_retry_wait: Duration::from_millis(100),
+        .worker_start_retries(3)
+        .worker_start_backoff_start(Duration::from_millis(1))
+        .max_worker_retry_wait(Duration::from_millis(100))
         // Generous: only tests that set this themselves expect startup to time out.
-        startup_timeout: Duration::from_secs(5),
-    }
+        .startup_timeout(Duration::from_secs(5));
+    builder
+}
+
+fn config(batch_size: u32, timeout_ms: u64, pool_size: u8) -> BatcherConfig {
+    config_builder(batch_size, timeout_ms, pool_size).build()
 }
 
 fn no_obs() -> Option<Arc<dyn BatcherMetrics>> {
@@ -400,12 +406,12 @@ async fn test_workers_initially_waiting() {
     for WorkerSnapshot {
         worker_status,
         predictor_status,
-        queue_len,
+        batch_len,
     } in batcher.pool_status()
     {
         assert_eq!(worker_status, WorkerStatus::Waiting);
         assert_eq!(predictor_status, PredictorStatus::Alive);
-        assert_eq!(queue_len, 0);
+        assert_eq!(batch_len, 0);
     }
 }
 
@@ -727,10 +733,9 @@ async fn test_metrics_queue_depth_emitted() {
     let queue_size = 64;
     let batcher = get_batcher(
         factory(SlowEchoPredictor),
-        BatcherConfig {
-            queue_size: NonZeroU32::new(queue_size).unwrap(),
-            ..config(2, 5, 1)
-        },
+        config_builder(2, 5, 1)
+            .queue_size(NonZeroU32::new(queue_size).unwrap())
+            .build(),
         with_obs(&metrics),
     )
     .await
@@ -911,12 +916,11 @@ async fn test_dead_worker_is_skipped_by_router() {
                 always_panics: worker_id == 0,
             }
         }),
-        BatcherConfig {
-            // Room for the whole burst on the two healthy workers, so any rejection is a routing
-            // bug rather than backpressure.
-            queue_size: NonZeroU32::new(64).unwrap(),
-            ..config(4, 10, 3)
-        },
+        // Room for the whole burst on the two healthy workers, so any rejection is a routing bug
+        // rather than backpressure.
+        config_builder(4, 10, 3)
+            .queue_size(NonZeroU32::new(64).unwrap())
+            .build(),
         no_obs(),
     )
     .await
@@ -1078,10 +1082,9 @@ async fn test_predict_waits_for_queue_capacity() {
     for batch_size in [1u32, 2] {
         let batcher = get_batcher(
             factory(SlowEchoPredictor),
-            BatcherConfig {
-                queue_size: NonZeroU32::new(1).unwrap(),
-                ..config(batch_size, 5, 1)
-            },
+            config_builder(batch_size, 5, 1)
+                .queue_size(NonZeroU32::new(1).unwrap())
+                .build(),
             no_obs(),
         )
         .await
@@ -1248,11 +1251,10 @@ async fn test_saturation_spreads_load_across_workers() {
             worker_id,
             batches_per_worker: Arc::clone(&counts),
         }),
-        BatcherConfig {
-            // Room for the whole burst, so any rejection would be a routing bug.
-            queue_size: NonZeroU32::new(64).unwrap(),
-            ..config(4, 5, pool_size as u8)
-        },
+        // Room for the whole burst, so any rejection would be a routing bug.
+        config_builder(4, 5, pool_size as u8)
+            .queue_size(NonZeroU32::new(64).unwrap())
+            .build(),
         no_obs(),
     )
     .await
@@ -1280,12 +1282,11 @@ async fn test_saturation_spreads_load_across_workers() {
 
 /// Config for a single worker with the given factory retry settings.
 fn retry_config(retries: u8, backoff_ms: u64, max_wait_ms: u64) -> BatcherConfig {
-    BatcherConfig {
-        worker_start_retries: retries,
-        worker_start_backoff_start: Duration::from_millis(backoff_ms),
-        max_worker_retry_wait: Duration::from_millis(max_wait_ms),
-        ..config(4, 10, 1)
-    }
+    config_builder(4, 10, 1)
+        .worker_start_retries(retries)
+        .worker_start_backoff_start(Duration::from_millis(backoff_ms))
+        .max_worker_retry_wait(Duration::from_millis(max_wait_ms))
+        .build()
 }
 
 /// Factory that panics on every call and counts how often it was called.
@@ -1419,10 +1420,9 @@ async fn test_startup_times_out_with_slow_factory() {
             std::thread::sleep(Duration::from_millis(400));
             EchoPredictor
         }),
-        BatcherConfig {
-            startup_timeout: Duration::from_millis(50),
-            ..config(4, 10, 1)
-        },
+        config_builder(4, 10, 1)
+            .startup_timeout(Duration::from_millis(50))
+            .build(),
         no_obs(),
     )
     .await;
@@ -1486,9 +1486,11 @@ async fn test_rebuild_after_panic_retries_factory() {
                 delay: Duration::ZERO,
             }
         }),
-        BatcherConfig {
-            batch_size: NonZeroU32::new(1).unwrap(),
-            ..retry_config(2, 5, 100)
+        {
+            // The fields are public, so a built config can still be adjusted.
+            let mut config = retry_config(2, 5, 100);
+            config.batch_size = NonZeroU32::new(1).unwrap();
+            config
         },
         no_obs(),
     )
@@ -1653,4 +1655,210 @@ async fn test_cancelled_requests_are_filtered_from_mixed_batch() {
         vec![1, 2, 3],
         "cancelled requests should not reach the predictor"
     );
+}
+
+// `blocking_try_predict` is for callers outside async code. Called from a plain OS thread, it queues
+// the request and blocks that thread until the result arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_blocking_predict_from_plain_thread() {
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 10, 1), no_obs())
+        .await
+        .unwrap();
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let b = batcher.clone();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(b.blocking_try_predict(7));
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(2), done_rx)
+        .await
+        .expect("blocking_try_predict should return once inference completes")
+        .expect("the calling thread should not panic");
+    assert_eq!(result.unwrap(), 7);
+}
+
+// Several plain threads can call `blocking_try_predict` at once, and each gets its own result.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_blocking_predict_from_many_threads() {
+    let batcher = get_batcher(
+        factory(EchoPredictor),
+        // Room for every request, so none is rejected as full.
+        config_builder(4, 10, 2)
+            .queue_size(NonZeroU32::new(64).unwrap())
+            .build(),
+        no_obs(),
+    )
+    .await
+    .unwrap();
+
+    let threads: Vec<_> = (0..16u64)
+        .map(|i| {
+            let b = batcher.clone();
+            std::thread::spawn(move || (i, b.blocking_try_predict(i)))
+        })
+        .collect();
+
+    // Joining blocks, so do it off the async runtime.
+    let results = tokio::task::spawn_blocking(move || {
+        threads
+            .into_iter()
+            .map(|t| t.join().expect("a calling thread panicked"))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap();
+
+    for (input, result) in results {
+        assert_eq!(result.unwrap(), input);
+    }
+}
+
+// `blocking_try_predict` fails fast like `try_predict`: while the only worker is rebuilding, it
+// returns QueueFullError immediately instead of blocking until the rebuild finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_blocking_predict_fails_fast_when_no_room() {
+    let batcher = get_batcher(
+        slow_rebuild_factory(Duration::from_millis(500), Duration::ZERO),
+        config(1, 10, 1),
+        no_obs(),
+    )
+    .await
+    .unwrap();
+
+    // Trigger the panic and a 500ms rebuild.
+    let first = batcher.predict(1).await;
+    assert!(
+        matches!(first, Err(BatchinfError::InternalError)),
+        "{first:?}"
+    );
+    assert!(
+        wait_for_predictor_status(
+            &batcher,
+            0,
+            PredictorStatus::Rebuilding,
+            Duration::from_millis(200)
+        )
+        .await
+    );
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let b = batcher.clone();
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let result = b.blocking_try_predict(2);
+        let _ = done_tx.send((result, start.elapsed()));
+    });
+
+    let (result, elapsed) = tokio::time::timeout(Duration::from_secs(2), done_rx)
+        .await
+        .expect("blocking_try_predict should not block while there is no room")
+        .expect("the calling thread should not panic");
+    assert!(
+        matches!(result, Err(BatchinfError::QueueFullError)),
+        "expected QueueFullError, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "blocking_try_predict should return without waiting for the rebuild, took {elapsed:?}"
+    );
+}
+
+// The documented contract: calling `blocking_try_predict` from async code panics rather than
+// blocking a runtime thread.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic]
+async fn test_blocking_predict_panics_in_async_context() {
+    let batcher = get_batcher(factory(EchoPredictor), config(4, 10, 1), no_obs())
+        .await
+        .unwrap();
+    let _ = batcher.blocking_try_predict(1);
+}
+
+// The builder takes the two required settings and fills in documented defaults for the rest.
+#[test]
+fn test_config_builder_defaults() {
+    let config =
+        BatcherConfig::builder(NonZeroU32::new(16).unwrap(), Duration::from_millis(25)).build();
+
+    assert_eq!(config.batch_size.get(), 16);
+    assert_eq!(config.batch_timeout, Duration::from_millis(25));
+    assert_eq!(config.pool_size, BatcherConfig::DEFAULT_POOL_SIZE);
+    assert_eq!(config.pool_size.get(), 1);
+    assert_eq!(
+        config.queue_size.get(),
+        16,
+        "queue_size should default to batch_size"
+    );
+    assert_eq!(
+        config.worker_start_retries,
+        BatcherConfig::DEFAULT_WORKER_START_RETRIES
+    );
+    assert_eq!(
+        config.worker_start_backoff_start,
+        BatcherConfig::DEFAULT_WORKER_START_BACKOFF_START
+    );
+    assert_eq!(
+        config.max_worker_retry_wait,
+        BatcherConfig::DEFAULT_MAX_WORKER_RETRY_WAIT
+    );
+    assert_eq!(
+        config.startup_timeout,
+        BatcherConfig::DEFAULT_STARTUP_TIMEOUT
+    );
+}
+
+// Every option can be overridden in one chained expression, and an explicit queue_size is not
+// replaced by the default.
+#[test]
+fn test_config_builder_overrides() {
+    let config = BatcherConfig::builder(NonZeroU32::new(8).unwrap(), Duration::from_millis(5))
+        .pool_size(NonZeroU8::new(4).unwrap())
+        .queue_size(NonZeroU32::new(100).unwrap())
+        .worker_start_retries(0)
+        .worker_start_backoff_start(Duration::from_millis(7))
+        .max_worker_retry_wait(Duration::from_millis(70))
+        .startup_timeout(Duration::from_secs(9))
+        .build();
+
+    assert_eq!(config.batch_size.get(), 8);
+    assert_eq!(config.batch_timeout, Duration::from_millis(5));
+    assert_eq!(config.pool_size.get(), 4);
+    assert_eq!(config.queue_size.get(), 100);
+    assert_eq!(config.worker_start_retries, 0);
+    assert_eq!(config.worker_start_backoff_start, Duration::from_millis(7));
+    assert_eq!(config.max_worker_retry_wait, Duration::from_millis(70));
+    assert_eq!(config.startup_timeout, Duration::from_secs(9));
+}
+
+// The builder's methods do not consume it: it can be configured step by step from a variable,
+// and `build` can be called more than once.
+#[test]
+fn test_config_builder_is_reusable() {
+    let mut builder = BatcherConfig::builder(NonZeroU32::new(8).unwrap(), Duration::from_millis(5));
+    builder.pool_size(NonZeroU8::new(2).unwrap());
+
+    let first = builder.build();
+    assert_eq!(first.pool_size.get(), 2);
+    assert_eq!(first.queue_size.get(), 8);
+
+    // Later changes affect only configs built afterwards.
+    builder.queue_size(NonZeroU32::new(64).unwrap());
+    let second = builder.build();
+    assert_eq!(second.pool_size.get(), 2);
+    assert_eq!(second.queue_size.get(), 64);
+    assert_eq!(first.queue_size.get(), 8);
+}
+
+// A config built with only the required settings is enough to start a working batcher.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_default_built_config_starts_a_batcher() {
+    let config =
+        BatcherConfig::builder(NonZeroU32::new(4).unwrap(), Duration::from_millis(10)).build();
+    let batcher = get_batcher(factory(EchoPredictor), config, no_obs())
+        .await
+        .unwrap();
+
+    assert_eq!(batcher.pool_status().len(), 1);
+    assert_eq!(batcher.predict(5).await.unwrap(), 5);
 }

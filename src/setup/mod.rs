@@ -22,6 +22,30 @@ use tokio::{
     time::sleep,
 };
 
+/// Builds the [`Predictor`] for one worker. Passed to [`get_batcher`].
+///
+/// The argument is the worker's index, in `0..pool_size`, which a factory can use to bind each
+/// worker to its own device (for example `worker_id % n_gpus`). The factory is called on that
+/// worker's dedicated inference thread, so the predictor it returns does not need to be `Send`
+/// or `Clone`. The factory itself is shared by every worker, so it must be `Send + Sync`.
+///
+/// It is called once per worker at startup, and again each time a worker rebuilds its predictor
+/// after [`Predictor::predict_batch`] panics. Load or download model weights once, outside the
+/// factory, and capture them in the closure (for example as an `Arc`) rather than fetching them
+/// on every call.
+///
+/// Signal failure by panicking. A failed call is retried as configured by
+/// [`BatcherConfig::worker_start_retries`].
+///
+/// ```
+/// # use batchinf::PredictorFactory;
+/// # use std::sync::Arc;
+/// # struct MyModel { device: u8 }
+/// let n_gpus = 4;
+/// let factory: PredictorFactory<MyModel> = Arc::new(move |worker_id| MyModel {
+///     device: worker_id % n_gpus,
+/// });
+/// ```
 pub type PredictorFactory<P> = Arc<dyn Fn(u8) -> P + Send + Sync>;
 type WorkerRefPairs<P> = (
     Vec<(InferenceWorker<P>, InputReceiver<P>)>,
@@ -58,7 +82,7 @@ fn init_worker_ref_pairs<P: Predictor + 'static>(
             Arc::clone(&predictor_factory),
             obs,
             i as u8,
-            Arc::clone(&signal),
+            Arc::clone(signal),
         );
         let worker_ref = WorkerRef::new(worker.clone(), tx);
         inf_workers.push((inf_worker, rx));

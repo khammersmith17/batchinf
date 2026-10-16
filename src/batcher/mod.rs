@@ -52,24 +52,51 @@ where
         Self { pool, obs }
     }
 
-    /// Submits an inference request and awaits the result.
+    /// Submits an inference request and awaits the result, failing immediately if no worker has
+    /// room for it.
     ///
-    /// The input is queued and dispatched as part of a batch with other concurrent requests.
-    /// Returns when inference completes or the worker exits.
+    /// The fail-fast counterpart of [`predict`](Batchinf::predict). If every worker's queue is
+    /// full, this returns [`BatchinfError::QueueFullError`] straight away instead of waiting, so
+    /// the caller can shed load, for example by answering with a 503. Otherwise the input is
+    /// queued and dispatched as part of a batch with other concurrent requests, and this returns
+    /// when inference completes or the worker exits.
     ///
     /// # Errors
     ///
+    /// - [`BatchinfError::QueueFullError`] — every available worker's queue is full, or the only
+    ///   workers left are rebuilding their predictor. The request was not queued.
+    /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed.
     /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`](`crate::Predictor`) returned an error.
     /// - [`BatchinfError::InvalidPredictorOutput`] — [`Predictor::predict_batch`](`crate::Predictor`) returned a different number of outputs than inputs.
     /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
-    /// - [`BatchinfError::QueueFullError`] — all worker queues are full; the caller should retry or apply backpressure.
-    /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed.
     pub async fn try_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         self.pool.push((input, tx))?;
         rx.await?
     }
 
+    /// Submits an inference request and awaits the result, waiting for room if every worker's
+    /// queue is full.
+    ///
+    /// The input is queued and dispatched as part of a batch with other concurrent requests.
+    /// If no worker has room, this waits until one does: a queued request is picked up, or a
+    /// worker finishes rebuilding its predictor. That wait is the backpressure, so this never
+    /// returns [`BatchinfError::QueueFullError`]. Waiting callers are not served in any
+    /// particular order. To bound the wait, use
+    /// [`predict_with_timeout`](Batchinf::predict_with_timeout); to fail immediately instead of
+    /// waiting, use [`try_predict`](Batchinf::try_predict).
+    ///
+    /// Dropping the returned future is safe at any point. If it is dropped while waiting for
+    /// room, the request was never queued. If it is dropped after being queued, the request is
+    /// skipped unless its batch has already started.
+    ///
+    /// # Errors
+    ///
+    /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed. Returned
+    ///   immediately, and also to callers already waiting for room when the last worker stops.
+    /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`](`crate::Predictor`) returned an error.
+    /// - [`BatchinfError::InvalidPredictorOutput`] — [`Predictor::predict_batch`](`crate::Predictor`) returned a different number of outputs than inputs.
+    /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
     pub async fn predict(&self, mut input: Input) -> Result<Output, BatchinfError<Error>> {
         let (mut tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         (input, tx) = match self.pool.try_push((input, tx)) {
@@ -96,15 +123,17 @@ where
 
     /// Submits an inference request and blocks the current thread until the result arrives.
     ///
-    /// The blocking counterpart of [`predict`](Batchinf::predict), for callers that are not in
-    /// async code, such as a plain OS thread. Returns the same errors as
-    /// [`predict`](Batchinf::predict).
+    /// The blocking counterpart of [`try_predict`](Batchinf::try_predict), for callers that are
+    /// not in async code, such as a plain OS thread. Like `try_predict`, it does not wait for
+    /// room: if every worker's queue is full it returns [`BatchinfError::QueueFullError`]
+    /// immediately. It returns the same errors as [`try_predict`](Batchinf::try_predict).
     ///
     /// # Panics
     ///
     /// Panics if called from within an asynchronous execution context, such as inside an async
-    /// function running on a Tokio runtime. Use [`predict`](Batchinf::predict) there instead.
-    pub fn blocking_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
+    /// function running on a Tokio runtime. Use [`predict`](Batchinf::predict) or
+    /// [`try_predict`](Batchinf::try_predict) there instead.
+    pub fn blocking_try_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         self.pool.push((input, tx))?;
         rx.blocking_recv()?
@@ -113,9 +142,14 @@ where
     /// Submits an inference request with a caller-side deadline.
     ///
     /// Equivalent to [`predict`](Batchinf::predict) but returns [`BatchinfError::TimeoutError`]
-    /// if `timeout` elapses before the result arrives. The request may still be processed by the
-    /// worker after the timeout — the result is simply discarded. All errors from [`predict`](Batchinf::predict)
-    /// may also be returned if inference fails before the timeout.
+    /// if `timeout` elapses before the result arrives. The deadline covers the whole call: the
+    /// wait for room in a worker's queue, the time spent queued, and inference itself.
+    ///
+    /// A request that times out while waiting for room was never queued. One that times out
+    /// after being queued is skipped if its batch has not started yet; if inference is already
+    /// running, it completes and the result is discarded. All errors from
+    /// [`predict`](Batchinf::predict) may also be returned if the request fails before the
+    /// timeout.
     pub async fn predict_with_timeout(
         &self,
         input: Input,

@@ -2,7 +2,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::oneshot::error::RecvError;
 
-/// Error returned by [`Batchinf::predict`](`crate::Batchinf`) and [`Batchinf::predict_with_timeout`](`crate::Batchinf`).
+/// Error returned by the request methods on [`Batchinf`](`crate::Batchinf`):
+/// [`predict`](`crate::Batchinf::predict`), [`try_predict`](`crate::Batchinf::try_predict`),
+/// [`predict_with_timeout`](`crate::Batchinf::predict_with_timeout`) and
+/// [`blocking_try_predict`](`crate::Batchinf::blocking_try_predict`).
 #[derive(Debug, Error)]
 pub enum BatchinfError<E>
 where
@@ -16,15 +19,23 @@ where
     /// [`Predictor::predict_batch`](`crate::Predictor`).
     #[error("Internal Error")]
     InternalError,
-    /// The request timed out before inference completed. Only returned by
-    /// [`Batchinf::predict_with_timeout`](`crate::Batchinf`). The worker may still process the request; the
-    /// result is discarded.
+    /// The deadline passed before a result arrived. Only returned by
+    /// [`Batchinf::predict_with_timeout`](`crate::Batchinf::predict_with_timeout`). The deadline
+    /// covers waiting for room, queueing and inference. If inference on the request had already
+    /// started it still completes, and the result is discarded.
     #[error("Inference request timed out")]
     TimeoutError,
     /// All workers have exited or crashed and no request could be dispatched.
     #[error("No available workers")]
     NoAvailableWorkersError,
-    /// Every worker's channel is full. The caller should retry or apply backpressure.
+    /// No worker has room for the request right now: every available worker's queue is full, or
+    /// the only workers left are rebuilding their predictor. The request was not queued.
+    ///
+    /// Only returned by the fail-fast methods,
+    /// [`Batchinf::try_predict`](`crate::Batchinf::try_predict`) and
+    /// [`Batchinf::blocking_try_predict`](`crate::Batchinf::blocking_try_predict`). The caller should
+    /// retry later or shed load. [`Batchinf::predict`](`crate::Batchinf::predict`) waits for
+    /// room instead and never returns this.
     #[error("All worker queues are full")]
     QueueFullError,
     /// [`Predictor::predict_batch`](`crate::Predictor`) returned a `Vec` whose length does not

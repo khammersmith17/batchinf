@@ -15,6 +15,9 @@ pub(crate) type FunnelMessage<Input, Output, Error> = (
     tokio::sync::oneshot::Sender<Result<Output, BatchinfError<Error>>>,
 );
 
+pub(crate) type TryPushResult<Input, Output, Error> =
+    Result<(), (FunnelMessage<Input, Output, Error>, BatchinfError<Error>)>;
+
 #[derive(Debug)]
 pub(crate) struct WorkerPool<Input, Output, Error>
 where
@@ -92,7 +95,7 @@ where
     pub(crate) fn try_push(
         &self,
         mut msg: FunnelMessage<Input, Output, Error>,
-    ) -> Result<(), (FunnelMessage<Input, Output, Error>, BatchinfError<Error>)> {
+    ) -> TryPushResult<Input, Output, Error> {
         // If the pool only has a single worker, then it is just dispatched.
         if self.is_single_worker() {
             let handle = &self.pool[0];
