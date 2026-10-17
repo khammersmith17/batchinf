@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use tokio::sync::watch;
 
-/// Held by every inference thread for its whole lifetime. Nothing is ever sent on it: the channel
-/// closes once the last thread drops its clone, which is what [`ShutdownWaiter`] waits for.
+/// Held by every inference thread for its whole lifetime. This serves as a sentinel that
+/// represents when a worker has exited.
 pub(crate) type ShutdownSender = Arc<watch::Sender<()>>;
 
 /// Creates the shared sender handed to each inference thread, and the receiver kept by the
@@ -31,7 +31,7 @@ pub(crate) fn shutdown_channel() -> (ShutdownSender, watch::Receiver<()>) {
 /// # }
 /// ```
 #[derive(Debug, Clone)]
-#[must_use = "a shutdown waiter does nothing unless `wait` is awaited or `is_shutdown` is checked"]
+#[must_use = "Shutdown should be awaited when used."]
 pub struct ShutdownWaiter {
     rx: watch::Receiver<()>,
 }

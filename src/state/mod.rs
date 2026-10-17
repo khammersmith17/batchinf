@@ -9,6 +9,7 @@ use tokio::sync::mpsc::{Sender, error::TrySendError};
 // Mask the state bits to get the batch len.
 const BATCH_LEN_MASK: u64 = !(0b11_u64 << 62);
 
+/// Result type to signal to caller if pushing a work unit on the queue was successful.
 pub(crate) enum QueuePushResult<Input, Output, Error>
 where
     Error: std::error::Error + Send + Sync + 'static,
@@ -23,6 +24,7 @@ mod worker_codes {
     // The 2 most significant bits store the status. Remaining 62 bits store the batch len.
     // [state bits] [remaining 62 bits]
     // These u8 values are never stored.
+
     // 0b00
     pub(super) const WAITING: u8 = 0_u8;
     // 0b01
@@ -71,8 +73,11 @@ impl WorkerStatus {
 }
 
 mod predictor_codes {
+    // Predictor is healthy.
     pub(super) const ALIVE: u8 = 0_u8;
+    // Predictor crashed but is being rebuilt.
     pub(super) const REBUILDING: u8 = 1_u8;
+    // Rebuild of a predictor was unsuccessful, and the predictor no longer services work.
     pub(super) const DEAD: u8 = 2_u8;
 }
 
@@ -133,6 +138,8 @@ struct WorkerStateInner {
     // The other 62 bits store the batch length.
     // Fused into a single atomic given both attributes may need to be updated in a single store.
     worker_state: AtomicU64,
+    // State of the predictor represented as a single byte.
+    // Maps to PredictorStatus codes.
     predictor_state: AtomicU8,
     config: InnerConfig,
 }
@@ -146,27 +153,20 @@ impl WorkerStateInner {
         }
     }
 
+    /// Set the state of a worker.
+    /// Only the accumulator for that worker will ever set the state of the worker,
+    /// so a load then a store is OK here, as nobody else is mutating this value.
+    ///
+    /// If another write is ever added, this needs to be a CAS loop.
     fn set_worker_state(&self, state: WorkerStatus) {
         let state_key: u8 = state.to_u8();
-        let state = u64::from(state_key) << 62;
+        let state_bits = u64::from(state_key) << 62;
 
-        // The 2 MSB need to be cleared here, and then ORed with the state value.
-        // So we need a CAS loop.
-        let mut current = self.worker_state.load(Ordering::Relaxed);
+        // Clear the current state bits, preserving the length bits.
+        let current = self.worker_state.load(Ordering::Acquire);
+        let new_state = (current & BATCH_LEN_MASK) | state_bits;
 
-        // Update the state bits using a CAS loop.
-        loop {
-            let new = (current & BATCH_LEN_MASK) | state;
-            match self.worker_state.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+        self.worker_state.store(new_state, Ordering::Release);
     }
 
     fn get_worker_state(&self) -> WorkerStatus {
@@ -186,6 +186,7 @@ impl WorkerStateInner {
         PredictorStatus::from_u8(state_key)
     }
 
+    /// Get a snapshot of the current workers state.
     fn snapshot(&self) -> WorkerSnapshot {
         let worker_state = self.worker_state.load(Ordering::Acquire);
         let worker_status: WorkerStatus = WorkerStatus::from_u8((worker_state >> 62) as u8);
@@ -203,6 +204,12 @@ impl WorkerStateInner {
         self.worker_state.store(0_u64, Ordering::Release);
     }
 
+    /// Determines if the worker can accept work now.
+    /// The accumulator is waiting for a batch to complete, the predictor is healthy,
+    /// and there is room in the batch.
+    ///
+    /// Room in the batch check is given that an accumulator may be full, but has not singled as
+    /// such yet.
     pub(crate) fn can_accept_primary(&self) -> bool {
         let snapshot = self.snapshot();
         snapshot.worker_status == WorkerStatus::Waiting
@@ -210,6 +217,8 @@ impl WorkerStateInner {
             && snapshot.batch_len < self.config.batch_size
     }
 
+    /// Determine is a worker can accept work soon as a fallback.
+    /// Determined by if both the accumulator and predictor are healthy.
     pub(crate) fn can_accept_secondary(&self) -> bool {
         let snapshot = self.snapshot();
         !matches!(
@@ -218,6 +227,7 @@ impl WorkerStateInner {
         ) && snapshot.predictor_status == PredictorStatus::Alive
     }
 
+    /// Signals is the predictor is currently being rebuilt.
     pub(crate) fn is_rebuilding(&self) -> bool {
         self.snapshot().predictor_status == PredictorStatus::Rebuilding
     }
@@ -236,6 +246,7 @@ impl Clone for WorkerState {
     }
 }
 
+// Delegate to the inner methods.
 impl WorkerState {
     pub(crate) fn new(config: InnerConfig) -> WorkerState {
         let inner = Arc::new(WorkerStateInner::new(config));
@@ -343,6 +354,9 @@ where
         self.state.snapshot()
     }
 
+    /// Attmept to push worker onto a workers queue.
+    ///
+    /// If the work cannot be forward, the work unit is handed back to the caller.
     pub(crate) fn push(
         &self,
         msg: FunnelMessage<Input, Output, Error>,

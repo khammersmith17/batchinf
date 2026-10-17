@@ -120,7 +120,7 @@ where
 
             // Subsequent attempts to resolve worker is thread local walk the worker search space
             // linearly.
-            sink = (sink + 1) % usize::from(self.pool_size());
+            sink = (sink + 1) % self.pool_size();
         }
 
         let mut has_live_worker = false;
@@ -144,7 +144,7 @@ where
                 has_rebuilding_worker = true;
             }
 
-            sink = (sink + 1) % usize::from(self.pool_size());
+            sink = (sink + 1) % self.pool_size();
         }
 
         // Resolve error to user.
@@ -188,6 +188,6 @@ where
     /// Search space start is round robin among threads.
     #[inline]
     fn get_and_increment(&self) -> usize {
-        self.start.fetch_add(1, Ordering::AcqRel) % usize::from(self.pool_size())
+        self.start.fetch_add(1, Ordering::Relaxed) % self.pool_size()
     }
 }

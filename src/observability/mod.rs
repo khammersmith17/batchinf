@@ -11,6 +11,9 @@ pub enum BatchTrigger {
 /// The implementations defined here are called inline. The implement observability orchestration
 /// called inline should be cheap and should not panic. If a panic occurs here, it will be
 /// unrecoverable, unlike panics in the [Predictor](crate::predictor::Predictor).
+///
+/// All trait methods here default to no-ops, implement the methods you would like observability
+/// around.
 pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger].
     /// This may provide some information that can help tune the batch size and the timeout for a
@@ -21,7 +24,8 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// [`on_batch_complete_ok`](BatcherMetrics::on_batch_complete_ok) and
     /// [`on_batch_complete_err`](BatcherMetrics::on_batch_complete_err) can be smaller, and a
     /// batch whose requests were all cancelled reports no completion at all.
-    fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger);
+    #[allow(unused)]
+    fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger) {}
 
     /// Fires after a batch completes successfully.
     ///
@@ -31,7 +35,8 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// implementation at this batch size. Use it to profile and tune the predictor; measure
     /// per-request latency around [`Batchinf::predict`](`crate::batcher::Batchinf::predict`)
     /// instead.
-    fn on_batch_complete_ok(&self, batch_size: usize, latency: tokio::time::Duration);
+    #[allow(unused)]
+    fn on_batch_complete_ok(&self, batch_size: usize, latency: tokio::time::Duration) {}
 
     /// Fires after a batch completes with an error: either
     /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) returned `Err`,
@@ -41,11 +46,13 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// [`on_batch_complete_ok`](BatcherMetrics::on_batch_complete_ok): time spent inside
     /// `predict_batch` only. Slow failures, such as device timeouts or out-of-memory errors at
     /// large batch sizes, show up here.
-    fn on_batch_complete_err(&self, batch_size: usize, latency: tokio::time::Duration);
+    #[allow(unused)]
+    fn on_batch_complete_err(&self, batch_size: usize, latency: tokio::time::Duration) {}
 
     /// Fires when an inference request queued through
     /// [`Batchinf::predict_with_timeout`](`crate::batcher::Batchinf::predict_with_timeout`) times out.
-    fn on_request_timeout(&self);
+    #[allow(unused)]
+    fn on_request_timeout(&self) {}
 
     /// Reports the number of requests waiting in one worker's queue, not yet pulled into a batch.
     ///
@@ -54,12 +61,13 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// inference thread was busy or rebuilding. Nothing is emitted while a worker is idle, so
     /// treat this as a gauge that keeps its last value. Aggregate across workers as needed: the
     /// maximum shows whether any single worker is backed up, the sum shows total backlog.
-    fn on_queue_depth(&self, worker_id: u8, queue_depth: usize);
+    #[allow(unused)]
+    fn on_queue_depth(&self, worker_id: u8, queue_depth: usize) {}
 
     /// Fires on the worker's inference thread when
     /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) panics, before
     /// the predictor is rebuilt from the factory.
-    fn on_worker_panic(&self);
+    fn on_worker_panic(&self) {}
 }
 
 pub(crate) mod emitters {

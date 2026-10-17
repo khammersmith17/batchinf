@@ -6,7 +6,8 @@ use crate::{
 };
 use std::sync::Arc;
 
-/// Send the output back out through the oneshot senders.
+/// Send the output back out to user code through the oneshot sender.
+/// Delegates to sending errors when batch in unusccessful.
 pub(super) fn send_output<P: Predictor>(
     output: InferenceResult<P>,
     senders: Vec<OutputSender<P>>,

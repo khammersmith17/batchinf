@@ -5,7 +5,7 @@ use crate::{
     error::StartupError,
     observability,
     pool::{FunnelMessage, WorkerPool},
-    predictor::Predictor,
+    predictor::{Predictor, PredictorFactory},
     shutdown::shutdown_channel,
     state::{WorkerRef, WorkerState},
     worker::{InferenceWorker, InputReceiver, PredictorStartConfig, RunnerHandoff, run_worker},
@@ -23,35 +23,6 @@ use tokio::{
     time::sleep,
 };
 
-/// Builds the [`Predictor`] for one worker. Passed to [`get_batcher`].
-///
-/// The argument is the worker's index, in `0..pool_size`, which a factory can use to bind each
-/// worker to its own device (for example `worker_id % n_gpus`). The factory is called on that
-/// worker's dedicated inference thread, so the predictor it returns does not need to be `Send`
-/// or `Clone`. The factory itself is shared by every worker, so it must be `Send + Sync`.
-///
-/// It is called once per worker at startup, and again each time a worker rebuilds its predictor
-/// after [`Predictor::predict_batch`] panics. Load or download model weights once, outside the
-/// factory, and capture them in the closure (for example as an `Arc`) rather than fetching them
-/// on every call.
-///
-/// Signal failure by returning `Err`. A panic is also treated as a failure. A failed call is
-/// retried as configured by [`BatcherConfig::worker_start_retries`]. If every attempt fails at
-/// startup, the error from the last attempt is returned by [`get_batcher`] as
-/// [`StartupError::WorkerStartFailure`]. Errors from a rebuild after a panic have no caller to
-/// return to, so they are discarded.
-///
-/// ```
-/// # use batchinf::PredictorFactory;
-/// # use std::sync::Arc;
-/// # struct MyModel { device: u8 }
-/// # #[derive(Debug)] struct LoadError;
-/// let n_gpus = 4;
-/// let factory: PredictorFactory<MyModel, LoadError> = Arc::new(move |worker_id| {
-///     Ok(MyModel { device: worker_id % n_gpus })
-/// });
-/// ```
-pub type PredictorFactory<P, E> = Arc<dyn Fn(u8) -> Result<P, E> + Send + Sync>;
 type WorkerRefPairs<P> = (
     Vec<(InferenceWorker, InputReceiver<P>)>,
     Vec<WorkerRef<<P as Predictor>::Input, <P as Predictor>::Output, <P as Predictor>::Error>>,
@@ -147,8 +118,8 @@ async fn collect_acks<E>(
 ///   function returns an error. If it keeps failing during a later rebuild, that worker is
 ///   marked [`PredictorStatus::Dead`](`crate::PredictorStatus::Dead`), the router skips it, and
 ///   the failure is visible in [`Batchinf::pool_status`](`crate::Batchinf::pool_status`).
-/// - `config`: Batching and pool configuration. See [`BatcherConfig`].
-/// - `observability`: Optional metrics hook. Pass `None` to disable. See [`observability::BatcherMetrics`].
+/// - `config`: Batching and pool configuration, including the optional metrics hook
+///   ([`BatcherConfig::metrics`]). See [`BatcherConfig`].
 ///
 /// # Errors
 ///
@@ -166,7 +137,6 @@ async fn collect_acks<E>(
 pub async fn get_batcher<P: Predictor + 'static, E: Send + 'static>(
     predictor_factory: PredictorFactory<P, E>,
     config: BatcherConfig,
-    observability: Option<Arc<dyn observability::BatcherMetrics>>,
 ) -> Result<Batchinf<P::Input, P::Output, P::Error>, StartupError<E>> {
     // Assert that input and output are not ZST at compile time. This will break in the accumulator and predictor
     // threads.
@@ -179,6 +149,7 @@ pub async fn get_batcher<P: Predictor + 'static, E: Send + 'static>(
     let start_ts = Instant::now();
     let pool_size = config.pool_size.get();
     let channel_size = config.queue_size.get();
+    let observability = config.metrics.clone();
 
     let conf: InnerConfig = config.clone().into();
 

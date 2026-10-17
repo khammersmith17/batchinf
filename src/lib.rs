@@ -73,12 +73,11 @@
 //!     let batcher = get_batcher(
 //!         // Called on each worker's inference thread to build that worker's predictor.
 //!         Arc::new(|_worker_id| Ok::<_, ModelError>(EchoModel)),
-//!         // Batches of up to 32 requests; a partial batch fires after 10ms. Every other option
-//!         // has a default, see `BatcherConfig::builder`.
+//!         // Batches of up to 32 requests; a partial batch fires after 10ms. Every other option,
+//!         // including the metrics hook, has a default, see `BatcherConfig::builder`.
 //!         BatcherConfig::builder(NonZeroU32::new(32).unwrap(), Duration::from_millis(10))
 //!             .pool_size(NonZeroU8::new(1).unwrap())
 //!             .build(),
-//!         None,
 //!     )
 //!     .await
 //!     .expect("workers failed to start");
@@ -105,7 +104,7 @@ pub use batcher::Batchinf;
 pub use config::{BatcherConfig, BatcherConfigBuilder};
 pub use error::{BatchinfError, StartupError};
 pub use observability::{BatchTrigger, BatcherMetrics};
-pub use predictor::Predictor;
-pub use setup::{PredictorFactory, get_batcher};
+pub use predictor::{Predictor, PredictorFactory};
+pub use setup::get_batcher;
 pub use shutdown::ShutdownWaiter;
 pub use state::{PredictorStatus, WorkerSnapshot, WorkerStatus};

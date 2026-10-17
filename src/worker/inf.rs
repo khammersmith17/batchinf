@@ -1,9 +1,8 @@
-use super::{StartAckSender, WorkerBuffer, dispatch};
+use super::{StartAckSender, buffer::WorkerBuffer, dispatch};
 use crate::{
     error::StartupError,
     observability::{BatcherMetrics, InfBatchMetrics, emitters},
-    predictor::Predictor,
-    setup::PredictorFactory,
+    predictor::{Predictor, PredictorFactory},
     shutdown::ShutdownSender,
     state::{PredictorStatus, WorkerState},
 };
@@ -147,7 +146,8 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
         total_attempts,
         backoff,
         max_wait,
-        move || tx_ref.is_closed(),
+        move || tx_ref.is_closed(), // If the startup ack sender is closed, either another worker
+                                    // failed, or the user's code did not await the startup, so we stop
     ) {
         Ok(predictor) => predictor,
         Err(failure) => {

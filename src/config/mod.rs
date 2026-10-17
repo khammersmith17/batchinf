@@ -1,5 +1,7 @@
+use crate::observability::BatcherMetrics;
 use std::{
     num::{NonZeroU8, NonZeroU32},
+    sync::Arc,
     time::Duration,
 };
 
@@ -54,7 +56,8 @@ pub struct BatcherConfig {
     pub queue_size: NonZeroU32,
     /// Number of times a worker retries the predictor factory after a failed call, so the
     /// factory is called at most `worker_start_retries + 1` times. `0` means a single attempt.
-    /// A factory call fails when it panics. Applies both at startup and when rebuilding the
+    /// A factory call fails when it returns `Err` or panics. Applies both at startup and when
+    /// rebuilding the
     /// predictor after [`Predictor::predict_batch`](`crate::Predictor::predict_batch`) panics.
     pub worker_start_retries: u8,
     /// Time a worker waits after the first failed factory call before retrying. The wait
@@ -71,6 +74,9 @@ pub struct BatcherConfig {
     /// `worker_start_retries + 1`, plus the waits in between. Otherwise a slow start that would
     /// have succeeded is cut off.
     pub startup_timeout: Duration,
+    /// Optional metrics hook, called as batches fire and complete. `None` disables metrics. See
+    /// [`BatcherMetrics`] for what is reported and the rules an implementation must follow.
+    pub metrics: Option<Arc<dyn BatcherMetrics>>,
 }
 
 impl BatcherConfig {
@@ -98,6 +104,7 @@ impl BatcherConfig {
     /// | [`worker_start_backoff_start`](BatcherConfigBuilder::worker_start_backoff_start) | 100 ms |
     /// | [`max_worker_retry_wait`](BatcherConfigBuilder::max_worker_retry_wait) | 5 s |
     /// | [`startup_timeout`](BatcherConfigBuilder::startup_timeout) | 60 s |
+    /// | [`metrics`](BatcherConfigBuilder::metrics) | none, metrics disabled |
     pub fn builder(batch_size: NonZeroU32, batch_timeout: Duration) -> BatcherConfigBuilder {
         BatcherConfigBuilder {
             batch_size,
@@ -108,6 +115,7 @@ impl BatcherConfig {
             worker_start_backoff_start: Self::DEFAULT_WORKER_START_BACKOFF_START,
             max_worker_retry_wait: Self::DEFAULT_MAX_WORKER_RETRY_WAIT,
             startup_timeout: Self::DEFAULT_STARTUP_TIMEOUT,
+            metrics: None,
         }
     }
 }
@@ -143,6 +151,7 @@ pub struct BatcherConfigBuilder {
     worker_start_backoff_start: Duration,
     max_worker_retry_wait: Duration,
     startup_timeout: Duration,
+    metrics: Option<Arc<dyn BatcherMetrics>>,
 }
 
 impl BatcherConfigBuilder {
@@ -188,6 +197,16 @@ impl BatcherConfigBuilder {
         self
     }
 
+    /// Sets the metrics hook. See [`BatcherConfig::metrics`].
+    ///
+    /// Takes an `Arc` of any [`BatcherMetrics`] implementation, for example
+    /// `.metrics(Arc::new(MyMetrics::default()))`. Keep a clone of the `Arc` to read the metrics
+    /// back. If this is not called, no metrics are reported.
+    pub fn metrics(&mut self, metrics: Arc<dyn BatcherMetrics>) -> &mut Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Builds the config from the current settings. The builder is left unchanged, so it can
     /// be adjusted and used again.
     pub fn build(&self) -> BatcherConfig {
@@ -200,6 +219,7 @@ impl BatcherConfigBuilder {
             worker_start_backoff_start: self.worker_start_backoff_start,
             max_worker_retry_wait: self.max_worker_retry_wait,
             startup_timeout: self.startup_timeout,
+            metrics: self.metrics.clone(),
         }
     }
 }

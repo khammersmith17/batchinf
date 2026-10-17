@@ -1,3 +1,37 @@
+use std::sync::Arc;
+
+/// Builds the [`Predictor`] for one worker. Passed to [`get_batcher`](`crate::get_batcher`).
+///
+/// The argument is the worker's index, in `0..pool_size`, which a factory can use to bind each
+/// worker to its own device (for example `worker_id % n_gpus`). The factory is called on that
+/// worker's dedicated inference thread, so the predictor it returns does not need to be `Send`
+/// or `Clone`. The factory itself is shared by every worker, so it must be `Send + Sync`.
+///
+/// It is called once per worker at startup, and again each time a worker rebuilds its predictor
+/// after [`Predictor::predict_batch`] panics. Load or download model weights once, outside the
+/// factory, and capture them in the closure (for example as an `Arc`) rather than fetching them
+/// on every call.
+///
+/// Signal failure by returning `Err`. A panic is also treated as a failure. A failed call is
+/// retried as configured by
+/// [`BatcherConfig::worker_start_retries`](`crate::BatcherConfig::worker_start_retries`). If
+/// every attempt fails at startup, the error from the last attempt is returned by
+/// [`get_batcher`](`crate::get_batcher`) as
+/// [`StartupError::WorkerStartFailure`](`crate::StartupError::WorkerStartFailure`). Errors from a
+/// rebuild after a panic have no caller to return to, so they are discarded.
+///
+/// ```
+/// # use batchinf::PredictorFactory;
+/// # use std::sync::Arc;
+/// # struct MyModel { device: u8 }
+/// # #[derive(Debug)] struct LoadError;
+/// let n_gpus = 4;
+/// let factory: PredictorFactory<MyModel, LoadError> = Arc::new(move |worker_id| {
+///     Ok(MyModel { device: worker_id % n_gpus })
+/// });
+/// ```
+pub type PredictorFactory<P, E> = Arc<dyn Fn(u8) -> Result<P, E> + Send + Sync>;
+
 /// Each worker builds its own predictor on its dedicated inference thread, via the factory passed
 /// to [`get_batcher`](`crate::get_batcher`). The predictor is created, used and dropped on that
 /// thread, so it does not need to be `Clone`, `Send` or `Sync`.

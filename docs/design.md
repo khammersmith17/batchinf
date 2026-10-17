@@ -201,7 +201,7 @@ pub trait BatcherMetrics: Debug + Send + Sync + 'static {
 }
 ```
 
-Passed as `Option<Arc<dyn BatcherMetrics>>`. `Option<Arc<T>>` uses the null pointer optimisation — `None` is a null pointer, so the presence check in the emit methods is a single null pointer comparison. The only overhead when `Some is virtual dispatch through the fat pointer.
+Set with `BatcherConfigBuilder::metrics` and stored as `Option<Arc<dyn BatcherMetrics>>` in `BatcherConfig::metrics`. `Option<Arc<T>>` uses the null pointer optimisation — `None` is a null pointer, so the presence check in the emit methods is a single null pointer comparison. The only overhead when `Some is virtual dispatch through the fat pointer.
 
 ## Out of scope
 

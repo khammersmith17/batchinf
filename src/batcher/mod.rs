@@ -14,12 +14,61 @@ use tokio::{
 /// [`Batchinf`] is cheap to clone — all clones share the same underlying worker pool via [`Arc`].
 /// Each clone can independently submit requests and query worker status.
 ///
+/// # Shutdown
+///
 /// Dropping all `Batchinf` clones triggers graceful shutdown: the pool stops accepting new
 /// requests, each worker's inference thread finishes the batch it is running and any batch
 /// already handed to it, then drops its predictor and exits. Requests still being accumulated
 /// are dropped; no caller can be waiting on them, since every waiting request holds a handle.
 /// Shutdown runs in the background. To wait for it to complete, use
 /// [`shutdown_waiter`](Batchinf::shutdown_waiter).
+///
+/// Shutdown starts only when the *last* handle is dropped. A clone held elsewhere, such as in a
+/// spawned task or in a web framework's state, keeps every worker running:
+///
+/// ```
+/// # use batchinf::{BatcherConfig, Predictor, get_batcher};
+/// # use std::{num::NonZeroU32, sync::Arc, time::Duration};
+/// # #[derive(Debug)]
+/// # struct ModelError;
+/// # impl std::fmt::Display for ModelError {
+/// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "model error") }
+/// # }
+/// # impl std::error::Error for ModelError {}
+/// # struct Doubler;
+/// # impl Predictor for Doubler {
+/// #     type Input = u32;
+/// #     type Output = u32;
+/// #     type Error = ModelError;
+/// #     fn predict_batch(&mut self, inputs: &[u32]) -> Result<Vec<u32>, ModelError> {
+/// #         Ok(inputs.iter().map(|x| x * 2).collect())
+/// #     }
+/// # }
+/// # #[tokio::main(flavor = "multi_thread")]
+/// # async fn main() {
+/// let batcher = get_batcher(
+///     Arc::new(|_worker_id| Ok::<_, ModelError>(Doubler)),
+///     BatcherConfig::builder(NonZeroU32::new(8).unwrap(), Duration::from_millis(5)).build(),
+/// )
+/// .await
+/// .unwrap();
+///
+/// // Get the waiter first: once every handle is gone there is nothing left to ask.
+/// let waiter = batcher.shutdown_waiter();
+///
+/// // A spawned task owns a clone of the handle.
+/// let handle = batcher.clone();
+/// let task = tokio::spawn(async move { handle.predict(21).await });
+///
+/// // Dropping this handle does not shut anything down: the task's clone is still alive.
+/// drop(batcher);
+/// assert_eq!(task.await.unwrap().unwrap(), 42);
+///
+/// // The task has finished and dropped its clone, the last handle. Shutdown is now under way,
+/// // and the waiter resolves once every predictor has been dropped.
+/// waiter.wait().await;
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Batchinf<Input, Output, Error>
 where
@@ -192,11 +241,11 @@ where
         }
     }
 
-    /// Returns a [`ShutdownWaiter`] that resolves once this batcher has fully shut down: every
-    /// handle has been dropped, and every worker's inference thread has exited and dropped its
-    /// predictor.
+    /// Returns a [`ShutdownWaiter`] that resolves once this batcher has fully shut down.
+    /// Workers exit when all associated [Batchinf] handles are dropped.
     ///
-    /// The waiter does not keep the batcher alive. Get it before dropping the last handle.
+    /// Thus, the waiter does not keep the batcher alive and depends on all instances being droped.
+    /// Get it before dropping the last handle.
     pub fn shutdown_waiter(&self) -> ShutdownWaiter {
         ShutdownWaiter::new(self.inner.shutdown_rx.clone())
     }

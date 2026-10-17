@@ -63,7 +63,7 @@ impl Predictor for ClipPredictor {
     type Error = EmbedError;
 
     // Example implementation of Predictor.
-    fn predict_batch(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn predict_batch(&mut self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let batch = inputs.len();
         let flat: Vec<f32> = inputs.iter().flat_map(|v| v.iter().copied()).collect();
         let pixel_values =
@@ -127,21 +127,25 @@ async fn main() -> Result<()> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device)? };
     let model = ClipModel::new(vb, &config)?;
 
-    let predictor = ClipPredictor {
-        model: Arc::new(model),
-        device,
-    };
+    // Weights are loaded once, above. The factory runs on each worker's inference thread and only
+    // hands that worker a handle to the shared model, so building a predictor is cheap.
+    let model = Arc::new(model);
+    let factory = Arc::new(move |_worker_id: u8| {
+        Ok::<_, EmbedError>(ClipPredictor {
+            model: Arc::clone(&model),
+            device: device.clone(),
+        })
+    });
 
-    // Configure batcher before service start up.
+    // Configure batcher before service start up. Waits until every worker has built its
+    // predictor, and fails if one cannot.
     let batcher = get_batcher(
-        predictor,
-        BatcherConfig {
-            batch_size: NonZeroU32::new(32).unwrap(),
-            batch_timeout: Duration::from_millis(10),
-            pool_size: NonZeroU8::new(1).unwrap(),
-        },
-        None,
-    );
+        factory,
+        BatcherConfig::builder(NonZeroU32::new(32).unwrap(), Duration::from_millis(10))
+            .pool_size(NonZeroU8::new(1).unwrap())
+            .build(),
+    )
+    .await?;
 
     let app = Router::new()
         .route("/embed", post(embed))

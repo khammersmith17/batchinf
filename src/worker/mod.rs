@@ -1,8 +1,7 @@
 use crate::{
     error::{BatchinfError, StartupError},
     observability::{BatchTrigger, BatcherMetrics, emitters},
-    predictor::Predictor,
-    setup::PredictorFactory,
+    predictor::{Predictor, PredictorFactory},
     shutdown::ShutdownSender,
     state::{WorkerState, WorkerStatus},
 };
@@ -14,11 +13,13 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
         oneshot::Sender as OneshotSender,
     },
-    time::{Duration, Instant, sleep},
+    time::{Duration, Instant, sleep_until},
 };
 
+mod buffer;
 mod dispatch;
 mod inf;
+use buffer::WorkerBuffer;
 use inf::{InferenceRunnerArgs, spawn_inference_runner};
 
 pub(crate) type OutputSender<P> =
@@ -74,88 +75,6 @@ impl InferenceWorker {
 
     fn notify_one(&self) {
         self.signal.notify_one()
-    }
-}
-
-/// Buffer for inference input and the senders.
-///
-/// Inference requests and sender to hand back are element wise pairs.
-pub(crate) struct WorkerBuffer<P: Predictor> {
-    sender_buffer: Vec<OutputSender<P>>,
-    input_buffer: Vec<P::Input>,
-}
-
-impl<P: Predictor> WorkerBuffer<P> {
-    fn new(cap: usize) -> WorkerBuffer<P> {
-        WorkerBuffer {
-            sender_buffer: Vec::with_capacity(cap),
-            input_buffer: Vec::with_capacity(cap),
-        }
-    }
-
-    #[inline]
-    fn swap_replace(&mut self) -> WorkerBuffer<P> {
-        let cap = self.cap();
-        std::mem::replace(self, WorkerBuffer::new(cap))
-    }
-
-    // Filter out the requests that have been canceled in place.
-    // A request may be canceled when using the timeout api or a dropped predict future.
-    #[inline]
-    pub(crate) fn filter_canceled(&mut self) {
-        // Single pass and swap remove.
-        let mut i = 0_usize;
-        while i < self.len() {
-            if self.sender_buffer[i].is_closed() {
-                self.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    // Swap remove both items in each pair.
-    #[inline]
-    fn swap_remove(&mut self, idx: usize) {
-        self.input_buffer.swap_remove(idx);
-        self.sender_buffer.swap_remove(idx);
-    }
-
-    fn push(&mut self, request: P::Input, sender: OutputSender<P>) {
-        self.sender_buffer.push(sender);
-        self.input_buffer.push(request);
-    }
-
-    // Returns the number of items in the buffer.
-    fn len(&self) -> usize {
-        debug_assert_eq!(self.input_buffer.len(), self.sender_buffer.len());
-        self.input_buffer.len()
-    }
-
-    // Returns the number of items in the buffer.
-    #[inline]
-    fn cap(&self) -> usize {
-        debug_assert_eq!(self.input_buffer.capacity(), self.sender_buffer.capacity());
-        self.input_buffer.capacity()
-    }
-
-    // Returns true if the buffer is empty.
-    fn is_empty(&self) -> bool {
-        debug_assert_eq!(self.input_buffer.len(), self.sender_buffer.len());
-        self.input_buffer.is_empty()
-    }
-
-    // Provides a reference to the input buffer.
-    fn input(&self) -> &[P::Input] {
-        &self.input_buffer
-    }
-
-    // Takes the held senders
-    fn take_senders(&mut self) -> Vec<OutputSender<P>> {
-        // drop the input buffer.
-        let _ = std::mem::take(&mut self.input_buffer);
-        // hand back the sender buffer.
-        std::mem::take(&mut self.sender_buffer)
     }
 }
 
@@ -292,7 +211,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
     }
 
     loop {
-        let timeout = time_until_timeout(next_inf);
+        // Evaluate the winner between an inference request being queued and the batch timeout.
         select! {
             user_input = receiver.recv() => {
                 if let Some((request, sender)) = user_input {
@@ -313,7 +232,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
                 };
 
             }
-            _ = sleep(timeout) => {
+            _ = sleep_until(*next_inf) => {
                     // Do not overwrite state to running when state has been set to Exit.
                     // Inference happens in an Exit state.
                     //
@@ -344,14 +263,6 @@ async fn run_inference<P: Predictor>(
     if res.is_ok() { Ok(()) } else { Err(()) }
 }
 
-/// On each wait for a message from the channel, compute the remaining timeout.
-fn time_until_timeout(ts: &Instant) -> Duration {
-    let now = Instant::now();
-
-    // Calculates the difference or returns Duration::ZERO if 'now' has passed 'deadline'
-    ts.saturating_duration_since(now)
-}
-
 /// Entry point to worker lifecycle.
 pub(crate) fn run_worker<P: Predictor + 'static, E: Send + 'static>(
     worker: InferenceWorker,
@@ -359,140 +270,4 @@ pub(crate) fn run_worker<P: Predictor + 'static, E: Send + 'static>(
     handoff: RunnerHandoff<P, E>,
 ) {
     tokio::task::spawn(async move { worker_loop(worker, receiver, handoff).await });
-}
-
-#[cfg(test)]
-mod test_worker_buffer {
-    use super::WorkerBuffer;
-    use crate::predictor::Predictor;
-
-    #[derive(Debug)]
-    struct DummyError;
-
-    impl std::fmt::Display for DummyError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "Error")
-        }
-    }
-
-    impl std::error::Error for DummyError {}
-
-    struct Dummy;
-
-    impl Predictor for Dummy {
-        type Input = usize;
-        type Output = usize;
-        type Error = DummyError;
-
-        fn predict_batch(
-            &mut self,
-            input: &[Self::Input],
-        ) -> Result<Vec<Self::Output>, Self::Error> {
-            Ok((0..input.len()).collect())
-        }
-    }
-
-    #[test]
-    fn test_filter_event_count() {
-        let size = 24_usize;
-        // only even idxs
-        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
-
-        let mut recv_vec = Vec::new();
-
-        for i in 0..size {
-            let (tx, rx) = tokio::sync::oneshot::channel::<
-                Result<usize, crate::error::BatchinfError<DummyError>>,
-            >();
-            buffer.push(i, tx);
-            if i % 2 == 0 {
-                recv_vec.push(rx)
-            }
-        }
-        buffer.filter_canceled();
-
-        let WorkerBuffer {
-            mut input_buffer, ..
-        } = buffer;
-        let base: Vec<usize> = (0..size).filter(|v| v % 2 == 0).collect();
-        input_buffer.sort();
-        assert_eq!(base, input_buffer);
-    }
-
-    #[test]
-    fn test_filter_odd_count() {
-        let size = 25_usize;
-        // only even idxs
-        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
-
-        let mut recv_vec = Vec::new();
-
-        for i in 0..size {
-            let (tx, rx) = tokio::sync::oneshot::channel::<
-                Result<usize, crate::error::BatchinfError<DummyError>>,
-            >();
-            buffer.push(i, tx);
-            if i % 2 == 1 {
-                recv_vec.push(rx)
-            }
-        }
-        buffer.filter_canceled();
-
-        let WorkerBuffer {
-            mut input_buffer, ..
-        } = buffer;
-        let base: Vec<usize> = (0..size).filter(|v| v % 2 == 1).collect();
-        input_buffer.sort();
-        assert_eq!(base, input_buffer);
-    }
-
-    #[test]
-    fn test_filter_uneven() {
-        let size = 50_usize;
-        // only even idxs
-        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
-
-        let mut recv_vec = Vec::new();
-
-        for i in 0..size {
-            let (tx, rx) = tokio::sync::oneshot::channel::<
-                Result<usize, crate::error::BatchinfError<DummyError>>,
-            >();
-            buffer.push(i, tx);
-            if i % 3 == 0 {
-                recv_vec.push(rx)
-            }
-        }
-        buffer.filter_canceled();
-
-        let WorkerBuffer {
-            mut input_buffer, ..
-        } = buffer;
-        let base: Vec<usize> = (0..size).filter(|v| v % 3 == 0).collect();
-        input_buffer.sort();
-        assert_eq!(base, input_buffer);
-    }
-
-    #[test]
-    fn test_all_canceled() {
-        let size = 50_usize;
-        // only even idxs
-        let mut buffer: WorkerBuffer<Dummy> = WorkerBuffer::new(size);
-
-        for i in 0..size {
-            let (tx, _) = tokio::sync::oneshot::channel::<
-                Result<usize, crate::error::BatchinfError<DummyError>>,
-            >();
-            buffer.push(i, tx);
-        }
-        buffer.filter_canceled();
-
-        let WorkerBuffer {
-            mut input_buffer, ..
-        } = buffer;
-        let base: Vec<usize> = vec![];
-        input_buffer.sort();
-
-        assert_eq!(base, input_buffer);
-    }
 }
