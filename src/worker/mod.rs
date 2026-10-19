@@ -35,8 +35,26 @@ pub(crate) type StartAckSender<E> = Sender<Result<(), StartupError<E>>>;
 const JOB_QUEUE_DEPTH: usize = 1;
 
 // Far out timeout for when a user specifies Duration::MAX as a batch timeout.
-// This is valid, only wanting to perform inference when batch size is satisfied.
+// This is valid design choice, only wanting to perform inference when batch size is satisfied.
 const ONE_YEAR: Duration = Duration::from_secs(24 * 60 * 60 * 365);
+
+struct DropGuard {
+    state: WorkerState,
+    signal: Arc<Notify>,
+}
+
+impl Drop for DropGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Setting the state to crashed, if there is a panic
+            // This should not happen. There should not be anything that can panic here, but to be
+            // safe this guard will make sure no requests get routed.
+            self.state.set_worker_state(WorkerStatus::Crashed);
+            // Notify waiters in the case this is the only worker and messages can no longer be serviced.
+            self.signal.notify_waiters();
+        }
+    }
+}
 
 /// State the accumulator task holds for its whole lifetime.
 pub(crate) struct InferenceWorker {
@@ -151,6 +169,10 @@ async fn worker_loop<P: Predictor + 'static, E: Send + 'static>(
     mut input_receiver: InputReceiver<P>,
     handoff: RunnerHandoff<P, E>,
 ) {
+    let _drop_guard = DropGuard {
+        state: worker.state.clone(),
+        signal: worker.signal.clone(),
+    };
     let cap = worker.state.batch_size() as usize;
     let mut next_inf = Instant::now();
     let mut buffer = WorkerBuffer::new(cap);

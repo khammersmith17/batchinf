@@ -25,7 +25,7 @@ impl<P: Predictor> WorkerBuffer<P> {
     // Filter out the requests that have been canceled in place.
     // A request may be canceled when using the timeout api or a dropped predict future.
     #[inline]
-    pub(crate) fn filter_canceled(&mut self) {
+    pub(super) fn filter_canceled(&mut self) {
         // Single pass and swap remove.
         let mut i = 0_usize;
         while i < self.len() {

@@ -1772,6 +1772,70 @@ async fn test_rebuild_after_panic_retries_factory() {
     assert_eq!(batcher.predict(2).await.unwrap(), 2);
 }
 
+// Dropping the batcher while a rebuild is waiting between factory attempts cuts the wait short:
+// shutdown completes quickly instead of sitting out the backoff, and no further attempts are made.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_cancels_rebuild_backoff() {
+    const BACKOFF: Duration = Duration::from_secs(3);
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&calls);
+    let batcher = get_batcher(
+        Arc::new(move |_worker_id| {
+            // Call 0 builds the first predictor; every rebuild attempt fails.
+            if counter.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(TestError);
+            }
+            Ok(MaybePanicPredictor {
+                always_panics: true,
+            })
+        }),
+        {
+            let mut config =
+                retry_config(3, BACKOFF.as_millis() as u64, BACKOFF.as_millis() as u64);
+            config.batch_size = NonZeroU32::new(1).unwrap();
+            config
+        },
+    )
+    .await
+    .unwrap();
+
+    // Trigger the panic and the rebuild.
+    let first = batcher.predict(1).await;
+    assert!(
+        matches!(first, Err(BatchinfError::InternalError)),
+        "{first:?}"
+    );
+
+    // Wait until the first rebuild attempt has failed: the thread is now in its backoff wait.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while calls.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "build, failed rebuild");
+    assert_eq!(
+        batcher.worker_status(0).unwrap().predictor_status,
+        PredictorStatus::Rebuilding
+    );
+
+    let waiter = batcher.shutdown_waiter();
+    let start = Instant::now();
+    drop(batcher);
+    tokio::time::timeout(BACKOFF, waiter.wait())
+        .await
+        .expect("shutdown should not wait out the rebuild backoff");
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "shutdown should cut the backoff short, took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "no factory attempt should be made after shutdown"
+    );
+}
+
 // Echoes its input and records every batch it was asked to run.
 struct BatchRecordingPredictor {
     batches: Arc<std::sync::Mutex<Vec<Vec<u64>>>>,

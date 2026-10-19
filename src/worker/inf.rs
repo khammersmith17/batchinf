@@ -57,19 +57,42 @@ enum BuildFailure<E> {
     Cancelled,
 }
 
+// Sleep that can be cancelled.
+// Poll the exit condition every 20 ms to determine if the build has been cancelled.
+// If the build has been cancelled, exit.
+fn sleep_with_exit(mut wait: Duration, exit_cond: &impl Fn() -> bool) -> bool {
+    let slice = Duration::from_millis(20);
+
+    while wait > Duration::ZERO {
+        std::thread::sleep(slice.min(wait));
+        if exit_cond() {
+            return false;
+        }
+        let Some(new_wait) = wait.checked_sub(slice) else {
+            return true;
+        };
+        wait = new_wait
+    }
+    true
+}
+
 fn try_make_predictor<P: Predictor, E>(
     f: PredictorFactory<P, E>,
     worker_id: u8,
     wait: Duration,
+    exit_cond: &impl Fn() -> bool,
 ) -> Result<P, BuildFailure<E>> {
-    let failure = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(worker_id)))
-    {
-        Ok(Ok(predictor)) => return Ok(predictor),
-        Ok(Err(e)) => BuildFailure::Error(e),
-        Err(_) => BuildFailure::Panic,
-    };
-    // Last wait is no-op.
-    std::thread::sleep(wait);
+    let mut failure =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(worker_id))) {
+            Ok(Ok(predictor)) => return Ok(predictor),
+            Ok(Err(e)) => BuildFailure::Error(e),
+            Err(_) => BuildFailure::Panic,
+        };
+    let cont = sleep_with_exit(wait, exit_cond);
+
+    if !cont {
+        failure = BuildFailure::Cancelled;
+    }
     Err(failure)
 }
 
@@ -86,7 +109,7 @@ fn spawn_predictor<P: Predictor, E>(
         if exit_cond() {
             return Err(BuildFailure::Cancelled);
         }
-        match try_make_predictor(Arc::clone(&factory), worker_id, wait) {
+        match try_make_predictor(Arc::clone(&factory), worker_id, wait, &exit_cond) {
             Ok(predictor) => return Ok(predictor),
             Err(failure) => last_failure = failure,
         }
