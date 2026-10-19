@@ -34,6 +34,10 @@ pub(crate) type StartAckSender<E> = Sender<Result<(), StartupError<E>>>;
 // accumulator waits on `send`, its request channel fills, and the router moves on to other workers.
 const JOB_QUEUE_DEPTH: usize = 1;
 
+// Far out timeout for when a user specifies Duration::MAX as a batch timeout.
+// This is valid, only wanting to perform inference when batch size is satisfied.
+const ONE_YEAR: Duration = Duration::from_secs(24 * 60 * 60 * 365);
+
 /// State the accumulator task holds for its whole lifetime.
 pub(crate) struct InferenceWorker {
     state: WorkerState,
@@ -59,8 +63,12 @@ impl InferenceWorker {
     }
 
     // Reset the inference timeout clock.
+    // Checked add for the case where user defines [Duration::MAX], which is a valid configuration.
     fn reset_next_inf(&self, ts: &mut Instant) {
-        *ts = Instant::now() + self.state.timeout();
+        let now = Instant::now();
+        *ts = now
+            .checked_add(self.state.timeout())
+            .unwrap_or(now + ONE_YEAR);
     }
 
     fn set_running_and_emit(&self, trigger_type: BatchTrigger, batch_size: usize) {
@@ -210,6 +218,10 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
         return;
     }
 
+    // Set the timer for a batch accumulation timeout.
+    let timer = sleep_until(*next_inf);
+    tokio::pin!(timer);
+
     loop {
         // Evaluate the winner between an inference request being queued and the batch timeout.
         select! {
@@ -232,7 +244,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
                 };
 
             }
-            _ = sleep_until(*next_inf) => {
+            _ = &mut timer  => {
                     // Do not overwrite state to running when state has been set to Exit.
                     // Inference happens in an Exit state.
                     //

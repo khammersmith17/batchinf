@@ -1,9 +1,10 @@
-//! This crate provides a harness for framework agnostic static inference batching. Static
+//! This crate provides a harness for framework agnostic dynamic inference batching. Dynamic
 //! inference batching is useful for increasing utilization of an external device and increasing
 //! throughput of expensive ML inference. Any framework can be used in this harness.
 //!
-//! Static inference batching is the technique of queueing up many requests, and performing
-//! inference across many examples at once, rather than per example. This is useful for stateless
+//! Dynamic inference batching is the technique of queueing up many requests, and performing
+//! inference across many examples at once, rather than per example. A batch runs as soon as it is
+//! full, or once a timeout passes, whichever comes first. This is useful for stateless
 //! inference, things like image models, generating embeddings, etc. This crate does not currently
 //! support continuous batching.
 //!
@@ -33,7 +34,9 @@
 //! clone. This type handles all inference input dispatch and returns the inference result back to
 //! the caller as a `Result<Output, `[`BatchinfError`]`>`.
 //!
-//! To add observability, implement the [`BatcherMetrics`] trait.
+//! To add observability, implement the [`BatcherMetrics`] trait and pass it to
+//! [`BatcherConfigBuilder::metrics`]. Every hook defaults to a no-op, so implement only the ones
+//! you need.
 //!
 //! # Quick Start
 //!

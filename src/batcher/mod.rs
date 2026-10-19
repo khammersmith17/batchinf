@@ -16,10 +16,14 @@ use tokio::{
 ///
 /// # Shutdown
 ///
-/// Dropping all `Batchinf` clones triggers graceful shutdown: the pool stops accepting new
-/// requests, each worker's inference thread finishes the batch it is running and any batch
-/// already handed to it, then drops its predictor and exits. Requests still being accumulated
-/// are dropped; no caller can be waiting on them, since every waiting request holds a handle.
+/// Dropping all `Batchinf` clones triggers graceful shutdown: each worker's inference thread
+/// finishes the batch it is running and any batch already handed to it, then drops its predictor
+/// and exits.
+///
+/// Requests still being accumulated into a batch are dropped without running inference. No
+/// caller can be waiting on them: every caller waiting for a result holds a handle, so while one
+/// is waiting the last handle has not been dropped.
+///
 /// Shutdown runs in the background. To wait for it to complete, use
 /// [`shutdown_waiter`](Batchinf::shutdown_waiter).
 ///
@@ -60,12 +64,12 @@ use tokio::{
 /// let handle = batcher.clone();
 /// let task = tokio::spawn(async move { handle.predict(21).await });
 ///
-/// // Dropping this handle does not shut anything down: the task's clone is still alive.
+/// // Will not shutdown handle is the task is dropped.
 /// drop(batcher);
 /// assert_eq!(task.await.unwrap().unwrap(), 42);
 ///
-/// // The task has finished and dropped its clone, the last handle. Shutdown is now under way,
-/// // and the waiter resolves once every predictor has been dropped.
+/// // The task has finished and dropped its clone, the last handle.
+/// // Shutdown is now under way, and the waiter resolves once every predictor has been dropped.
 /// waiter.wait().await;
 /// # }
 /// ```

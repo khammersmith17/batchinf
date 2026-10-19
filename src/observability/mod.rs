@@ -7,14 +7,24 @@ pub enum BatchTrigger {
     Timeout,
 }
 
-/// This trait provides the contract for emitting observability metrics. Implement the backend.
-/// The implementations defined here are called inline. The implement observability orchestration
-/// called inline should be cheap and should not panic. If a panic occurs here, it will be
-/// unrecoverable, unlike panics in the [Predictor](crate::predictor::Predictor).
+/// Hooks for reporting batcher metrics to any backend. Implement this trait and pass it to
+/// [`BatcherConfigBuilder::metrics`](`crate::BatcherConfigBuilder::metrics`).
 ///
-/// All trait methods here default to no-ops, implement the methods you would like observability
-/// around.
-pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
+/// Every method defaults to a no-op, so implement only the hooks you need.
+///
+/// # Contract
+///
+/// Hooks are called inline: [`on_batch_trigger`](Self::on_batch_trigger) and
+/// [`on_queue_depth`](Self::on_queue_depth) on the worker's batching task (a tokio task),
+/// [`on_request_timeout`](Self::on_request_timeout) on the caller's task, and the others on the
+/// worker's inference thread. Implementations must be cheap and must not block: record into
+/// atomics or a lock-free metrics registry, or forward to a channel, and do expensive work such
+/// as network export elsewhere. A slow hook delays batches and reduces throughput.
+///
+/// Implementations must not panic. Unlike a panic in
+/// [`Predictor::predict_batch`](`crate::Predictor::predict_batch`), which the worker recovers
+/// from, a panic in a hook is not caught and stops the worker.
+pub trait BatcherMetrics: Send + Sync + 'static {
     /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger].
     /// This may provide some information that can help tune the batch size and the timeout for a
     /// batch.
@@ -49,8 +59,10 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     #[allow(unused)]
     fn on_batch_complete_err(&self, batch_size: usize, latency: tokio::time::Duration) {}
 
-    /// Fires when an inference request queued through
-    /// [`Batchinf::predict_with_timeout`](`crate::batcher::Batchinf::predict_with_timeout`) times out.
+    /// Fires when a call to
+    /// [`Batchinf::predict_with_timeout`](`crate::batcher::Batchinf::predict_with_timeout`) times
+    /// out, whether the request was still waiting for room in a worker's queue, was queued, or was
+    /// already running.
     #[allow(unused)]
     fn on_request_timeout(&self) {}
 
@@ -68,6 +80,15 @@ pub trait BatcherMetrics: std::fmt::Debug + Send + Sync + 'static {
     /// [`Predictor::predict_batch`](`crate::predictor::Predictor::predict_batch`) panics, before
     /// the predictor is rebuilt from the factory.
     fn on_worker_panic(&self) {}
+}
+
+// Implementations are not required to be `Debug`, since metrics backends often hold handles that
+// are not. Implementing it on the trait object instead keeps `#[derive(Debug)]` working on every
+// type that holds an `Arc<dyn BatcherMetrics>`, such as `BatcherConfig`.
+impl std::fmt::Debug for dyn BatcherMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("dyn BatcherMetrics")
+    }
 }
 
 pub(crate) mod emitters {

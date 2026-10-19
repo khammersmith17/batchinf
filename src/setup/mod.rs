@@ -30,15 +30,17 @@ type WorkerRefPairs<P> = (
 
 /*
 * Implementation:
-*   User implements the Predictor trait on a model type wrapper.
+*   User implements the Predictor trait on a model type wrapper, and passes a factory that builds
+*   one predictor per worker.
 *
-* The model runs in a dedicated tokio task.
-* Inference inputs are buffered in the task, and inference is performed across all examples that
-* are buffered. Inference occurs at either max buffer size, or timeout.
+* Each worker has two parts:
+* - An accumulator tokio task, which pulls requests from the worker's channel into a batch until
+*   the batch is full or its timeout fires, then hands the batch to the inference thread.
+* - A dedicated OS inference thread, which builds the predictor from the factory, runs
+*   predict_batch on each batch, sends each result back, and rebuilds the predictor after a panic.
 *
-* Data is passed to this background thread through a channel and gets an associated oneshot::Sender.
-* The calling thread enqueues the inference input and the oneshot::Sender, and waits on the
-* oneshot::Receiver.
+* The caller enqueues the input together with a oneshot::Sender on a worker's channel, chosen by
+* the router in `pool`, and waits on the matching oneshot::Receiver.
 * */
 
 fn init_worker_ref_pairs<P: Predictor + 'static>(

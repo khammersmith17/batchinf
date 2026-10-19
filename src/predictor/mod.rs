@@ -2,15 +2,22 @@ use std::sync::Arc;
 
 /// Builds the [`Predictor`] for one worker. Passed to [`get_batcher`](`crate::get_batcher`).
 ///
+/// A factory gives the user more flexibility on how a model is constructed and orchestrated with
+/// a particular device.
+///
 /// The argument is the worker's index, in `0..pool_size`, which a factory can use to bind each
-/// worker to its own device (for example `worker_id % n_gpus`). The factory is called on that
-/// worker's dedicated inference thread, so the predictor it returns does not need to be `Send`
-/// or `Clone`. The factory itself is shared by every worker, so it must be `Send + Sync`.
+/// worker to its own device (for example `worker_id % n_gpus` for pinning device index when
+/// configuring ExecutionProvider in `ort`).
+///
+/// The factory is called on that worker's dedicated inference thread, and the predictor it
+/// returns stays on that thread, so the predictor does not need to be `Send`, `Sync` or `Clone`.
+/// The factory itself is shared by every worker, so it must be `Send + Sync`.
 ///
 /// It is called once per worker at startup, and again each time a worker rebuilds its predictor
-/// after [`Predictor::predict_batch`] panics. Load or download model weights once, outside the
-/// factory, and capture them in the closure (for example as an `Arc`) rather than fetching them
-/// on every call.
+/// after [`Predictor::predict_batch`] panics.
+///
+/// Load or download model weights once, outside the factory, and capture them in the closure
+/// (for example as an `Arc`) rather than fetching them on every call.
 ///
 /// Signal failure by returning `Err`. A panic is also treated as a failure. A failed call is
 /// retried as configured by
@@ -19,7 +26,6 @@ use std::sync::Arc;
 /// [`get_batcher`](`crate::get_batcher`) as
 /// [`StartupError::WorkerStartFailure`](`crate::StartupError::WorkerStartFailure`). Errors from a
 /// rebuild after a panic have no caller to return to, so they are discarded.
-///
 /// ```
 /// # use batchinf::PredictorFactory;
 /// # use std::sync::Arc;
@@ -49,9 +55,8 @@ pub trait Predictor {
 
     /// This is where the magic happens.
     ///
-    /// This method is called on each inference batch and is a required implementation. It will be
-    /// called once per batch. When configured with multiple workers, it will be called once per batch
-    /// local worker.
+    /// This method is called once per batch and is a required implementation. With several
+    /// workers, each worker calls its own predictor for the batches it builds.
     ///
     /// Implement this method to take in a slice of queued inference data, and perform inference on
     /// the batch of examples.
@@ -62,10 +67,11 @@ pub trait Predictor {
     /// It is assumed under this contract that the output and input vectors are element wise pairs;
     /// the order of outputs must match the order of inputs.
     ///
-    /// A panic here fails the current batch: the oneshot senders for all requests in the batch are
-    /// dropped, so callers receive [`crate::error::BatchinfError::InternalError`]. The worker then
-    /// discards this predictor and builds a fresh one from the factory. Requests queued behind the
-    /// panicking batch are not affected. To make panics visible, install a panic hook via
+    /// A panic here fails the current batch: every caller in it receives
+    /// [`BatchinfError::InternalError`](`crate::BatchinfError::InternalError`). The worker then
+    /// drops this predictor and builds a fresh one from the factory. Requests already queued on
+    /// this worker wait for the rebuild and are then served by the new predictor; if the rebuild
+    /// fails, they also receive `InternalError`. To make panics visible, install a panic hook via
     /// [`std::panic::set_hook`] before starting the batcher.
     ///
     /// This recovery relies on unwinding. In a binary built with `panic = "abort"`, a panic here

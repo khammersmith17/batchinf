@@ -210,6 +210,7 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
                     total_attempts,
                     backoff,
                     max_wait,
+                    // Cancel a rebuild if the application is shutting down.
                     || batch_recv.is_closed(),
                 ) else {
                     worker_state.set_dead();

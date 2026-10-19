@@ -303,6 +303,61 @@ async fn test_batch_fires_at_timeout() {
     );
 }
 
+// Regression test: `batch_timeout = Duration::MAX` means "only fire on capacity". Computing the
+// batch deadline used to overflow `Instant + Duration` and panic the worker's accumulator task on
+// the first request, leaving every later request with `NoAvailableWorkersError`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_max_batch_timeout_fires_only_at_capacity() {
+    let predictor = CountingPredictor::new();
+    let batcher = get_batcher(
+        factory(predictor.clone()),
+        BatcherConfig::builder(NonZeroU32::new(2).unwrap(), Duration::MAX).build(),
+    )
+    .await
+    .unwrap();
+
+    // A lone request never fills the batch, and no timer fires it, so the caller's own deadline
+    // is what ends the wait.
+    let lone = batcher
+        .predict_with_timeout(1, Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(lone, Err(BatchinfError::TimeoutError)),
+        "a partial batch must not fire on a timer, got {lone:?}"
+    );
+
+    // The accumulator survived computing the deadline and still holds the (now cancelled)
+    // request.
+    let status = batcher.worker_status(0).unwrap();
+    assert_eq!(status.worker_status, WorkerStatus::Waiting);
+    assert_eq!(status.predictor_status, PredictorStatus::Alive);
+    assert_eq!(status.batch_len, 1);
+
+    // The next request fills the batch, which fires on capacity. The cancelled request is
+    // filtered out before inference.
+    assert_eq!(batcher.predict(2).await.unwrap(), 2);
+
+    // Two concurrent requests fill the next batch together.
+    let handles: Vec<_> = [3u64, 4]
+        .into_iter()
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await.unwrap() })
+        })
+        .collect();
+    let mut results = tokio::time::timeout(Duration::from_secs(2), join(handles))
+        .await
+        .expect("a full batch should fire on capacity");
+    results.sort_unstable();
+    assert_eq!(results, vec![3, 4]);
+
+    assert_eq!(
+        predictor.call_count(),
+        2,
+        "only the two full batches should have reached the predictor"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_error_propagates_to_caller() {
     let batcher = get_batcher(factory(FailPredictor), config(1, 50, 1))
@@ -436,6 +491,38 @@ async fn test_worker_status_out_of_bounds() {
         .await
         .unwrap();
     assert!(batcher.worker_status(2).is_none());
+}
+
+/// Implements only one hook and, like many metrics backends, is not `Debug`.
+struct NoDebugMetrics {
+    batches: Arc<AtomicU32>,
+}
+
+impl BatcherMetrics for NoDebugMetrics {
+    fn on_batch_complete_ok(&self, _batch_size: usize, _latency: Duration) {
+        self.batches.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// A metrics type needs neither `Debug` nor every hook, and a config holding it is still `Debug`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_without_debug_or_all_hooks() {
+    let batches = Arc::new(AtomicU32::new(0));
+    let config = config_builder(1, 50, 1)
+        .metrics(Arc::new(NoDebugMetrics {
+            batches: Arc::clone(&batches),
+        }))
+        .build();
+    assert!(
+        format!("{config:?}").contains("metrics: Some(dyn BatcherMetrics)"),
+        "unexpected Debug output: {config:?}"
+    );
+
+    let batcher = get_batcher(factory(EchoPredictor), config).await.unwrap();
+    assert_eq!(batcher.predict(7).await.unwrap(), 7);
+    assert_eq!(batches.load(Ordering::SeqCst), 1);
+    // `Batchinf` holds the hook too and stays `Debug`.
+    let _ = format!("{batcher:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
