@@ -63,9 +63,10 @@ impl Predictor for ClipPredictor {
     type Error = EmbedError;
 
     // Example implementation of Predictor.
-    fn predict_batch(&mut self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, EmbedError> {
+    fn predict_batch(&mut self, inputs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, EmbedError> {
         let batch = inputs.len();
-        let flat: Vec<f32> = inputs.iter().flat_map(|v| v.iter().copied()).collect();
+        // The inputs are owned, so they are consumed while flattening into the tensor data.
+        let flat: Vec<f32> = inputs.into_iter().flatten().collect();
         let pixel_values =
             Tensor::from_vec(flat, (batch, 3, IMAGE_SIZE, IMAGE_SIZE), &self.device)?;
         let embeddings = self.model.get_image_features(&pixel_values)?;

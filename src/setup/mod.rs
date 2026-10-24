@@ -106,8 +106,8 @@ async fn collect_acks<E>(
 /// # Threads
 ///
 /// Each worker runs batch accumulation as a `tokio` task and inference on its own dedicated OS
-/// thread, named `batchinf-worker-{id}`. Inference never blocks the async runtime, so both the
-/// multi-thread and current-thread runtimes are supported.
+/// thread, named `batchinf-inference-worker-{id}`. Inference never blocks the async runtime, so
+/// both the multi-thread and current-thread runtimes are supported.
 ///
 /// # Parameters
 ///
@@ -136,7 +136,7 @@ async fn collect_acks<E>(
 ///   its inference thread could not be spawned.
 ///
 /// On error the workers that did start are shut down.
-pub async fn get_batcher<P: Predictor + 'static, E: Send + 'static>(
+pub async fn get_batcher<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
     predictor_factory: PredictorFactory<P, E>,
     config: BatcherConfig,
 ) -> Result<Batchinf<P::Input, P::Output, P::Error>, StartupError<E>> {

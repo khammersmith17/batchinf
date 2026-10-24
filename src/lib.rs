@@ -19,8 +19,8 @@
 //! To use, implement a type to hold inference state, such as model weights or an instance of a
 //! model type in the framework the model is implemented in. Implement the [`Predictor`] trait on
 //! that type. This trait requires a defined input type, output type, and an error type that can
-//! bubble up when inference fails. Implement [`Predictor::predict_batch`], which takes the
-//! buffered inference inputs as a slice and returns a `Result<Vec<Output>, Error>`.
+//! bubble up when inference fails. Implement [`Predictor::predict_batch`], which takes ownership
+//! of the buffered inference inputs as a `Vec` and returns a `Result<Vec<Output>, Error>`.
 //!
 //! Pass [`get_batcher`] a factory closure that builds the predictor for a given worker index. It
 //! is called on each worker's inference thread, so a predictor can bind to a device (for example
@@ -65,9 +65,9 @@
 //!     type Output = Vec<f32>;
 //!     type Error = ModelError;
 //!
-//!     fn predict_batch(&mut self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, ModelError> {
+//!     fn predict_batch(&mut self, inputs: Vec<Vec<f32>>) -> Result<Vec<Vec<f32>>, ModelError> {
 //!         // Run your model here. Each output must correspond to the input at the same index.
-//!         Ok(inputs.to_vec())
+//!         Ok(inputs)
 //!     }
 //! }
 //!

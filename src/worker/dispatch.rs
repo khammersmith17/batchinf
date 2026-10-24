@@ -7,7 +7,7 @@ use crate::{
 use std::sync::Arc;
 
 /// Send the output back out to user code through the oneshot sender.
-/// Delegates to sending errors when batch in unusccessful.
+/// Delegates to sending errors when the batch is unsuccessful.
 pub(super) fn send_output<P: Predictor>(
     output: InferenceResult<P>,
     senders: Vec<OutputSender<P>>,
@@ -17,7 +17,7 @@ pub(super) fn send_output<P: Predictor>(
     // When user defined predict errors, dispatch to error handler.
     let batch = match output {
         // Ensure that the predictors output buffer matches the number of senders we have.
-        // This is a user error, so the user defined error is overriden.
+        // This is a user error, so the user defined error is overridden.
         Ok(b) if b.len() != senders.len() => {
             send_errors::<P>(
                 BatchinfError::InvalidPredictorOutput,
@@ -28,7 +28,7 @@ pub(super) fn send_output<P: Predictor>(
             return;
         }
         Ok(b) => b,
-        // User defined error, so P::Error is propogated forward.
+        // User defined error, so P::Error is propagated forward.
         Err(e) => {
             let err = Arc::new(e);
             send_errors::<P>(

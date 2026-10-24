@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Notify, mpsc::Receiver};
+use tracing::{debug, error, info, info_span, warn};
 
 // Type alias for the receiver where work is passed from the accumulator.
 pub(super) type JobReceiver<P> = Receiver<WorkerBuffer<P>>;
@@ -28,6 +29,14 @@ pub(super) struct InferenceRunnerArgs<P: Predictor, E> {
     pub(super) obs: Option<Arc<dyn BatcherMetrics>>,
     pub(super) ready_tx: StartAckSender<E>,
     pub(super) signal: Arc<Notify>,
+}
+
+fn construct_panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<unable to coerce panic message to string>")
 }
 
 fn backoff_schedule(
@@ -76,7 +85,9 @@ fn sleep_with_exit(mut wait: Duration, exit_cond: &impl Fn() -> bool) -> bool {
     true
 }
 
-fn try_make_predictor<P: Predictor, E>(
+/// Performs a single attempt to create an instance of the Predictor using the user provided
+/// PredictorFactory.
+fn try_make_predictor<P: Predictor, E: std::fmt::Debug>(
     f: PredictorFactory<P, E>,
     worker_id: u8,
     wait: Duration,
@@ -85,8 +96,19 @@ fn try_make_predictor<P: Predictor, E>(
     let mut failure =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(worker_id))) {
             Ok(Ok(predictor)) => return Ok(predictor),
-            Ok(Err(e)) => BuildFailure::Error(e),
-            Err(_) => BuildFailure::Panic,
+            Ok(Err(e)) => {
+                // `retry_in` is zero on the last attempt.
+                warn!(error = ?e, retry_in = ?wait, "predictor factory returned an error");
+                BuildFailure::Error(e)
+            }
+            Err(e) => {
+                warn!(
+                    panic = construct_panic_message(&*e),
+                    retry_in = ?wait,
+                    "predictor factory panicked"
+                );
+                BuildFailure::Panic
+            }
         };
     let cont = sleep_with_exit(wait, exit_cond);
 
@@ -96,7 +118,8 @@ fn try_make_predictor<P: Predictor, E>(
     Err(failure)
 }
 
-fn spawn_predictor<P: Predictor, E>(
+/// Attempt to create a Predictor instance.
+fn spawn_predictor<P: Predictor, E: std::fmt::Debug>(
     factory: PredictorFactory<P, E>,
     worker_id: u8,
     total_attempts: u8,
@@ -117,18 +140,24 @@ fn spawn_predictor<P: Predictor, E>(
     Err(last_failure)
 }
 
-pub(super) fn spawn_inference_runner<P: Predictor + 'static, E: Send + 'static>(
+/// Start the inferencer runner thread.
+pub(super) fn spawn_inference_runner<
+    P: Predictor + 'static,
+    E: std::fmt::Debug + Send + 'static,
+>(
     args: InferenceRunnerArgs<P, E>,
     shutdown_tx: ShutdownSender,
 ) {
     let worker_id = args.worker_id;
-    let name = format!("batchinf-worker-{worker_id}");
+    let name = format!("batchinf-inference-worker-{worker_id}");
     let ready_tx = args.ready_tx.clone();
 
     if Builder::new()
         .name(name)
         .spawn(move || {
             inference_runner(args);
+            // The runner's span has ended, so name the worker explicitly.
+            info!(worker_id, "inference thread exited");
             // `inference_runner` owned the predictor, the factory (and any weights it captures)
             // and every channel end, so all of it has been dropped by now. Only then release the
             // shutdown sender, which lets a `ShutdownWaiter` resolve. If the runner panics,
@@ -142,7 +171,9 @@ pub(super) fn spawn_inference_runner<P: Predictor + 'static, E: Send + 'static>(
     drop(ready_tx);
 }
 
-fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
+/// The inference runner thread.
+/// Attempt to create the initial instance, and then the main inference loop.
+fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<P, E>) {
     let InferenceRunnerArgs {
         factory,
         mut batch_recv,
@@ -155,6 +186,9 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
         ready_tx,
         signal,
     } = args;
+
+    let _span = info_span!("batchinf_inference", worker_id).entered();
+    info!("Starting Predictor thread");
 
     // ****** Start up ******
     let total_attempts = retries.saturating_add(1);
@@ -169,19 +203,25 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
         total_attempts,
         backoff,
         max_wait,
-        move || tx_ref.is_closed(), // If the startup ack sender is closed, either another worker
-                                    // failed, or the user's code did not await the startup, so we stop
+        // If the startup ack sender is closed, either another worker failed, or the user's code did not await the startup, so we stop.
+        move || tx_ref.is_closed(),
     ) {
         Ok(predictor) => predictor,
         Err(failure) => {
             worker_state.set_dead();
             let err = match failure {
+                // Forward the user defined Err.
                 BuildFailure::Error(err) => StartupError::WorkerStartFailure { worker_id, err },
+                // In the case of panic, we are unable to forward the Err to the user.
                 BuildFailure::Panic => StartupError::WorkerStartPanic { worker_id },
                 // Startup already ended (timeout or another worker failed), so nobody is
                 // waiting for this worker's result.
-                BuildFailure::Cancelled => return,
+                BuildFailure::Cancelled => {
+                    debug!("startup ended before the predictor was built, exiting");
+                    return;
+                }
             };
+            error!("Unable to build Predictor, exiting");
             let _ = ready_tx.blocking_send(Err(err));
             return;
         }
@@ -193,6 +233,8 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
     };
     drop(ready_tx);
 
+    info!("Successfully built predictor, waiting for inference batches");
+
     // ****** Start Inference Runner ******
 
     // `blocking_recv` is fine here: this is a dedicated OS thread, not a runtime thread.
@@ -200,19 +242,26 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
         // Filter out any canceled (timed out) requests.
         buffer.filter_canceled();
 
-        // All request might have been canceled.
+        // All request have been canceled.
         if buffer.is_empty() {
             continue;
         }
+        info!("Running inference");
+
+        let (inf_input, senders) = buffer.split();
         // Capture panic signal to handle crash and restart.
         let panic_signal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            predict(&mut predictor, buffer.input())
+            predict(&mut predictor, inf_input)
         }));
 
         // Inspect the result and handle panic in the case the user defined prediction method panicked.
         let (metrics, inf_result) = match panic_signal {
             Ok((m, ir)) => (m, ir),
-            Err(_) => {
+            Err(e) => {
+                warn!(
+                    panic = construct_panic_message(&*e),
+                    "predict_batch panic, rebuilding worker"
+                );
                 // Mark the predictor as rebuilding, so new requests are routed elsewhere.
                 worker_state.set_predictor_state(PredictorStatus::Rebuilding);
 
@@ -221,13 +270,12 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
 
                 // Dispatch the internal error. Requests should not wait on a worker to restart.
                 // They will not be retried here.
-                let senders = buffer.take_senders();
                 dispatch::send_errors_on_crash::<P>(senders);
 
                 // Drop predictor while new one is being rebuilt.
                 // Otherwise, memory footprint on the predictor would 2x.
                 drop(predictor);
-                let Ok(new_predictor) = spawn_predictor(
+                let new_predictor = match spawn_predictor(
                     Arc::clone(&factory),
                     worker_id,
                     total_attempts,
@@ -235,12 +283,25 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
                     max_wait,
                     // Cancel a rebuild if the application is shutting down.
                     || batch_recv.is_closed(),
-                ) else {
-                    worker_state.set_dead();
-                    // Allows requesters to get a `NoAvailableWorkers`.
-                    signal.notify_waiters();
-                    return;
+                ) {
+                    Ok(predictor) => predictor,
+                    Err(failure) => {
+                        if matches!(failure, BuildFailure::Cancelled) {
+                            // A normal shutdown during the rebuild, not a failure.
+                            debug!("shutdown during predictor rebuild, exiting");
+                        } else {
+                            error!(
+                                "Unable to rebuild predictor. Setting predictor to PredictorStatus::Dead."
+                            );
+                        }
+                        worker_state.set_dead();
+                        // Allows requesters to get a `NoAvailableWorkers`.
+                        signal.notify_waiters();
+                        return;
+                    }
                 };
+
+                info!("Successfully rebuilt predictor");
                 predictor = new_predictor;
                 worker_state.set_predictor_state(PredictorStatus::Alive);
                 // This worker can accept work again.
@@ -249,7 +310,7 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
             }
         };
 
-        let senders = buffer.take_senders();
+        info!("Inference successful, returning results to waiters");
         dispatch::send_output::<P>(inf_result, senders, metrics, obs.clone());
     }
 }
@@ -259,8 +320,9 @@ fn inference_runner<P: Predictor, E>(args: InferenceRunnerArgs<P, E>) {
 /// Captures inference latency and batch size for metric emission.
 fn predict<P: Predictor>(
     predictor: &mut P,
-    input: &[P::Input],
+    input: Vec<P::Input>,
 ) -> (InfBatchMetrics, Result<Vec<P::Output>, P::Error>) {
+    let size = input.len();
     let start = Instant::now();
 
     // Runs on this worker's dedicated inference thread, so blocking here does not affect the
@@ -268,10 +330,7 @@ fn predict<P: Predictor>(
     let inf_results = predictor.predict_batch(input);
 
     let latency = Instant::now().duration_since(start);
-    let metrics = InfBatchMetrics {
-        size: input.len(),
-        latency,
-    };
+    let metrics = InfBatchMetrics { size, latency };
 
     (metrics, inf_results)
 }

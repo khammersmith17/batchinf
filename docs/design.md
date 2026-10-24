@@ -34,13 +34,14 @@ pub trait Predictor {
     type Output: Send + 'static;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn predict_batch(&mut self, inputs: &[Self::Input]) -> Result<Vec<Self::Output>, Self::Error>;
+    fn predict_batch(&mut self, inputs: Vec<Self::Input>) -> Result<Vec<Self::Output>, Self::Error>;
 }
 
 pub type PredictorFactory<P, E> = Arc<dyn Fn(u8) -> Result<P, E> + Send + Sync>;
 ```
 
-- Takes a slice of queued inputs, returns a `Vec<Output>` in the same order. Output order matching input order must be upheld by the implementer; a length mismatch is reported as `InvalidPredictorOutput`.
+- Takes ownership of the queued inputs, returns a `Vec<Output>` in the same order. Output order matching input order must be upheld by the implementer; a length mismatch is reported as `InvalidPredictorOutput`.
+- Inputs are passed by value because the inference thread owns each batch's buffer and has no further use for it. Moving the `Vec` costs nothing, and lets a predictor hand inputs to APIs that take ownership (tokenizers, tensor constructors) without cloning them. The result senders are split off and kept by the thread, so a panic still reaches every caller in the batch.
 - The predictor is built by a factory, called with the worker index on that worker's inference thread. The predictor is created, used and dropped on that thread, so it needs neither `Clone`, `Send` nor `Sync`, and can bind to a device (for example `worker_id % n_gpus`).
 - `&mut self` lets a predictor keep mutable state (scratch buffers, sessions) without interior mutability.
 - `Error: Sync` because one error value is shared by every caller in a failed batch, as `InferenceError(Arc<E>)`. No `Clone` is needed.
@@ -138,7 +139,7 @@ Each worker runs `worker_loop` as a detached tokio task:
 
 ## Inference thread
 
-Spawned once per worker as `batchinf-worker-{id}`:
+Spawned once per worker as `batchinf-inference-worker-{id}`:
 
 1. **Startup**: call the factory with retries and backoff, then report `Ok(())` or a `StartupError` to `get_batcher` over the startup channel. Retries stop early if that channel has closed (startup already failed, timed out, or the `get_batcher` future was dropped).
 2. **Loop** over the job channel with `blocking_recv`:
@@ -159,7 +160,7 @@ struct WorkerBuffer<P: Predictor> {
 }
 ```
 
-Invariant: `input_buffer.len() == sender_buffer.len()`. Both are allocated with capacity `batch_size`. The accumulator moves a full buffer to the inference thread and starts the next batch in a fresh one (`swap_replace`); the thread takes the senders with `mem::take` and drops the inputs.
+Invariant: `input_buffer.len() == sender_buffer.len()`. Both are allocated with capacity `batch_size`. The accumulator moves a full buffer to the inference thread and starts the next batch in a fresh one (`swap_replace`); the thread splits it into inputs, which it moves into `predict_batch`, and result senders, which it keeps to deliver results.
 
 ## Worker pool and routing
 

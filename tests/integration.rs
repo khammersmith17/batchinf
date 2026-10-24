@@ -31,8 +31,8 @@ impl Predictor for EchoPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
-        Ok(inp.to_vec())
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
+        Ok(inp)
     }
 }
 
@@ -44,7 +44,7 @@ impl Predictor for MismatchPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, _inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         Ok(vec![]) // always returns wrong number of outputs
     }
 }
@@ -57,7 +57,7 @@ impl Predictor for FailPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, _inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         Err(TestError)
     }
 }
@@ -84,9 +84,9 @@ impl Predictor for CountingPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -639,11 +639,11 @@ impl Predictor for PanicOncePredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         if !self.has_panicked.swap(true, Ordering::SeqCst) {
             panic!("intentional panic for crash recovery test");
         }
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -681,7 +681,7 @@ impl Predictor for AlwaysPanicPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, _inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, _inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         panic!("intentional panic");
     }
 }
@@ -811,9 +811,9 @@ impl Predictor for SlowEchoPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         std::thread::sleep(Duration::from_millis(30));
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -892,8 +892,8 @@ impl Predictor for MarkedPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
-        Ok(inp.to_vec())
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
+        Ok(inp)
     }
 }
 
@@ -966,9 +966,9 @@ impl Predictor for SlowMarkedPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         std::thread::sleep(self.delay);
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -1027,9 +1027,9 @@ impl Predictor for ThreadLocalPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         self.calls.set(self.calls.get() + 1);
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -1080,11 +1080,11 @@ impl Predictor for MaybePanicPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         if self.always_panics {
             panic!("intentional panic during inference");
         }
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -1148,12 +1148,12 @@ impl Predictor for SlowPanicOncePredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         if !self.has_panicked.swap(true, Ordering::SeqCst) {
             std::thread::sleep(self.delay);
             panic!("intentional panic during inference");
         }
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -1476,10 +1476,10 @@ impl Predictor for RecordingPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
         self.batches_per_worker[self.worker_id as usize].fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(20));
-        Ok(inp.to_vec())
+        Ok(inp)
     }
 }
 
@@ -1846,9 +1846,9 @@ impl Predictor for BatchRecordingPredictor {
     type Output = u64;
     type Error = TestError;
 
-    fn predict_batch(&mut self, inp: &[u64]) -> Result<Vec<u64>, TestError> {
-        self.batches.lock().unwrap().push(inp.to_vec());
-        Ok(inp.to_vec())
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
+        self.batches.lock().unwrap().push(inp.clone());
+        Ok(inp)
     }
 }
 

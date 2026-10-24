@@ -55,7 +55,7 @@ impl<P: Predictor> WorkerBuffer<P> {
         self.input_buffer.len()
     }
 
-    // Returns the number of items in the buffer.
+    // Returns the capacity of the buffer.
     #[inline]
     fn cap(&self) -> usize {
         debug_assert_eq!(self.input_buffer.capacity(), self.sender_buffer.capacity());
@@ -68,17 +68,13 @@ impl<P: Predictor> WorkerBuffer<P> {
         self.input_buffer.is_empty()
     }
 
-    // Provides a reference to the input buffer.
-    pub(super) fn input(&self) -> &[P::Input] {
-        &self.input_buffer
-    }
-
-    // Takes the held senders
-    pub(super) fn take_senders(&mut self) -> Vec<OutputSender<P>> {
-        // drop the input buffer.
-        let _ = std::mem::take(&mut self.input_buffer);
-        // hand back the sender buffer.
-        std::mem::take(&mut self.sender_buffer)
+    // Consumes the buffer, returning the inputs and their result senders in matching order.
+    pub(super) fn split(self) -> (Vec<P::Input>, Vec<OutputSender<P>>) {
+        let Self {
+            input_buffer,
+            sender_buffer,
+        } = self;
+        (input_buffer, sender_buffer)
     }
 }
 
@@ -107,9 +103,9 @@ mod test_buffer {
 
         fn predict_batch(
             &mut self,
-            input: &[Self::Input],
+            input: Vec<Self::Input>,
         ) -> Result<Vec<Self::Output>, Self::Error> {
-            Ok((0..input.len()).collect())
+            Ok(input)
         }
     }
     #[test]

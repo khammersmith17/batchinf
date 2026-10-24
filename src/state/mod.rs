@@ -47,7 +47,8 @@ pub enum WorkerStatus {
     /// state while the inference thread is busy and already has a batch queued.
     Running = 2,
     /// The worker's inference thread is gone, so batches can no longer be handed off. The worker
-    /// has stopped and no longer accepts requests. See [`PredictorStatus::Dead`] for the cause.
+    /// has stopped and no longer accepts requests. This is caused by the predictor crashing and no
+    /// recovering, or a panic in the observability callbacks.
     Crashed = 3,
 }
 
@@ -208,8 +209,8 @@ impl WorkerStateInner {
     /// The accumulator is waiting for a batch to complete, the predictor is healthy,
     /// and there is room in the batch.
     ///
-    /// Room in the batch check is given that an accumulator may be full, but has not singled as
-    /// such yet.
+    /// The room-in-the-batch check covers an accumulator whose batch is full but that has not yet
+    /// signaled it by setting `Running`.
     pub(crate) fn can_accept_primary(&self) -> bool {
         let snapshot = self.snapshot();
         snapshot.worker_status == WorkerStatus::Waiting
@@ -217,8 +218,8 @@ impl WorkerStateInner {
             && snapshot.batch_len < self.config.batch_size
     }
 
-    /// Determine is a worker can accept work soon as a fallback.
-    /// Determined by if both the accumulator and predictor are healthy.
+    /// Determines if a worker can accept work soon, as a fallback.
+    /// True when both the accumulator and the predictor are healthy.
     pub(crate) fn can_accept_secondary(&self) -> bool {
         let snapshot = self.snapshot();
         !matches!(
@@ -227,7 +228,7 @@ impl WorkerStateInner {
         ) && snapshot.predictor_status == PredictorStatus::Alive
     }
 
-    /// Signals is the predictor is currently being rebuilt.
+    /// Signals if the predictor is currently being rebuilt.
     pub(crate) fn is_rebuilding(&self) -> bool {
         self.snapshot().predictor_status == PredictorStatus::Rebuilding
     }
@@ -354,9 +355,9 @@ where
         self.state.snapshot()
     }
 
-    /// Attmept to push worker onto a workers queue.
+    /// Attempt to push work onto a worker's queue.
     ///
-    /// If the work cannot be forward, the work unit is handed back to the caller.
+    /// If the work cannot be forwarded, the work unit is handed back to the caller.
     pub(crate) fn push(
         &self,
         msg: FunnelMessage<Input, Output, Error>,

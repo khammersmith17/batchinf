@@ -58,14 +58,16 @@ pub trait Predictor {
     /// This method is called once per batch and is a required implementation. With several
     /// workers, each worker calls its own predictor for the batches it builds.
     ///
-    /// Implement this method to take in a slice of queued inference data, and perform inference on
-    /// the batch of examples.
+    /// Implement this method to take the queued inference inputs and perform inference on the
+    /// batch of examples. The method owns the inputs, so it can move them into whatever the model
+    /// needs (a tokenizer, a tensor) without cloning them.
     ///
     /// Each inference result is its own result, and all inference results are returned from this
     /// method as a Vec.
     ///
-    /// It is assumed under this contract that the output and input vectors are element wise pairs;
-    /// the order of outputs must match the order of inputs.
+    /// It is assumed under this contract that the output and input vectors are element wise pairs:
+    /// output `i` must answer the `i`-th input in the order it was received. The inputs may be
+    /// consumed or reordered internally, as long as the outputs come back in that original order.
     ///
     /// A panic here fails the current batch: every caller in it receives
     /// [`BatchinfError::InternalError`](`crate::BatchinfError::InternalError`). The worker then
@@ -76,5 +78,7 @@ pub trait Predictor {
     ///
     /// This recovery relies on unwinding. In a binary built with `panic = "abort"`, a panic here
     /// terminates the whole process instead.
-    fn predict_batch(&mut self, inp: &[Self::Input]) -> Result<Vec<Self::Output>, Self::Error>;
+    ///
+    /// Note that the input buffer will be at most `batch_size` in size.
+    fn predict_batch(&mut self, inp: Vec<Self::Input>) -> Result<Vec<Self::Output>, Self::Error>;
 }

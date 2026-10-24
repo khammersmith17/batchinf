@@ -21,6 +21,7 @@ mod dispatch;
 mod inf;
 use buffer::WorkerBuffer;
 use inf::{InferenceRunnerArgs, spawn_inference_runner};
+use tracing::{Instrument, debug, error, info_span};
 
 pub(crate) type OutputSender<P> =
     OneshotSender<Result<<P as Predictor>::Output, BatchinfError<<P as Predictor>::Error>>>;
@@ -35,20 +36,21 @@ pub(crate) type StartAckSender<E> = Sender<Result<(), StartupError<E>>>;
 const JOB_QUEUE_DEPTH: usize = 1;
 
 // Far out timeout for when a user specifies Duration::MAX as a batch timeout.
-// This is valid design choice, only wanting to perform inference when batch size is satisfied.
+// This is a valid design choice by a user: only perform inference once the batch size is reached.
 const ONE_YEAR: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 
-struct DropGuard {
+struct PanicGuard {
     state: WorkerState,
     signal: Arc<Notify>,
 }
 
-impl Drop for DropGuard {
+impl Drop for PanicGuard {
     fn drop(&mut self) {
         if std::thread::panicking() {
             // Setting the state to crashed, if there is a panic
             // This should not happen. There should not be anything that can panic here, but to be
             // safe this guard will make sure no requests get routed.
+            error!("batching task panicked, marking worker as WorkerStatus::Crashed");
             self.state.set_worker_state(WorkerStatus::Crashed);
             // Notify waiters in the case this is the only worker and messages can no longer be serviced.
             self.signal.notify_waiters();
@@ -103,7 +105,6 @@ impl InferenceWorker {
         self.signal.notify_one()
     }
 }
-
 /// Settings for building a worker's predictor. Only needed to spawn the inference thread, so
 /// they are passed through to it by value rather than kept in the worker's shared state.
 #[derive(Debug, Clone, Copy)]
@@ -129,7 +130,7 @@ pub(crate) struct RunnerHandoff<P: Predictor, E> {
     pub(crate) shutdown_tx: ShutdownSender,
 }
 
-fn make_runner<P: Predictor + 'static, E: Send + 'static>(
+fn make_runner<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
     worker: &InferenceWorker,
     handoff: RunnerHandoff<P, E>,
 ) -> JobSender<P> {
@@ -164,12 +165,15 @@ fn make_runner<P: Predictor + 'static, E: Send + 'static>(
 // then dispatch inference.
 //
 // After inference, the state is evaluated to determine if the worker should continue.
-async fn worker_loop<P: Predictor + 'static, E: Send + 'static>(
+async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
     worker: InferenceWorker,
     mut input_receiver: InputReceiver<P>,
     handoff: RunnerHandoff<P, E>,
 ) {
-    let _drop_guard = DropGuard {
+    tracing::info!("Starting accumulator");
+    // Register the panic guard.
+    // Panics could occur in the user defined observability callbacks.
+    let _panic_guard = PanicGuard {
         state: worker.state.clone(),
         signal: worker.signal.clone(),
     };
@@ -182,6 +186,8 @@ async fn worker_loop<P: Predictor + 'static, E: Send + 'static>(
         accumulate_next_batch(&mut input_receiver, &worker, &mut buffer, &mut next_inf).await;
         let live_buffer = buffer.swap_replace();
         match worker.state.get_worker_state() {
+            // This state is unreachable given there is at least one item in the buffer to perform
+            // inference or the worker is being shutdown.
             WorkerStatus::Waiting => unreachable!(),
             WorkerStatus::Running => {
                 // Backlog behind the batch that is about to be handed off.
@@ -191,6 +197,7 @@ async fn worker_loop<P: Predictor + 'static, E: Send + 'static>(
                 if alive.is_err() {
                     // The inference thread is gone. Returning drops the request receiver, so the
                     // router sees this worker as closed and queued requests get InternalError.
+                    error!("inference thread is gone, marking worker as WorkerStatus::Crashed");
                     worker.state.set_worker_state(WorkerStatus::Crashed);
                     return;
                 }
@@ -216,6 +223,8 @@ async fn worker_loop<P: Predictor + 'static, E: Send + 'static>(
 /// Accumulate the next batch of inference data.
 /// Starts timer for the batch upon receiving the first record for the batch.
 /// Sets state to Running when the batch is ready, or Exit when the channel closes.
+///
+/// The buffer is either non empty after this function completes, or the worker is being shut down.
 async fn accumulate_next_batch<P: Predictor + 'static>(
     receiver: &mut InputReceiver<P>,
     worker: &InferenceWorker,
@@ -224,11 +233,13 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
 ) {
     // Wait for first item in batch to start batch timer.
     if let Some((request, sender)) = receiver.recv().await {
+        tracing::info!("Received first item in batch, starting timer");
         worker.notify_one();
         buffer.push(request, sender);
         worker.state.increment_len();
         worker.reset_next_inf(next_inf);
     } else {
+        debug!("Receiver closed, setting state to WorkerStatus::Exit");
         // None indicates the channel is closed. In this case set the state to exit.
         worker.state.set_worker_state(WorkerStatus::Exit);
         return;
@@ -239,6 +250,8 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
         worker.set_running_and_emit(BatchTrigger::Capacity, buffer.len());
         return;
     }
+
+    let batch_start = Instant::now();
 
     // Set the timer for a batch accumulation timeout.
     let timer = sleep_until(*next_inf);
@@ -254,7 +267,12 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
                     buffer.push(request, sender);
 
                     worker.state.increment_len();
+
+                    // Check the batch size condition to trigger inference.
                     if buffer.len() == (worker.state.batch_size() as usize) {
+
+                        debug!("batch triggered by size in {} milliseconds",
+                            batch_start.elapsed().as_millis());
                         // Set state and emit trigger.
                         worker.set_running_and_emit(BatchTrigger::Capacity, buffer.len());
                         break;
@@ -262,29 +280,21 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
 
                 } else {
                     worker.state.set_worker_state(WorkerStatus::Exit);
-                    return;
+                    break;
                 };
 
             }
             _ = &mut timer  => {
-                    // Do not overwrite state to running when state has been set to Exit.
-                    // Inference happens in an Exit state.
-                    //
-                    // Only log a timeout when the worker has not exited.
-                    if matches!(worker.state.get_worker_state(), WorkerStatus::Waiting) && !buffer.is_empty() {
-                        worker.set_running_and_emit(BatchTrigger::Timeout, buffer.len());
-                    }
-
-                    return;
+                    tracing::info!("batch triggered by timeout with {} items", buffer.len());
+                    worker.set_running_and_emit(BatchTrigger::Timeout, buffer.len());
+                    break;
             }
 
         }
     }
 }
 
-/// Inference runner.
-/// Runs inference with buffered input and handle when the user implemented inference function
-/// crashes.
+/// Forward the buffer to the inference thread.
 async fn run_inference<P: Predictor>(
     buffer: WorkerBuffer<P>,
     job_sender: &JobSender<P>,
@@ -293,15 +303,17 @@ async fn run_inference<P: Predictor>(
         return Ok(());
     }
 
-    let res = job_sender.send(buffer).await;
-    if res.is_ok() { Ok(()) } else { Err(()) }
+    job_sender.send(buffer).await.map_err(|_| ())
 }
 
 /// Entry point to worker lifecycle.
-pub(crate) fn run_worker<P: Predictor + 'static, E: Send + 'static>(
+pub(crate) fn run_worker<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
     worker: InferenceWorker,
     receiver: InputReceiver<P>,
     handoff: RunnerHandoff<P, E>,
 ) {
-    tokio::task::spawn(async move { worker_loop(worker, receiver, handoff).await });
+    let span = info_span!("batchinf_accumulator", worker_id = worker.worker_id);
+    tokio::task::spawn(
+        async move { worker_loop(worker, receiver, handoff).await }.instrument(span),
+    );
 }

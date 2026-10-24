@@ -2,13 +2,14 @@
 name = "batchinf"
 version = "0.1.0"
 edition = "2024"
- rust-version = "1.85"
+rust-version = "1.85"
 description = "A drop in harness for dynamic ML inference batching. This is useful to saturate a device (TPU/GPU) and increase throughput for expensive ML inference."
 license = "MIT"
 
 [dependencies]
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The tests and the doc example run on the multi-thread runtime.

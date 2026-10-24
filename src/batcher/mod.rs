@@ -44,8 +44,8 @@ use tokio::{
 /// #     type Input = u32;
 /// #     type Output = u32;
 /// #     type Error = ModelError;
-/// #     fn predict_batch(&mut self, inputs: &[u32]) -> Result<Vec<u32>, ModelError> {
-/// #         Ok(inputs.iter().map(|x| x * 2).collect())
+/// #     fn predict_batch(&mut self, inputs: Vec<u32>) -> Result<Vec<u32>, ModelError> {
+/// #         Ok(inputs.into_iter().map(|x| x * 2).collect())
 /// #     }
 /// # }
 /// # #[tokio::main(flavor = "multi_thread")]
@@ -248,7 +248,7 @@ where
     /// Returns a [`ShutdownWaiter`] that resolves once this batcher has fully shut down.
     /// Workers exit when all associated [Batchinf] handles are dropped.
     ///
-    /// Thus, the waiter does not keep the batcher alive and depends on all instances being droped.
+    /// Thus, the waiter does not keep the batcher alive and depends on all instances being dropped.
     /// Get it before dropping the last handle.
     pub fn shutdown_waiter(&self) -> ShutdownWaiter {
         ShutdownWaiter::new(self.inner.shutdown_rx.clone())

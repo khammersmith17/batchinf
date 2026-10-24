@@ -34,7 +34,7 @@ pub trait BatcherMetrics: Send + Sync + 'static {
     /// [`on_batch_complete_ok`](BatcherMetrics::on_batch_complete_ok) and
     /// [`on_batch_complete_err`](BatcherMetrics::on_batch_complete_err) can be smaller, and a
     /// batch whose requests were all cancelled reports no completion at all.
-    #[allow(unused)]
+    #[allow(unused_variables)]
     fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger) {}
 
     /// Fires after a batch completes successfully.
@@ -45,7 +45,7 @@ pub trait BatcherMetrics: Send + Sync + 'static {
     /// implementation at this batch size. Use it to profile and tune the predictor; measure
     /// per-request latency around [`Batchinf::predict`](`crate::batcher::Batchinf::predict`)
     /// instead.
-    #[allow(unused)]
+    #[allow(unused_variables)]
     fn on_batch_complete_ok(&self, batch_size: usize, latency: tokio::time::Duration) {}
 
     /// Fires after a batch completes with an error: either
@@ -56,14 +56,14 @@ pub trait BatcherMetrics: Send + Sync + 'static {
     /// [`on_batch_complete_ok`](BatcherMetrics::on_batch_complete_ok): time spent inside
     /// `predict_batch` only. Slow failures, such as device timeouts or out-of-memory errors at
     /// large batch sizes, show up here.
-    #[allow(unused)]
+    #[allow(unused_variables)]
     fn on_batch_complete_err(&self, batch_size: usize, latency: tokio::time::Duration) {}
 
     /// Fires when a call to
     /// [`Batchinf::predict_with_timeout`](`crate::batcher::Batchinf::predict_with_timeout`) times
     /// out, whether the request was still waiting for room in a worker's queue, was queued, or was
     /// already running.
-    #[allow(unused)]
+    #[allow(unused_variables)]
     fn on_request_timeout(&self) {}
 
     /// Reports the number of requests waiting in one worker's queue, not yet pulled into a batch.
@@ -73,7 +73,7 @@ pub trait BatcherMetrics: Send + Sync + 'static {
     /// inference thread was busy or rebuilding. Nothing is emitted while a worker is idle, so
     /// treat this as a gauge that keeps its last value. Aggregate across workers as needed: the
     /// maximum shows whether any single worker is backed up, the sum shows total backlog.
-    #[allow(unused)]
+    #[allow(unused_variables)]
     fn on_queue_depth(&self, worker_id: u8, queue_depth: usize) {}
 
     /// Fires on the worker's inference thread when
