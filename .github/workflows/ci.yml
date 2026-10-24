@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+  # Also run by the release workflow before publishing, so the checks are defined once.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per pull request (or per ref when called); a new push cancels the previous run.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--locked`: use exactly the committed Cargo.lock, and fail if it is out of date.
+      - name: Run tests
+        run: cargo test --locked
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Lints the library, tests and examples; any warning fails the job.
+      - name: Run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in sync with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      # Builds the library and every test target on the minimum supported Rust version. The tests
+      # themselves run in the `test` job; compiling is what this job checks.
+      - name: Build on the minimum supported Rust version
+        run: cargo test --locked --no-run
+
+  publish-dry-run:
+    name: Publish (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Packages the crate and builds it from the package, as crates.io would, without uploading.
+      - name: Package and verify
+        run: cargo publish --dry-run --locked

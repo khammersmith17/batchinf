@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never run two publishes at once, and never cancel one part-way.
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish to crates.io
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # crates.io rejects a version that already exists, so only publish when `version` in
+      # Cargo.toml has been bumped. Merges that don't bump it skip this job's publish step.
+      - name: Check whether this version is already published
+        id: check
+        run: |
+          name=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          # crates.io requires a User-Agent that identifies the client.
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "${name}-release-ci (https://github.com/${{ github.repository }})" \
+            "https://crates.io/api/v1/crates/${name}/${version}")
+          case "$status" in
+            200)
+              echo "${name} ${version} is already on crates.io; skipping publish."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "${name} ${version} is not on crates.io yet; publishing."
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unexpected HTTP ${status} from crates.io while checking ${name} ${version}."
+              exit 1
+              ;;
+          esac
+
+      - name: Publish
+        if: steps.check.outputs.publish == 'true'
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
