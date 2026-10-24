@@ -31,8 +31,8 @@ pub(crate) fn shutdown_channel() -> (ShutdownSender, watch::Receiver<()>) {
 /// # }
 /// ```
 ///
-/// There is a cases where a shutdown may be delayed: when a worker is building during a shutdown. This cannot
-/// be interupted. Backoff time for a retry _can_ be interrupted.
+/// There is one case where a shutdown may be delayed: when a worker is building its predictor
+/// during a shutdown. This cannot be interrupted. Backoff time for a retry _can_ be interrupted.
 #[derive(Debug, Clone)]
 #[must_use = "Shutdown should be awaited when used."]
 pub struct ShutdownWaiter {
