@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     branches: [main]
+    # Only release for changes to the crate itself, so docs-only merges don't publish.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
 
 permissions:
   contents: read

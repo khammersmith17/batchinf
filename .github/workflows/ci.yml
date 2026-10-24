@@ -2,6 +2,12 @@ name: CI
 
 on:
   pull_request:
+    # Only run for changes to the crate itself, so docs-only pull requests skip CI.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
   # Also run by the release workflow before publishing, so the checks are defined once.
   workflow_call:
 

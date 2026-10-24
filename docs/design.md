@@ -40,13 +40,13 @@ pub trait Predictor {
 pub type PredictorFactory<P, E> = Arc<dyn Fn(u8) -> Result<P, E> + Send + Sync>;
 ```
 
-- Takes ownership of the queued inputs, returns a `Vec<Output>` in the same order. Output order matching input order must be upheld by the implementer; a length mismatch is reported as `InvalidPredictorOutput`.
-- Inputs are passed by value because the inference thread owns each batch's buffer and has no further use for it. Moving the `Vec` costs nothing, and lets a predictor hand inputs to APIs that take ownership (tokenizers, tensor constructors) without cloning them. The result senders are split off and kept by the thread, so a panic still reaches every caller in the batch.
+- Takes ownership of the queued inputs, returns a `Vec<Output>` in the same order. Output order matching input order must be upheld by the implementer. `BatchinfError` describes to the caller what might have failed.
+- Inputs are passed by value because the inference thread owns each batch's buffer and has no further use for it. Moving the `Vec` is cheap and allows for pipeline in addition to letting a predictor hand inputs to APIs that take ownership (tokenizers, tensor constructors) without cloning them. The result senders are split off and kept by the thread, so a panic still reaches every caller in the batch.
 - The predictor is built by a factory, called with the worker index on that worker's inference thread. The predictor is created, used and dropped on that thread, so it needs neither `Clone`, `Send` nor `Sync`, and can bind to a device (for example `worker_id % n_gpus`).
 - `&mut self` lets a predictor keep mutable state (scratch buffers, sessions) without interior mutability.
-- `Error: Sync` because one error value is shared by every caller in a failed batch, as `InferenceError(Arc<E>)`. No `Clone` is needed.
+- `Error: Sync` because one error value is shared by every caller in a failed batch, as `InferenceError(Arc<E>)`. 
 - The factory returns `Result`; a panic in it is also caught and treated as a failure. Failed calls are retried with exponential backoff. Weights should be loaded once outside the factory and captured in the closure, so rebuilds are cheap.
-- `get_batcher` rejects a zero-sized `Input` at compile time (an inline `const` assertion).
+- `get_batcher` rejects a zero-sized `Input` at compile time.
 
 ## Configuration
 
@@ -85,24 +85,24 @@ pub enum StartupError<E> {     // Returned by get_batcher.
 ```
 
 - `InferenceError` and `InvalidPredictorOutput` are broadcast to every caller in the affected batch.
-- After a `predict_batch` panic, the inference thread sends `InternalError` explicitly to every caller in that batch.
-- `StartupError<E>` implements `std::error::Error` when `E: Debug + Display`, so `anyhow::Error` works as `E`.
+- After a `predict_batch` panic, the inference thread sends `InternalError` explicitly to every caller in that batch. The error here cannot be derived, but the panic trace is logged.
+- `StartupError<E>` hands the user defined error back to the user on panic during `Predictor` build.
 
 ## Public handle
 
-`Batchinf<Input, Output, Error>` wraps a single `Arc<BatchinfInner>` holding the pool, the metrics hook and the shutdown receiver, so a clone is one reference-count increment. `Clone` is implemented by hand so it puts no `Clone` bound on the type parameters.
+`Batchinf<Input, Output, Error>` wraps a single `Arc<BatchinfInner>` holding the pool, the metrics hook and the shutdown receiver, so a clone is cheap. 
 
-- `predict(input)` — queues the request and awaits the result. If every queue is full it waits for room (backpressure) and never returns `QueueFullError`.
+- `predict(input)` — queues the request and awaits the result. If every queue is full it waits for room and never returns `QueueFullError`.
 - `try_predict(input)` / `blocking_try_predict(input)` — fail fast with `QueueFullError` instead of waiting.
 - `predict_with_timeout(input, Duration)` — `predict` with a deadline covering the wait for room, queueing and inference. A request that times out before its batch starts is skipped; one already running completes and its result is discarded.
 - `shutdown_waiter()` — see Shutdown.
-- `pool_status()` / `worker_status(idx)` — point-in-time `WorkerSnapshot`s. Worker order is fixed.
+- `pool_status()` / `worker_status(idx)` — point-in-time `WorkerSnapshot`s. Worker order is fixed in the worker pool.
 
 Dropping all `Batchinf` clones triggers graceful shutdown (see Shutdown).
 
 ## Worker state
 
-Each worker shares a `WorkerState` (an `Arc`) between its accumulator, its inference thread and the router. It holds two atomics, each with a single writer.
+Each worker shares a `WorkerState` between its accumulator, its inference thread and the router. It holds two atomics, each with a single writer.
 
 **Accumulator status and batch length** — one `AtomicU64`, written only by the accumulator, so a router reads both fields with one load:
 
@@ -118,24 +118,26 @@ Each worker shares a `WorkerState` (an `Arc`) between its accumulator, its infer
 | `10` | Running | A batch is ready and being handed to the inference thread (waits while the thread is busy and already has a batch queued). |
 | `11` | Crashed | The inference thread is gone; the accumulator has exited. |
 
-`batch_len` counts requests pulled into the current batch; it never reaches the status bits. With a single writer, `set_worker_state` is a load (`Acquire`), mask and store (`Release`) rather than a CAS loop. `increment_len` is `fetch_add(1, Release)`; `reset_batch_len` stores `0`, which also means `Waiting`. If another writer is ever added, `set_worker_state` must go back to a CAS loop.
+`batch_len` counts requests pulled into the current batch. The batch size is capped at `u32::MAX`, so state bits are never overwritten. `Acquire` and `Release` are used for ordering.
 
-**Predictor status** — one `AtomicU8`, written only by the inference thread: `Alive`, `Rebuilding` (after a panic, while the factory runs) or `Dead` (the factory kept failing; the thread has exited).
+**Predictor status** — one `AtomicU8`, written only by the inference thread: `Alive`, `Rebuilding` or `Dead`. `Rebuilding` describes the state where a `Predictor` panicked and is rebuilding. `Dead` describes the state where the `Predictor` was unable to be build after retries.
 
 ## Accumulator
 
 Each worker runs `worker_loop` as a detached tokio task:
 
-1. Wait on `recv()` for the first request. The batch timer starts here, not when the previous batch ended, so an idle worker does no work.
-2. Compute the deadline with `checked_add`; a timeout that overflows (for example `Duration::MAX`) falls back to a deadline a year away, so the batch fires only when full. One `sleep_until` is pinned per batch.
+1. Wait on `recv()` for the first request. The batch timer starts here, so an idle worker does no work.
+2. Batch expiration is derived using `tokio::time::sleep_until`.
 3. `select!` between `recv()` and the timer:
-   - New request: push to the buffer, `increment_len`, and `notify_one` (a slot opened in the channel). At `batch_size`, set `Running`.
+   - On new request: push to the buffer, `increment_len`, and `notify_one` to notify when someone is waiting for capacity in the queue. At `batch_size`, set `Running`.
    - Timer: set `Running`.
    - Channel closed: set `Exit` and return.
-4. Swap in a fresh buffer and send the full one over the job channel (depth 1). Swapping lets the next batch accumulate while the thread runs the current one; with one batch running and one queued, the accumulator then waits on `send`, its request channel fills, and the router moves on.
-5. If the send fails, the inference thread is gone: set `Crashed` and return, which drops the request channel's receiver. Otherwise `reset_batch_len` (back to `Waiting`) and loop.
+4. Swap in a fresh buffer and send the full one over the job channel. Swapping lets the next batch accumulate while the thread runs the current one. With one batch running and one queued, the accumulator then waits on `send`, its request channel fills, and the router moves on. In effect, this allows for pipelining.
+5. If the send fails, the inference thread is gone: set `Crashed` and return, which drops the request channel's receiver. Otherwise `reset_batch_len` and loop.
 
 `on_queue_depth` is emitted with the channel backlog just before and just after each hand-off.
+
+A panic in the observability hooks is observed by `PanicGuard` and the accumulators state is set to `WorkerStatus::Crashed` when the `PanicGuard` is dropped. The `PredictorStatus` is also set to `Dead` as the `Predictor` is no longer reachable.
 
 ## Inference thread
 
@@ -143,13 +145,16 @@ Spawned once per worker as `batchinf-inference-worker-{id}`:
 
 1. **Startup**: call the factory with retries and backoff, then report `Ok(())` or a `StartupError` to `get_batcher` over the startup channel. Retries stop early if that channel has closed (startup already failed, timed out, or the `get_batcher` future was dropped).
 2. **Loop** over the job channel with `blocking_recv`:
-   - `filter_canceled` removes requests whose caller has gone (`swap_remove` keeps inputs and result senders paired). An empty batch is skipped.
+   - `filter_canceled` removes requests whose caller has gone when batch is non-empty.
    - Run `predict_batch` inside `catch_unwind`, timing only the call.
-   - On success or error, send results (or the shared error) and emit `on_batch_complete_ok` / `_err`.
-3. **Panic**: set `Rebuilding`, emit `on_worker_panic`, send `InternalError` to the batch, **drop the old predictor** (so two never coexist in device memory), and rebuild from the factory. Retries stop early if the job channel has closed (shutdown). On success set `Alive` and `notify_waiters`; on failure set `Dead`, `notify_waiters`, and exit.
-4. When the job channel closes, finish any queued batch, return (dropping the predictor and factory), then release the shutdown sender.
+   - On success or error, send results or error and emit `on_batch_complete_ok` / `_err`.
+3. **Panic**: set the `Predictor` state to`Rebuilding`, emit `on_worker_panic`, and send `InternalError` to the batch
+    - The old crashed `Predictor` is then dropped and rebuilt from the factory. Retries stop early if the job channel has closed by polling every 20 ms. 
+    - On a success rebuild, the `Predictor` state is set to `Alive` and `notify_waiters`
+    - On a failure the `Predictor` state is set to `Dead`, `notify_waiters` so they can get a `NoAvailableWorkers` error, and exit the loop.
+4. When the job channel closes, exit the loop and shutdown.
 
-Panics outside `predict_batch` (in `BatcherMetrics` hooks or user `Drop` impls) are not caught; the documented contract is that those must not panic.
+Panics outside `predict_batch` are not caught. This is limited to user define observability hooks, thus the documented contract is that those must not panic.
 
 ## WorkerBuffer
 
@@ -159,8 +164,9 @@ struct WorkerBuffer<P: Predictor> {
     input_buffer:  Vec<P::Input>,
 }
 ```
+The property `input_buffer.len() == sender_buffer.len()` must always hold.
 
-Invariant: `input_buffer.len() == sender_buffer.len()`. Both are allocated with capacity `batch_size`. The accumulator moves a full buffer to the inference thread and starts the next batch in a fresh one (`swap_replace`); the thread splits it into inputs, which it moves into `predict_batch`, and result senders, which it keeps to deliver results.
+Both buffers are allocated with capacity `batch_size` on construction. The accumulator moves a full buffer to the inference thread and starts the next batch in a fresh one. The thread splits it into inputs and senders. The inputs are moved to the user defined `predict_batch`, and result senders continue to be owned by the loop until the results are dispatched back to the callers over the `oneshot` channels.
 
 ## Worker pool and routing
 
@@ -172,34 +178,40 @@ pub(crate) struct WorkerPool<Input, Output, Error> {
 }
 ```
 
-A fixed-size slice; slots are never added or removed, and a slot's sender never changes (rebuilds happen inside the inference thread). It is shared through `BatchinfInner`, so it needs no `Arc` of its own.
+A fixed-size slice and a slot's sender is always valid as `Predictors` are rebuilt inplace. It is shared through `BatchinfInner`.
 
 **Routing** (`try_push`), all non-blocking `try_send`:
 
-- Single-worker pools take a fast path.
-- Otherwise pick a start index round-robin (`fetch_add(1, Relaxed) % size`), then:
-  1. Pass 1 tries workers that are `Waiting`, `Alive` and have room in the current batch (`batch_len < batch_size` covers the moment between filling the batch and setting `Running`).
-  2. Pass 2 tries every worker that has not exited or crashed and whose predictor is `Alive`.
-- If both passes fail: `QueueFullError` if any worker was alive or rebuilding, otherwise `NoAvailableWorkersError`.
+- Single-worker pools attempt to forward to the only worker.
+- Otherwise pick a start index round-robin, then:
+  1. Pass 1 tries workers that are `WorkerStatus::Waiting`, `PredictorStatus::Alive` and have room in the current batch as a batch might have just become full. The first worker, if any, that satifies these conditions is selected.
+  2. Pass 2 tries every worker that has not exited or crashed and whose predictor is `Alive`, as a fallback. The first worker that can accept work is selected.
+- If both passes fail, `QueueFullError` is returned if any worker was alive or rebuilding, otherwise `NoAvailableWorkersError` indicating there are currently no workers how can accept work at any point. This will be case when all workers are rebuilding or dead.
 
-**Waiting for room** (`predict`): on `QueueFullError`, register a `Notify` waiter with `enable()` *before* retrying `try_push`, then await it, so a slot freed in between is not missed. Wakeups:
-- `notify_one` on every dequeue: one slot opened, so wake one waiter. Cheap when nobody waits (an atomic, no lock). A woken waiter that is dropped passes its notification on.
-- `notify_waiters` when a rebuild finishes (a whole queue opens up) and when a worker dies (every waiter must see `NoAvailableWorkersError` if it was the last one).
+**Waiting for room** (`predict`): on `QueueFullError`, a `Notify` waiter is registered before retrying `try_push`, then await it, so a slot freed in between is not missed. 
+On wakeups:
+- `notify_one` is called on every dequeue in all accumulators to notify a caller waiting for capacity.
+- `notify_waiters` when a rebuild finishes to indicate another worker can accept work, and when a worker dies to bubble up a `NoAvailableWorkers` if there are no workers currently available after the `Predictor` panic/panic in observability hook in the accumulator.
 
 ## Startup
 
-`get_batcher(factory, config)` is `async`. It creates the workers, then waits on a startup channel carrying `Result<(), StartupError<E>>` from each inference thread. It returns on the first failure, after `startup_timeout`, or once every worker has reported success. On failure the pool is dropped, which shuts down the workers that did start; a factory call already running finishes in the background and its predictor is dropped.
+`get_batcher(factory, config)` creates the workers, then waits on a startup channel carrying `Result<(), StartupError<E>>` from each inference thread. It returns on the first failure, after `startup_timeout`, or once every worker has reported success. 
+
+On failure the pool is dropped, which shuts down the workers that did start and an `Err` is bubbled up. Any factories that are still running are failed.
 
 ## Shutdown
 
-Shutdown is driven entirely by ownership: there is no shutdown flag or command.
+Shutdown is driven entirely by ownership by dropping the channels that forward requests to workers.
 
-1. The last `Batchinf` is dropped, so `BatchinfInner` and the pool are dropped, dropping each worker's request `Sender` — the only one.
-2. Each accumulator's `recv()` returns `None` after any buffered requests; it sets `Exit` and returns, dropping the job channel's `Sender` — again the only one. A partially accumulated batch is dropped: no caller can be waiting on it, since every waiting caller holds a handle.
-3. Each inference thread finishes any queued batch, sees the job channel close, returns (dropping the predictor and factory), and only then drops its clone of the shutdown `watch::Sender`.
+1. When the last `Batchinf` is dropped, `BatchinfInner` is the dropped as the reference count becomes 0. Dropping `BatchinfInner` then drops the pool, which in turn closes all channels after the are drained.
+2. Each accumulator's `recv()` then returns `None` after any buffered requests
+    - The accumulators state is then set to `Exit` and returns
+    - The same mechanism is used in the `Predictor` thread to signal exit.
+3. Each inference thread finishes any queued batch
+    - Then the `watch::Sender` is dropped.
 4. When the last thread exits, the watch channel closes and every `ShutdownWaiter` resolves.
 
-`Batchinf::shutdown_waiter()` returns a cloneable `ShutdownWaiter` holding only the `watch::Receiver`, so it never keeps the batcher alive. No value is ever sent on that channel; `wait()` returns when `changed()` errors because every sender is gone. Shutting down the tokio runtime also triggers the same sequence from step 2, by cancelling the accumulator tasks. To handle `SIGTERM`, stop the server on the signal so it drops its handle.
+`Batchinf::shutdown_waiter()` returns a cloneable `ShutdownWaiter` holding the `watch::Receiver`. Its lifetime is not coupled to the lifetime of `BatchinfInner`. A user can then await the `watch::Receiver` to gracefully exit.
 
 ## Observability
 
@@ -214,14 +226,15 @@ pub trait BatcherMetrics: Send + Sync + 'static {
 }
 ```
 
-Every hook defaults to a no-op, so adding a hook is not a breaking change. `Debug` is not required: the crate implements `Debug` for `dyn BatcherMetrics` itself, which keeps `#[derive(Debug)]` working on `BatcherConfig` and `Batchinf`. Latencies cover `predict_batch` only.
-
 Hooks run inline — `on_batch_trigger` and `on_queue_depth` on the accumulator task, `on_request_timeout` on the caller's task, the rest on the inference thread — so they must be cheap, non-blocking and must not panic.
 
-Set with `BatcherConfigBuilder::metrics` and stored as `Option<Arc<dyn BatcherMetrics>>` in `BatcherConfig::metrics`. `Option<Arc<T>>` uses the null pointer optimisation — `None` is a null pointer, so the presence check in the emit methods is a single null pointer comparison. The only overhead when `Some` is virtual dispatch through the fat pointer.
+Set with `BatcherConfigBuilder::metrics`. Given it is `Option<Arc<dyn BatcherMetrics>`, it is a no-op when not provided. Also, this leverages the null pointer optimization, given that the `Option<T>` only holds a pointer when `Some`.
 
-## Out of scope
+## Logging
+Logging is configurable by a user. The modes can be found in the README.
 
-- Retry/requeue on failure — caller's responsibility.
+## Out of scope (For now)
+
+- Retry/requeue on failure is delegated to the user.
 - Continuous batching / autoregressive generation.
-- Pluggable flush policies beyond count and timeout.
+- Inference trigger policies beyond count and timeout.
