@@ -14,3 +14,5 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 [dev-dependencies]
 # The tests and the doc example run on the multi-thread runtime.
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+# Captures the crate's tracing events in tests/logging.rs.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

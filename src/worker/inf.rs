@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Notify, mpsc::Receiver};
-use tracing::{debug, error, info, info_span, warn};
+use tracing::{debug, error, info, info_span, trace, warn};
 
 // Type alias for the receiver where work is passed from the accumulator.
 pub(super) type JobReceiver<P> = Receiver<WorkerBuffer<P>>;
@@ -221,7 +221,7 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
                     return;
                 }
             };
-            error!("Unable to build Predictor, exiting");
+            warn!("Unable to build Predictor, exiting");
             let _ = ready_tx.blocking_send(Err(err));
             return;
         }
@@ -246,7 +246,7 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
         if buffer.is_empty() {
             continue;
         }
-        info!("Running inference");
+        trace!("Running inference on predictor");
 
         let (inf_input, senders) = buffer.split();
         // Capture panic signal to handle crash and restart.
@@ -310,7 +310,7 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
             }
         };
 
-        info!("Inference successful, returning results to waiters");
+        trace!("Inference successful, returning results to waiters");
         dispatch::send_output::<P>(inf_result, senders, metrics, obs.clone());
     }
 }

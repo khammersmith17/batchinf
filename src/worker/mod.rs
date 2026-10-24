@@ -21,7 +21,7 @@ mod dispatch;
 mod inf;
 use buffer::WorkerBuffer;
 use inf::{InferenceRunnerArgs, spawn_inference_runner};
-use tracing::{Instrument, debug, error, info_span};
+use tracing::{Instrument, debug, error, info, info_span};
 
 pub(crate) type OutputSender<P> =
     OneshotSender<Result<<P as Predictor>::Output, BatchinfError<<P as Predictor>::Error>>>;
@@ -170,7 +170,7 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
     mut input_receiver: InputReceiver<P>,
     handoff: RunnerHandoff<P, E>,
 ) {
-    tracing::info!("Starting accumulator");
+    info!("Starting accumulator");
     // Register the panic guard.
     // Panics could occur in the user defined observability callbacks.
     let _panic_guard = PanicGuard {
@@ -233,7 +233,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
 ) {
     // Wait for first item in batch to start batch timer.
     if let Some((request, sender)) = receiver.recv().await {
-        tracing::info!("Received first item in batch, starting timer");
+        debug!("Received first item in batch, starting timer");
         worker.notify_one();
         buffer.push(request, sender);
         worker.state.increment_len();
@@ -285,7 +285,7 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
 
             }
             _ = &mut timer  => {
-                    tracing::info!("batch triggered by timeout with {} items", buffer.len());
+                    debug!("batch triggered by timeout with {} items", buffer.len());
                     worker.set_running_and_emit(BatchTrigger::Timeout, buffer.len());
                     break;
             }

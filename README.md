@@ -23,4 +23,21 @@ Shutdown is graceful and driven by ownership: dropping the last `Batchinf` handl
 
 To shut down on `SIGTERM` (on Kubernetes, for example), stop your server on the signal so it drops its handle.
 
+## Observability
 Observability is a first class citizen through the `BatcherMetrics` trait, where any observability backend can be used to emit system metrics, see the trait methods for more detail. Pass your implementation to `BatcherConfigBuilder::metrics`. Hooks run inline, so they should be cheap and must not panic. If an observability method panics, it will remove the associated accumulator from the pool. Other workers in the pool, if `pool_size` > 1, will continue.
+
+## Logging
+The crate emits [`tracing`](https://docs.rs/tracing) events under the `batchinf` target. It does not install a subscriber or read any environment variables itself. It is configurable based on your needs.
+
+With `tracing-subscriber`'s `EnvFilter`, for example, run with `RUST_LOG=batchinf=info`, or add `batchinf=info` to your existing filter.
+
+| Level | What is logged |
+|---|---|
+| `error` | A worker stopped serving: its predictor could not be rebuilt, or its batching task failed. |
+| `warn` | [`Predictor::predict_batch`] panicked (with the panic message), a predictor factory call failed (with the error and the delay before the next attempt), or a worker could not start. |
+| `info` | Worker lifecycle: batching tasks and inference threads starting and exiting, predictors built and rebuilt. |
+| `debug` | Per batch: when a batch starts filling and why it fired (full, or timed out). Shutdown cutting a startup or rebuild short. |
+| `trace` | Per batch: inference starting and results being returned. |
+
+Every event from a worker carries a `worker_id` field. Events from the batching task are inside a `batchinf_accumulator` span, and events from the inference thread inside a `batchinf_inference` span. Your own `tracing` calls inside `predict_batch` run in the inference thread's span too, so they are tagged with the worker as well.
+
