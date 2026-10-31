@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/khammersmith17/batchinf"
 keywords = ["batching", "inference", "machine-learning", "tokio", "gpu"]
 categories = ["science", "asynchronous", "concurrency"]
-exclude = ["docs/"]
+exclude = ["docs/", "http-bench/"]
 
 [dependencies]
 thiserror = "2.0.20"
@@ -20,3 +20,8 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 # Captures the crate's tracing events in tests/logging.rs.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[[bench]]
+name = "throughput"
+# A plain binary that prints a throughput table, rather than the unstable libtest bench harness.
+harness = false

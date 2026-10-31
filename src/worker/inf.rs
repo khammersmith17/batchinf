@@ -1,4 +1,4 @@
-use super::{StartAckSender, buffer::WorkerBuffer, dispatch};
+use super::{StartAckSender, buffer::WorkerBuffer, dispatch, panic_guard::PanicGuard};
 use crate::{
     error::StartupError,
     observability::{BatcherMetrics, InfBatchMetrics, emitters},
@@ -171,6 +171,15 @@ pub(super) fn spawn_inference_runner<
     drop(ready_tx);
 }
 
+/// Flush a batch in the queue, returning errors to callers when the predictor is unable to serve
+/// inference on these items to due a crash.
+fn flush_batch<P: Predictor>(recv: &mut JobReceiver<P>) {
+    if let Ok(batch) = recv.try_recv() {
+        let (_, senders) = batch.split();
+        dispatch::send_errors_on_crash::<P>(senders);
+    }
+}
+
 /// The inference runner thread.
 /// Attempt to create the initial instance, and then the main inference loop.
 fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<P, E>) {
@@ -186,6 +195,8 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
         ready_tx,
         signal,
     } = args;
+
+    let _panic_guard = PanicGuard::new(worker_state.clone(), Arc::clone(&signal));
 
     let _span = info_span!("batchinf_inference", worker_id).entered();
     info!("Starting Predictor thread");
@@ -272,6 +283,9 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
                 // They will not be retried here.
                 dispatch::send_errors_on_crash::<P>(senders);
 
+                // If there is a batched queued, flush it as well.
+                flush_batch(&mut batch_recv);
+
                 // Drop predictor while new one is being rebuilt.
                 // Otherwise, memory footprint on the predictor would 2x.
                 drop(predictor);
@@ -295,6 +309,7 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
                             );
                         }
                         worker_state.set_dead();
+
                         // Allows requesters to get a `NoAvailableWorkers`.
                         signal.notify_waiters();
                         return;
@@ -303,6 +318,9 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
 
                 info!("Successfully rebuilt predictor");
                 predictor = new_predictor;
+
+                // Flush a batch the may have queued during predictor rebuild.
+                flush_batch(&mut batch_recv);
                 worker_state.set_predictor_state(PredictorStatus::Alive);
                 // This worker can accept work again.
                 signal.notify_waiters();

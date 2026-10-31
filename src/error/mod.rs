@@ -13,8 +13,12 @@ where
 {
     /// [`Predictor::predict_batch`](`crate::Predictor`) returned an error. The error is propagated to every
     /// caller whose request was part of the failed batch.
-    #[error("Unable to perform inference: {0}")]
-    InferenceError(Arc<E>),
+    ///
+    /// The predictor's error is this error's [`source`](std::error::Error::source), not part of
+    /// its message, so error reporters that print the chain show it once. Match on the variant to
+    /// get the error itself.
+    #[error("Unable to perform inference")]
+    InferenceError(#[source] Arc<E>),
     /// The worker exited before returning a result, typically caused by a panic inside
     /// [`Predictor::predict_batch`](`crate::Predictor`).
     #[error("Internal Error")]

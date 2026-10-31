@@ -8,6 +8,7 @@ on:
       - "Cargo.lock"
       - "src/**"
       - "tests/**"
+      - "benches/**"
   # Also run by the release workflow before publishing, so the checks are defined once.
   workflow_call:
 

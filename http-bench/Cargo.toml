@@ -1,0 +1,13 @@
+[package]
+name = "batchinf-http-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+batchinf = { path = ".." }
+rlimit = "0.11.0"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }

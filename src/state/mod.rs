@@ -170,12 +170,6 @@ impl WorkerStateInner {
         self.worker_state.store(new_state, Ordering::Release);
     }
 
-    fn get_worker_state(&self) -> WorkerStatus {
-        let state_key = self.worker_state.load(Ordering::Acquire);
-        // Ignore length bits to evaluate state.
-        WorkerStatus::from_u8((state_key >> 62) as u8)
-    }
-
     fn set_predictor_state(&self, state: PredictorStatus) {
         let state = state.to_u8();
         self.predictor_state.store(state, Ordering::Release);
@@ -276,12 +270,12 @@ impl WorkerState {
         self.inner.set_worker_state(state);
     }
 
-    pub(crate) fn get_worker_state(&self) -> WorkerStatus {
-        self.inner.get_worker_state()
-    }
-
     pub(crate) fn set_predictor_state(&self, state: PredictorStatus) {
         self.inner.set_predictor_state(state);
+    }
+
+    pub(crate) fn get_predictor_state(&self) -> PredictorStatus {
+        self.inner.get_predictor_state()
     }
 
     pub(crate) fn can_accept_primary(&self) -> bool {
