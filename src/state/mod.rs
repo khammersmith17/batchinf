@@ -43,12 +43,12 @@ pub enum WorkerStatus {
     Waiting = 0,
     /// The worker has exited and is no longer accepting requests.
     Exit = 1,
-    /// A full batch is ready and is being handed to the inference thread. The worker stays in this
+    /// A batch is ready and is being handed to the inference thread. The worker stays in this
     /// state while the inference thread is busy and already has a batch queued.
     Running = 2,
     /// The worker's inference thread is gone, so batches can no longer be handed off. The worker
-    /// has stopped and no longer accepts requests. This is caused by the predictor crashing and no
-    /// recovering, or a panic in the observability callbacks.
+    /// has stopped and no longer accepts requests. Its predictor is reported as
+    /// [`PredictorStatus::Dead`].
     Crashed = 3,
 }
 
@@ -78,11 +78,12 @@ mod predictor_codes {
     pub(super) const ALIVE: u8 = 0_u8;
     // Predictor crashed but is being rebuilt.
     pub(super) const REBUILDING: u8 = 1_u8;
-    // Rebuild of a predictor was unsuccessful, and the predictor no longer services work.
+    // The predictor could not be built or rebuilt, or a metrics callback panicked, and the
+    // worker no longer services work.
     pub(super) const DEAD: u8 = 2_u8;
 }
 
-/// The state of a worker's predictor, owned by the worker's inference thread.
+/// The state of a worker's predictor, set by the worker's inference thread.
 ///
 /// Reported alongside [`WorkerStatus`] in [`WorkerSnapshot`]. The router only sends new requests
 /// to workers whose predictor is [`PredictorStatus::Alive`].
@@ -92,13 +93,16 @@ pub enum PredictorStatus {
     /// The predictor is built and serving batches.
     Alive = 0,
     /// [`Predictor::predict_batch`](`crate::Predictor::predict_batch`) panicked and the predictor
-    /// is being rebuilt from the factory. Requests already queued on this worker wait for the
-    /// rebuild; new requests are routed elsewhere, or get
+    /// is being rebuilt from the factory. Requests already queued on this worker fail with
+    /// [`BatchinfError::InternalError`](`crate::BatchinfError::InternalError`) instead of waiting
+    /// for the rebuild. New requests are routed elsewhere, or get
     /// [`BatchinfError::QueueFullError`](`crate::BatchinfError::QueueFullError`) if no other
     /// worker can take them.
     Rebuilding = 1,
-    /// The factory failed repeatedly, at startup or during a rebuild. The inference thread has
-    /// exited and this worker will not serve any more requests.
+    /// This worker will not serve any more requests. Either the factory failed repeatedly, at
+    /// startup or during a rebuild, or a metrics callback panicked on one of the worker's tasks.
+    /// Requests already queued on it fail with
+    /// [`BatchinfError::InternalError`](`crate::BatchinfError::InternalError`).
     Dead = 2,
 }
 
@@ -132,7 +136,7 @@ pub struct WorkerSnapshot {
 }
 
 /// Struct to store inner worker state.
-/// State that will be shared and wrapped in Arc<T>.
+/// State that will be shared and wrapped in `Arc<T>`.
 #[derive(Debug)]
 struct WorkerStateInner {
     // State is stored in the 2 MSB here atomic load/store.

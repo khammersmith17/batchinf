@@ -19,8 +19,14 @@ where
     /// get the error itself.
     #[error("Unable to perform inference")]
     InferenceError(#[source] Arc<E>),
-    /// The worker exited before returning a result, typically caused by a panic inside
-    /// [`Predictor::predict_batch`](`crate::Predictor`).
+    /// The request could not be served by the worker it was queued on. Returned when:
+    ///
+    /// - [`Predictor::predict_batch`](`crate::Predictor`) panicked on the batch holding the
+    ///   request.
+    /// - The request was waiting on a worker whose predictor panicked or went
+    ///   [`Dead`](`crate::PredictorStatus::Dead`). Waiting requests fail straight away rather than
+    ///   wait for the predictor to be rebuilt.
+    /// - The worker exited before returning a result.
     #[error("Internal Error")]
     InternalError,
     /// The deadline passed before a result arrived. Only returned by

@@ -23,12 +23,17 @@ pub enum BatchTrigger {
 ///
 /// Implementations must not panic. Unlike a panic in
 /// [`Predictor::predict_batch`](`crate::Predictor::predict_batch`), which the worker recovers
-/// from, a panic in a hook is not caught and stops the worker.
+/// from, a panic in a hook is not caught and stops the worker: its predictor is reported as
+/// [`PredictorStatus::Dead`](`crate::PredictorStatus::Dead`), and requests queued on it fail.
 #[allow(unused_variables)]
 pub trait BatcherMetrics: Send + Sync + 'static {
-    /// Fires at the point a batch is triggered to fire. Takes in the trigger type, [BatchTrigger].
-    /// This may provide some information that can help tune the batch size and the timeout for a
-    /// batch.
+    /// Fires when a batch is handed to the inference thread. Takes in the trigger type,
+    /// [BatchTrigger]. This may provide some information that can help tune the batch size and
+    /// the timeout for a batch.
+    ///
+    /// A batch that is failed instead of run, because its worker's predictor panicked or died, is
+    /// not reported. If the inference thread is busy with a batch already queued, this fires
+    /// once there is room, which can be a while after the batch filled or timed out.
     ///
     /// `batch_size` is the number of requests accumulated when the batch fired. Requests that
     /// were cancelled while waiting are removed just before inference, so the size reported by

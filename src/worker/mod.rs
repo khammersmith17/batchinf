@@ -34,30 +34,39 @@ type JobSender<P> = Sender<WorkerBuffer<P>>;
 pub(crate) type StartAckSender<E> = Sender<Result<(), StartupError<E>>>;
 
 // One batch queued while one runs on the inference thread. When both slots are taken, the
-// accumulator waits on `send`, its request channel fills, and the router moves on to other workers.
+// accumulator waits in `reserve`, its request channel fills, and the router moves on to other
+// workers.
 const JOB_QUEUE_DEPTH: usize = 1;
 
 // Far out timeout for when a user specifies Duration::MAX as a batch timeout.
 // This is a valid design choice by a user: only perform inference once the batch size is reached.
 const ONE_YEAR: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 
-/// Describes that status of an accumulated batch.
+/// How accumulating a batch ended.
 enum BatchStatus<P: Predictor> {
-    /// Batch is ready for inference
+    /// The batch is ready to hand to the inference thread.
     Ready {
         buffer: WorkerBuffer<P>,
         trigger: BatchTrigger,
     },
-    /// The batch has been flushed and erros returned to the callers.
-    /// This occurs when the predictor is no longer able to serve inference.
+    /// The predictor was not `Alive` when the batch triggered, so the batch and every request
+    /// waiting in the request channel were failed with `InternalError`.
     Flushed,
-    /// When the channel has been closed.
+    /// The request channel closed, so the worker is shutting down. Any requests left in the
+    /// batch were already cancelled, since a live request holds a handle that keeps the channel
+    /// open.
     Exit,
 }
 
+/// How handing a ready batch to the inference thread ended.
 enum BatchHandoffResult {
+    /// The batch is in the job channel.
     Sent,
+    /// The predictor stopped being `Alive` while the batch waited for the job slot, so the batch
+    /// and every request waiting in the request channel were failed with `InternalError`.
     Flushed,
+    /// The job channel's receiver is gone: the inference thread has exited, either because its
+    /// predictor is `Dead` or because it panicked outside `predict_batch`.
     Dead,
 }
 
@@ -104,6 +113,8 @@ impl InferenceWorker {
         emitters::emit_queue_depth(self.obs.clone(), self.worker_id, input_receiver.len());
     }
 
+    // Report an empty queue for a worker that is about to stop, so the gauge does not keep the
+    // last backlog it reported.
     fn emit_empty_queue(&self) {
         emitters::emit_queue_depth(self.obs.clone(), self.worker_id, 0_usize);
     }
@@ -169,9 +180,10 @@ fn make_runner<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
 // The main worker loop.
 //
 // Accumulate inference examples from request writers until batch conditions are satisfied,
-// then dispatch inference.
+// then hand the batch to the inference thread.
 //
-// After inference, the state is evaluated to determine if the worker should continue.
+// Runs until the request channel closes (shutdown) or the inference thread is gone. A batch that
+// cannot run because the predictor is not `Alive` is failed, and the loop carries on.
 async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
     worker: InferenceWorker,
     mut input_receiver: InputReceiver<P>,
@@ -179,7 +191,7 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
 ) {
     info!("Starting accumulator");
     // Register the panic guard.
-    // Panics could occur in the user defined observability callbacks.
+    // Panics could occur in the user defined observability callbacks that run on this task.
     let _panic_guard = PanicGuard::new(worker.state.clone(), Arc::clone(&worker.signal));
     let cap = worker.state.batch_size() as usize;
     let mut next_inf = Instant::now();
@@ -198,7 +210,10 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
         match batch_result {
             BatchStatus::Ready { buffer, trigger } => {
                 let buffer_len = buffer.len();
+                // Set before the handoff, so the router's first pass skips this worker while it
+                // waits for the job slot.
                 worker.state.set_worker_state(WorkerStatus::Running);
+                // Backlog behind the batch that is about to be handed off.
                 worker.emit_queue_depth(&input_receiver);
                 // Waits here while the inference thread is busy and a batch is already queued.
                 let handoff_result =
@@ -208,23 +223,25 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
                         // The inference thread is gone. Returning drops the request receiver, so the
                         // router sees this worker as closed and queued requests get InternalError.
                         error!("inference thread is gone, marking worker as WorkerStatus::Crashed");
-                        // The queue is now empty and this value will not emit again for this
-                        // worker.
-                        // Emitting an empty queue here to represent the state.
+                        // This worker never reports its queue again, so report it empty rather
+                        // than leave the gauge at the last backlog.
                         worker.emit_empty_queue();
                         worker.state.set_worker_state(WorkerStatus::Crashed);
                         return;
                     }
-                    BatchHandoffResult::Sent => {
-                        // Backlog that built up while waiting on a busy or rebuilding inference thread.
-                        worker.emit_batch_start(trigger, buffer_len);
+                    // Only a batch that will run reports a trigger.
+                    BatchHandoffResult::Sent => worker.emit_batch_start(trigger, buffer_len),
+                    BatchHandoffResult::Flushed => {
+                        debug!("Inference requests flushed, predictor unavailable")
                     }
-                    // Emit queue depth again to the value emitted is fresh.
-                    // When the predictor is being rebuilt, it will not be emitted for some time.
-                    BatchHandoffResult::Flushed => worker.emit_queue_depth(&input_receiver),
                 }
 
-                // Batch handed off or flushed. Signal that this worker can accept a new batch.
+                // [BatcherMetrics] trait contract dictates that queue depth is emitted after every
+                // handoff between the accumulator and the inference predictor.
+                worker.emit_queue_depth(&input_receiver);
+
+                // The batch was handed off or failed, so the buffer is empty. Signal that this
+                // worker can accept a new batch.
                 worker.state.reset_batch_len();
             }
             BatchStatus::Flushed => continue,
@@ -235,9 +252,11 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
 
 /// Accumulate the next batch of inference data.
 /// Starts timer for the batch upon receiving the first record for the batch.
-/// Sets state to Running when the batch is ready, or Exit when the channel closes.
 ///
-/// The buffer is either non empty after this function completes, or the worker is being shut down.
+/// The batch ends when it is full, its timeout fires, or the inference thread exits. It is then
+/// returned as [`BatchStatus::Ready`], or failed and reported as [`BatchStatus::Flushed`] if the
+/// predictor is not `Alive`. Returns [`BatchStatus::Exit`], with the state set to Exit, when the
+/// request channel closes. `buffer` is left empty in every case.
 #[must_use]
 async fn accumulate_next_batch<P: Predictor + 'static>(
     receiver: &mut InputReceiver<P>,
@@ -298,7 +317,6 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
 
                         debug!("batch triggered by size in {} milliseconds",
                             batch_start.elapsed().as_millis());
-                        // Set state and emit trigger.
                         break;
                     }
 
@@ -313,7 +331,8 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
                     debug!("batch triggered by timeout with {} items", buffer.len());
                     break;
             }
-            // Wake the accumulator when the predictor goes dead.
+            // The inference thread exited (its predictor is Dead), so this batch can never run.
+            // End it now so its requests fail straight away rather than at the batch timeout.
             _ = job_tx.closed() => break
 
         }
@@ -331,13 +350,15 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
     }
 }
 
+/// Returns the predictor's status. If it is not `Alive`, first fails the current batch and every
+/// request waiting in the request channel with `InternalError`, and resets the batch length.
 fn check_predictor_alive<P: Predictor>(
     state: &WorkerState,
     receiver: &mut InputReceiver<P>,
     buffer: &mut WorkerBuffer<P>,
 ) -> PredictorStatus {
     let predictor_state = state.get_predictor_state();
-    // If the predictor has crashed since the router read its state when resolving to this worker.
+    // The predictor went down after these requests were routed to this worker.
     if matches!(
         predictor_state,
         PredictorStatus::Rebuilding | PredictorStatus::Dead
@@ -350,13 +371,12 @@ fn check_predictor_alive<P: Predictor>(
     predictor_state
 }
 
-/// When the inference worker crashes, all requests queued in the current batch are failed as the
-/// worker they were dispatch to is not currently available.
+/// Fails the current batch and every request waiting in the request channel with `InternalError`,
+/// because the predictor they were routed to cannot serve them. Requests do not wait for a rebuild.
+/// Leaves `buffer` empty.
 fn handle_crashed_inf<P: Predictor>(receiver: &mut InputReceiver<P>, buffer: &mut WorkerBuffer<P>) {
-    // Drain the reciever. ALl currently queued requests fail as the worker is not
-    // available.
-    // This worker should also not be routed any new requests, as the resolver now will not forward
-    // requests to this workers queue.
+    // Drain the receiver. New requests are not routed here while the predictor is not `Alive`,
+    // so this only catches requests routed before it went down.
     while let Ok((inp, sender)) = receiver.try_recv() {
         buffer.push(inp, sender);
     }
@@ -365,7 +385,16 @@ fn handle_crashed_inf<P: Predictor>(receiver: &mut InputReceiver<P>, buffer: &mu
     dispatch::send_errors_on_crash::<P>(senders);
 }
 
-/// Forward the buffer to the inference thread.
+/// Hands a ready batch to the inference thread, or fails it if the predictor is not `Alive` by the
+/// time a job slot is free.
+///
+/// The wait for the slot and the send are split with `reserve`, so the predictor check happens
+/// after the wait, at the moment of handoff. A batch that waited while the predictor panicked is
+/// failed here instead of landing in the job channel and waiting out the rebuild.
+///
+/// One narrow race remains: if the predictor panics between the check and `permit.send`, the batch
+/// lands in the job channel after the inference thread's post-panic flush. The inference thread
+/// fails it after the rebuild.
 async fn run_inference<P: Predictor>(
     mut buffer: WorkerBuffer<P>,
     job_sender: &JobSender<P>,

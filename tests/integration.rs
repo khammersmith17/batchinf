@@ -762,9 +762,9 @@ async fn test_multi_worker_one_panic_others_serve() {
         .collect();
     let results = join(handles).await;
 
-    // All concurrent requests may have been queued to the panicking worker before its state
-    // was set to Crashed. The recovery guarantee is that the worker restarts, not that every
-    // in-flight request succeeds. Assert that at least some requests were served by other workers.
+    // Requests queued on the panicking worker before it was marked Rebuilding fail with
+    // InternalError. The recovery guarantee is that the worker restarts, not that every in-flight
+    // request succeeds. Assert that at least some requests were served by other workers.
     let successes = results.iter().filter(|r| r.is_ok()).count();
     assert!(
         successes > 0,
@@ -2276,12 +2276,16 @@ struct QueuedAtPanic {
 
 /// Fills every place a request can wait on a single worker, then lets the predictor panic.
 ///
-/// Timeline (ms), batch size 4: batch A is sent at 0 and runs until it panics at ~200. Batch B
-/// (sent at 20) fills the inference thread's job slot. Batch C (40) fills, and the accumulator
-/// blocks handing it off. Requests D (60, three of them, so no batch fills) wait in the request
-/// channel. The rebuild then takes ~200ms.
-async fn queue_behind_panic(metrics: Option<Arc<dyn BatcherMetrics>>) -> QueuedAtPanic {
-    let mut builder = config_builder(4, 50, 1);
+/// Timeline (ms): batch A is sent at 0 and runs until it panics at ~200. Batch B (sent at 20)
+/// fills the inference thread's job slot. Batch C (40) fills, and the accumulator blocks handing it
+/// off. Requests D (60, three of them, so no batch of 4 fills) wait in the request channel, since
+/// the accumulator is blocked. Each of A, B and C holds `batch_size` requests. The rebuild then
+/// takes ~200ms.
+async fn queue_behind_panic(
+    batch_size: u32,
+    metrics: Option<Arc<dyn BatcherMetrics>>,
+) -> QueuedAtPanic {
+    let mut builder = config_builder(batch_size, 50, 1);
     builder.queue_size(NonZeroU32::new(16).unwrap());
     if let Some(m) = metrics {
         builder.metrics(m);
@@ -2302,13 +2306,14 @@ async fn queue_behind_panic(metrics: Option<Arc<dyn BatcherMetrics>>) -> QueuedA
             .collect()
     };
     let gap = Duration::from_millis(20);
-    let a = send(0..4);
+    let n = u64::from(batch_size);
+    let a = send(0..n);
     tokio::time::sleep(gap).await;
-    let b = send(10..14);
+    let b = send(1_000..1_000 + n);
     tokio::time::sleep(gap).await;
-    let c = send(20..24);
+    let c = send(2_000..2_000 + n);
     tokio::time::sleep(gap).await;
-    let d = send(30..33);
+    let d = send(3_000..3_003);
 
     let outcomes = |results: Vec<(u64, Result<u64, BatchinfError<TestError>>)>| -> Vec<Outcome> {
         results.iter().map(|(i, r)| outcome(r, *i)).collect()
@@ -2320,7 +2325,7 @@ async fn queue_behind_panic(metrics: Option<Arc<dyn BatcherMetrics>>) -> QueuedA
         let handing_off = outcomes(join(c).await);
         let in_channel = outcomes(join(d).await);
         // `predict` waits out any rest of the rebuild before it is queued.
-        let after = outcome(&batcher.predict(40).await, 40);
+        let after = outcome(&batcher.predict(4_000).await, 4_000);
         QueuedAtPanic {
             running,
             in_job_slot,
@@ -2334,12 +2339,11 @@ async fn queue_behind_panic(metrics: Option<Arc<dyn BatcherMetrics>>) -> QueuedA
 }
 
 // Requests that were only waiting when a predictor panicked, and never reached it, should all
-// get the same treatment: either every one of them fails fast, or every one waits for the
-// rebuild and is served. Which one depends on where in the worker a request happened to be
-// waiting.
+// get the same treatment, whichever part of the worker they were waiting in: either every one of
+// them fails fast, or every one waits for the rebuild and is served.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_requests_queued_at_panic_share_one_outcome() {
-    let q = queue_behind_panic(None).await;
+    let q = queue_behind_panic(4, None).await;
 
     assert!(
         q.running.iter().all(|o| *o == Outcome::InternalError),
@@ -2371,7 +2375,7 @@ async fn test_requests_queued_at_panic_share_one_outcome() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_no_empty_batch_triggers_after_panic() {
     let sizes = Arc::new(TriggerSizes::default());
-    queue_behind_panic(Some(sizes.clone())).await;
+    queue_behind_panic(4, Some(sizes.clone())).await;
 
     let sizes = sizes.0.lock().unwrap();
     assert!(
@@ -2520,4 +2524,551 @@ async fn test_inference_thread_panic_marks_predictor_dead() {
         ),
         "no request should be routed to a worker whose inference thread is gone"
     );
+}
+
+/// Panics in its first `on_queue_depth` call, which runs on the accumulator task just before a
+/// batch is handed off.
+#[derive(Default)]
+struct PanicOnFirstQueueDepth(AtomicBool);
+
+impl BatcherMetrics for PanicOnFirstQueueDepth {
+    fn on_queue_depth(&self, _worker_id: u8, _queue_depth: usize) {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            panic!("intentional panic in a metrics callback");
+        }
+    }
+}
+
+// A panic in a metrics callback on the accumulator task ends that task. The predictor must be
+// reported Dead, and every request on that worker must fail rather than hang: the batch being
+// handed off, and the requests waiting in the request channel, whose receiver the task dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_accumulator_hook_panic_fails_queued_requests() {
+    let batcher = get_batcher(
+        factory(EchoPredictor),
+        config_builder(1, 10, 1)
+            .queue_size(NonZeroU32::new(8).unwrap())
+            .metrics(Arc::new(PanicOnFirstQueueDepth::default()))
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    // The first request's handoff panics. The rest are either already in the request channel by
+    // then, or are sent after the predictor is Dead and rejected.
+    let handles: Vec<_> = (0..5u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await })
+        })
+        .collect();
+    let results = tokio::time::timeout(Duration::from_secs(2), join(handles))
+        .await
+        .expect("no request should hang after the accumulator panicked");
+    assert!(
+        results.iter().all(|r| matches!(
+            r,
+            Err(BatchinfError::InternalError | BatchinfError::NoAvailableWorkersError)
+        )),
+        "every request should fail once the accumulator is gone: {results:?}"
+    );
+
+    assert!(
+        wait_for_predictor_status(&batcher, 0, PredictorStatus::Dead, Duration::from_secs(2)).await,
+        "the predictor should be reported Dead once its accumulator is gone, got {:?}",
+        batcher.worker_status(0).unwrap()
+    );
+    assert!(
+        matches!(
+            batcher.try_predict(9).await,
+            Err(BatchinfError::NoAvailableWorkersError)
+        ),
+        "no request should be routed to a worker whose accumulator is gone"
+    );
+}
+
+// With several workers, a metrics callback panicking on one worker's accumulator takes only that
+// worker out of the pool. The others serve every request after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_accumulator_hook_panic_other_workers_serve() {
+    let batcher = get_batcher(
+        factory(EchoPredictor),
+        config_builder(1, 10, 2)
+            .queue_size(NonZeroU32::new(32).unwrap())
+            .metrics(Arc::new(PanicOnFirstQueueDepth::default()))
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let first = batcher.predict(0).await;
+    assert!(
+        matches!(first, Err(BatchinfError::InternalError)),
+        "the request whose handoff panicked should fail: {first:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let dead = loop {
+        let dead: Vec<usize> = (0..2)
+            .filter(|i| {
+                batcher.worker_status(*i).unwrap().predictor_status == PredictorStatus::Dead
+            })
+            .collect();
+        if !dead.is_empty() || Instant::now() >= deadline {
+            break dead;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(dead.len(), 1, "exactly one worker should be Dead: {dead:?}");
+
+    let handles: Vec<_> = (1..=20u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { (i, b.predict(i).await) })
+        })
+        .collect();
+    let results = join(handles).await;
+    assert!(
+        results.iter().all(|(i, r)| matches!(r, Ok(v) if v == i)),
+        "the healthy worker should serve every request: {results:?}"
+    );
+}
+
+// The fail-fast behavior with batch size 1, where a batch triggers as soon as its first request
+// arrives. Requests waiting behind a panic fail with InternalError, and the worker serves again
+// once the rebuild finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_batch_size_one_requests_queued_at_panic_fail_fast() {
+    let q = queue_behind_panic(1, None).await;
+
+    let waiting: Vec<Outcome> = [&q.running, &q.in_job_slot, &q.handing_off, &q.in_channel]
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert!(
+        waiting.iter().all(|o| *o == Outcome::InternalError),
+        "every request queued at the panic should fail with InternalError: running {:?}, job slot \
+         {:?}, handing off {:?}, request channel {:?}",
+        q.running,
+        q.in_job_slot,
+        q.handing_off,
+        q.in_channel
+    );
+    assert_eq!(
+        q.after,
+        Outcome::Served,
+        "the worker should serve requests again once the rebuild finishes"
+    );
+}
+
+/// Added to an output to record which worker served it.
+const WORKER_TAG: u64 = 1_000_000;
+
+/// Echoes each input plus `worker_id * WORKER_TAG`, counts every request it receives, and sleeps
+/// `delay` per batch. With `panic_once`, it instead panics after the sleep on the first batch any
+/// predictor sharing the flag sees, and serves later batches without sleeping.
+struct TaggedPredictor {
+    worker_id: u8,
+    received: Arc<AtomicU32>,
+    panic_once: Option<Arc<AtomicBool>>,
+    delay: Duration,
+}
+
+impl Predictor for TaggedPredictor {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
+        self.received.fetch_add(inp.len() as u32, Ordering::SeqCst);
+        match &self.panic_once {
+            Some(flag) => {
+                if !flag.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(self.delay);
+                    panic!("intentional panic during inference");
+                }
+            }
+            None => std::thread::sleep(self.delay),
+        }
+        let tag = u64::from(self.worker_id) * WORKER_TAG;
+        Ok(inp.into_iter().map(|x| x + tag).collect())
+    }
+}
+
+// With several workers, a panic fails only the requests queued on the panicking worker. Every
+// request the healthy worker received is served, nothing hangs, and the panicking worker rejoins
+// the pool after its rebuild.
+//
+// Worker 0 sleeps 300ms on its first batch and then panics; its rebuild takes 500ms. Worker 1
+// takes 20ms per batch, so it is often busy and the router also queues requests on worker 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_panic_fails_only_the_panicking_workers_requests() {
+    let received = [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))];
+    let factory_received = received.clone();
+    let panicked = Arc::new(AtomicBool::new(false));
+    let worker_zero_builds = AtomicU32::new(0);
+    let batcher = get_batcher(
+        Arc::new(move |worker_id: u8| {
+            let zero = worker_id == 0;
+            if zero && worker_zero_builds.fetch_add(1, Ordering::SeqCst) > 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Ok::<_, TestError>(TaggedPredictor {
+                worker_id,
+                received: Arc::clone(&factory_received[usize::from(worker_id)]),
+                panic_once: zero.then(|| Arc::clone(&panicked)),
+                delay: Duration::from_millis(if zero { 300 } else { 20 }),
+            })
+        }),
+        config_builder(1, 10, 2)
+            .queue_size(NonZeroU32::new(8).unwrap())
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let send = |i: u64| {
+        let b = batcher.clone();
+        tokio::spawn(async move { (i, b.predict(i).await) })
+    };
+    // Send requests one at a time until one reaches worker 0, which then starts its 300ms sleep.
+    let mut handles = Vec::new();
+    for i in 0..50u64 {
+        handles.push(send(i));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if received[0].load(Ordering::SeqCst) > 0 {
+            break;
+        }
+    }
+    assert!(
+        received[0].load(Ordering::SeqCst) > 0,
+        "a request should have reached worker 0"
+    );
+    // While worker 0 sleeps, a burst that queues on both workers.
+    handles.extend((100..130u64).map(send));
+
+    let results = tokio::time::timeout(Duration::from_secs(5), join(handles))
+        .await
+        .expect("no request should hang");
+    let mut failed = 0;
+    let mut served = [0u32; 2];
+    for (i, result) in &results {
+        match result {
+            Ok(v) if v % WORKER_TAG == *i => served[(v / WORKER_TAG) as usize] += 1,
+            Err(BatchinfError::InternalError) => failed += 1,
+            other => panic!("request {i} got an unexpected result: {other:?}"),
+        }
+    }
+    assert!(
+        failed > 1,
+        "requests queued on worker 0 should fail along with the batch that panicked, but only \
+         {failed} failed"
+    );
+    assert_eq!(
+        received[1].load(Ordering::SeqCst),
+        served[1],
+        "every request worker 1 received should have been served"
+    );
+
+    assert!(
+        wait_for_predictor_status(&batcher, 0, PredictorStatus::Alive, Duration::from_secs(3))
+            .await,
+        "worker 0 should finish its rebuild"
+    );
+    // Idle workers are tried round-robin, so sequential requests alternate between them.
+    let mut rejoined = false;
+    for i in 200..210u64 {
+        let v = batcher.predict(i).await.unwrap();
+        if v / WORKER_TAG == 0 {
+            rejoined = true;
+            break;
+        }
+    }
+    assert!(
+        rejoined,
+        "worker 0 should serve requests again after its rebuild"
+    );
+}
+
+/// Records every queue depth and counts triggers and failed completions. With `panic_on_first_ok`,
+/// panics in the first `on_batch_complete_ok` call, on the inference thread.
+#[derive(Default)]
+struct QueueMetrics {
+    depths: std::sync::Mutex<Vec<usize>>,
+    triggers: AtomicU32,
+    err_completions: AtomicU32,
+    panic_on_first_ok: bool,
+    panicked: AtomicBool,
+}
+
+impl QueueMetrics {
+    fn depths(&self) -> Vec<usize> {
+        self.depths.lock().unwrap().clone()
+    }
+}
+
+impl BatcherMetrics for QueueMetrics {
+    fn on_batch_trigger(&self, _batch_size: usize, _trigger: BatchTrigger) {
+        self.triggers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_batch_complete_ok(&self, _batch_size: usize, _latency: Duration) {
+        if self.panic_on_first_ok && !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("intentional panic in a metrics callback");
+        }
+    }
+
+    fn on_batch_complete_err(&self, _batch_size: usize, _latency: Duration) {
+        self.err_completions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_queue_depth(&self, _worker_id: u8, queue_depth: usize) {
+        self.depths.lock().unwrap().push(queue_depth);
+    }
+}
+
+/// Sleeps `delay` on each of its first two batches, and panics on the second. The call count is
+/// shared across rebuilds.
+struct PanicOnSecondBatch {
+    calls: Arc<AtomicU32>,
+    delay: Duration,
+}
+
+impl Predictor for PanicOnSecondBatch {
+    type Input = u64;
+    type Output = u64;
+    type Error = TestError;
+
+    fn predict_batch(&mut self, inp: Vec<u64>) -> Result<Vec<u64>, TestError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call < 2 {
+            std::thread::sleep(self.delay);
+        }
+        if call == 1 {
+            panic!("intentional panic during inference");
+        }
+        Ok(inp)
+    }
+}
+
+// The queue-depth gauge keeps its last value, so after the request channel is drained by a flush
+// it must report 0. Otherwise it shows the pre-flush backlog for the whole rebuild. Flushed
+// batches report no trigger and no failed completion.
+//
+// Timeline (ms), batch size 4: batch A (sent at 0) runs until ~200 and succeeds. Batch B (20) fills
+// the job slot, and batch C (40) blocks in `reserve`. Seven requests D (60) pile up in the request
+// channel. At ~200 B starts running, C is sent, and the accumulator reports the 7 that built up,
+// then takes 4 of them as the next batch and reports the 3 left behind before blocking in
+// `reserve` again. At ~400 B panics: B fails, C is failed from the job slot, and the blocked batch
+// fails at its handoff along with the 3 in the channel. The rebuild then runs until ~900.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_queue_depth_is_zero_after_a_flush() {
+    let metrics = Arc::new(QueueMetrics::default());
+    let calls = Arc::new(AtomicU32::new(0));
+    let built_once = AtomicBool::new(false);
+    let batcher = get_batcher(
+        Arc::new(move |_worker_id| {
+            if built_once.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Ok::<_, TestError>(PanicOnSecondBatch {
+                calls: Arc::clone(&calls),
+                delay: Duration::from_millis(200),
+            })
+        }),
+        config_builder(4, 50, 1)
+            .queue_size(NonZeroU32::new(16).unwrap())
+            .metrics(metrics.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let send = |inputs: std::ops::Range<u64>| -> Vec<_> {
+        inputs
+            .map(|i| {
+                let b = batcher.clone();
+                tokio::spawn(async move { (i, b.predict(i).await) })
+            })
+            .collect()
+    };
+    let gap = Duration::from_millis(20);
+    let a = send(0..4);
+    tokio::time::sleep(gap).await;
+    let b = send(10..14);
+    tokio::time::sleep(gap).await;
+    let c = send(20..24);
+    tokio::time::sleep(gap).await;
+    let d = send(30..37);
+
+    let (a, rest) = tokio::time::timeout(Duration::from_secs(2), async {
+        let a = join(a).await;
+        let mut rest = join(b).await;
+        rest.extend(join(c).await);
+        rest.extend(join(d).await);
+        (a, rest)
+    })
+    .await
+    .expect("every request should complete before the rebuild finishes");
+    assert!(
+        a.iter().all(|(i, r)| matches!(r, Ok(v) if v == i)),
+        "batch A ran before the panic and should be served: {a:?}"
+    );
+    assert!(
+        rest.iter()
+            .all(|(_, r)| matches!(r, Err(BatchinfError::InternalError))),
+        "every request queued behind the panic should fail with InternalError: {rest:?}"
+    );
+
+    // The rebuild is still running, so nothing has been reported since the flush.
+    let depths = metrics.depths();
+    assert!(
+        depths.contains(&3),
+        "the backlog left behind the blocked batch should have been reported: {depths:?}"
+    );
+    assert_eq!(
+        depths.last(),
+        Some(&0),
+        "the queue depth should be reported as 0 after the flush: {depths:?}"
+    );
+    assert_eq!(
+        metrics.triggers.load(Ordering::SeqCst),
+        3,
+        "batches A, B and C were handed to the inference thread; the flushed batch was not"
+    );
+    assert_eq!(
+        metrics.err_completions.load(Ordering::SeqCst),
+        0,
+        "no batch completed with an error"
+    );
+}
+
+// When the inference thread is gone while the accumulator waits to hand off a batch, the
+// accumulator fails what it holds and stops for good, so it reports an empty queue on the way
+// out. Otherwise the gauge keeps the last backlog forever.
+//
+// Batch size 1: request 1 runs (100ms), request 2 fills the job slot, request 3 blocks in
+// `reserve`, and the last two wait in the request channel, so the handoff of request 3 reports a
+// backlog of 2. Request 1's completion callback then panics, which ends the inference thread.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_queue_depth_is_zero_after_inference_thread_dies() {
+    let metrics = Arc::new(QueueMetrics {
+        panic_on_first_ok: true,
+        ..QueueMetrics::default()
+    });
+    let marker = Arc::new(());
+    let batcher = get_batcher(
+        factory_slow_marked(Arc::clone(&marker), Duration::from_millis(100)),
+        config_builder(1, 10, 1)
+            .queue_size(NonZeroU32::new(8).unwrap())
+            .metrics(metrics.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let handles: Vec<_> = (0..5u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await })
+        })
+        .collect();
+    let results = tokio::time::timeout(Duration::from_secs(2), join(handles))
+        .await
+        .expect("no request should hang after the inference thread died");
+    assert!(
+        results
+            .iter()
+            .all(|r| matches!(r, Err(BatchinfError::InternalError))),
+        "every request should fail with InternalError: {results:?}"
+    );
+
+    let depths = metrics.depths();
+    assert!(
+        depths.iter().any(|d| *d > 0),
+        "a backlog should have been reported before the thread died: {depths:?}"
+    );
+    assert_eq!(
+        depths.last(),
+        Some(&0),
+        "the queue depth should be reported as 0 once the worker stops: {depths:?}"
+    );
+}
+
+/// Factory for [`SlowMarkedPredictor`]s that share `marker` and sleep `delay` per batch.
+fn factory_slow_marked(
+    marker: Arc<()>,
+    delay: Duration,
+) -> Arc<dyn Fn(u8) -> Result<SlowMarkedPredictor, TestError> + Send + Sync> {
+    Arc::new(move |_worker_id| {
+        Ok(SlowMarkedPredictor {
+            _marker: Arc::clone(&marker),
+            delay,
+        })
+    })
+}
+
+// A worker whose predictor died exits its inference thread early. The shutdown waiter must still
+// wait for every handle to be dropped and for the healthy worker, and resolve once they are gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_waiter_after_a_worker_died() {
+    let worker_zero_builds = Arc::new(AtomicU32::new(0));
+    let batcher = get_batcher(
+        Arc::new(move |worker_id: u8| {
+            if worker_id == 0 && worker_zero_builds.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(TestError);
+            }
+            Ok::<_, TestError>(MaybePanicPredictor {
+                always_panics: worker_id == 0,
+            })
+        }),
+        config(1, 10, 2),
+    )
+    .await
+    .unwrap();
+    let waiter = batcher.shutdown_waiter();
+
+    // Round-robin routing sends one of the first few requests to worker 0, which kills it.
+    for i in 0..10u64 {
+        let _ = batcher.predict(i).await;
+        if batcher.worker_status(0).unwrap().predictor_status != PredictorStatus::Alive {
+            break;
+        }
+    }
+    assert!(
+        wait_for_predictor_status(&batcher, 0, PredictorStatus::Dead, Duration::from_secs(2)).await,
+        "worker 0 should be marked Dead after its rebuild fails"
+    );
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), waiter.clone().wait())
+            .await
+            .is_err(),
+        "shutdown must not complete while a handle is alive, even with a dead worker"
+    );
+    assert_eq!(
+        batcher.predict(42).await.unwrap(),
+        42,
+        "the healthy worker still serves"
+    );
+
+    drop(batcher);
+    tokio::time::timeout(Duration::from_secs(2), waiter.clone().wait())
+        .await
+        .expect("shutdown should complete once the last handle is dropped");
+    assert!(waiter.is_shutdown());
+}
+
+// `InferenceError` keeps the predictor's error out of its own message and exposes it as the
+// source, so error reporters that print the chain show it once.
+#[test]
+fn test_inference_error_exposes_predictor_error_as_source() {
+    use std::error::Error;
+
+    let err: BatchinfError<TestError> = BatchinfError::InferenceError(Arc::new(TestError));
+    assert_eq!(err.to_string(), "Unable to perform inference");
+    let source = err
+        .source()
+        .expect("the predictor's error should be the source");
+    assert_eq!(source.to_string(), "test error");
 }

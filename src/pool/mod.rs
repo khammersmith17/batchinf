@@ -66,8 +66,9 @@ where
     /// Load-aware round-robin routing.
     ///
     /// Selects a start point via global round-robin, then makes two passes over the pool from that
-    /// point. The first pass only tries [WorkerStatus::Waiting] workers. The second tries every
-    /// worker, so a busy worker with room in its channel can still take the request.
+    /// point. The first pass only tries [`Waiting`](crate::state::WorkerStatus::Waiting) workers
+    /// whose predictor is `Alive`. The second tries every live worker whose predictor is `Alive`,
+    /// so a busy worker with room in its channel can still take the request.
     ///
     /// Returns [`BatchinfError::QueueFullError`] if at least one worker is alive but every channel
     /// is full, and [`BatchinfError::NoAvailableWorkersError`] if every worker has exited or

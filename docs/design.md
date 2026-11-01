@@ -70,7 +70,8 @@ Built with `BatcherConfig::builder(batch_size, batch_timeout)`; every other opti
 pub enum BatchinfError<E> {
     InferenceError(Arc<E>),    // predict_batch returned Err; shared by every caller in the batch.
     InvalidPredictorOutput,    // predict_batch returned the wrong number of outputs.
-    InternalError,             // predict_batch panicked, or the worker went away before replying.
+    InternalError,             // predict_batch panicked, the request was queued on a worker whose
+                               // predictor panicked or died, or the worker went away before replying.
     TimeoutError,              // predict_with_timeout deadline passed.
     NoAvailableWorkersError,   // Every worker has exited or its predictor is dead.
     QueueFullError,            // No room right now (try_predict / blocking_try_predict only).
@@ -85,7 +86,8 @@ pub enum StartupError<E> {     // Returned by get_batcher.
 ```
 
 - `InferenceError` and `InvalidPredictorOutput` are broadcast to every caller in the affected batch.
-- After a `predict_batch` panic, the inference thread sends `InternalError` explicitly to every caller in that batch. The error here cannot be derived, but the panic trace is logged.
+- After a `predict_batch` panic, the inference thread sends `InternalError` explicitly to every caller in that batch. The error here cannot be derived, but the panic trace is logged. Requests queued on the worker at that point also get `InternalError` (see [Failing queued requests](#failing-queued-requests)).
+- `InferenceError` displays as `Unable to perform inference` and exposes the predictor's error through `source()` rather than its message, so error reporters that print the chain show it once.
 - `StartupError<E>` hands the user defined error back to the user on panic during `Predictor` build.
 
 ## Public handle
@@ -116,11 +118,11 @@ Each worker shares a `WorkerState` between its accumulator, its inference thread
 | `00` | Waiting | Accumulating requests into the next batch. |
 | `01` | Exit    | Request channel closed; the accumulator has exited. |
 | `10` | Running | A batch is ready and being handed to the inference thread (waits while the thread is busy and already has a batch queued). |
-| `11` | Crashed | The inference thread is gone; the accumulator has exited. |
+| `11` | Crashed | The inference thread is gone; the accumulator has exited. The predictor is always `Dead` by then. |
 
-`batch_len` counts requests pulled into the current batch. The batch size is capped at `u32::MAX`, so state bits are never overwritten. `Acquire` and `Release` are used for ordering.
+`batch_len` counts requests pulled into the current batch. The batch size is capped at `u32::MAX`, so state bits are never overwritten. `Acquire` and `Release` are used for ordering. Only the accumulator writes the worker status: `set_worker_state` is a load then a store, which is only safe with a single writer.
 
-**Predictor status** — one `AtomicU8`, written only by the inference thread: `Alive`, `Rebuilding` or `Dead`. `Rebuilding` describes the state where a `Predictor` panicked and is rebuilding. `Dead` describes the state where the `Predictor` was unable to be build after retries.
+**Predictor status** — one `AtomicU8`, set by the inference thread: `Alive`, `Rebuilding` or `Dead`. `Rebuilding` describes the state where a `Predictor` panicked and is rebuilding. `Dead` describes the state where the `Predictor` could not be built after retries, or where a metrics hook panicked on either the accumulator or the inference thread (set by `PanicGuard`). Writes are plain stores, so both sides can write it safely.
 
 ## Accumulator
 
@@ -128,16 +130,21 @@ Each worker runs `worker_loop` as a detached tokio task:
 
 1. Wait on `recv()` for the first request. The batch timer starts here, so an idle worker does no work.
 2. Batch expiration is derived using `tokio::time::sleep_until`.
-3. `select!` between `recv()` and the timer:
-   - On new request: push to the buffer, `increment_len`, and `notify_one` to notify when someone is waiting for capacity in the queue. At `batch_size`, set `Running`.
-   - Timer: set `Running`.
-   - Channel closed: set `Exit` and return.
-4. Swap in a fresh buffer and send the full one over the job channel. Swapping lets the next batch accumulate while the thread runs the current one. With one batch running and one queued, the accumulator then waits on `send`, its request channel fills, and the router moves on. In effect, this allows for pipelining.
-5. If the send fails, the inference thread is gone: set `Crashed` and return, which drops the request channel's receiver. Otherwise `reset_batch_len` and loop.
+3. `select!` between `recv()`, the timer and `job_tx.closed()`:
+   - On new request: push to the buffer, `increment_len`, and `notify_one` to notify when someone is waiting for capacity in the queue. At `batch_size`, end the batch.
+   - Timer: end the batch.
+   - Job channel closed: the inference thread has exited, so end the batch now rather than at its timeout.
+   - Request channel closed: set `Exit` and return `BatchStatus::Exit`.
+4. Check the predictor. If it is not `Alive`, fail the batch and drain the request channel (`BatchStatus::Flushed`), then loop. Otherwise swap in a fresh buffer and return the batch as `BatchStatus::Ready`. Swapping lets the next batch accumulate while the thread runs the current one.
+5. Set `Running`, then hand off with `job_tx.reserve()`. With one batch running and one queued, the accumulator waits here, its request channel fills, and the router moves on. In effect, this allows for pipelining. Once a slot is free, check the predictor again:
+   - `Alive`: `permit.send` the batch (`BatchHandoffResult::Sent`) and emit `on_batch_trigger`.
+   - Not `Alive`: drop the permit, fail the batch and drain the request channel (`BatchHandoffResult::Flushed`).
+   - `reserve` failed: the inference thread is gone (`BatchHandoffResult::Dead`). Set `Crashed` and return, which drops the request channel's receiver.
+6. `reset_batch_len` and loop.
 
-`on_queue_depth` is emitted with the channel backlog just before and just after each hand-off.
+`on_queue_depth` is emitted with the channel backlog just before and just after each hand-off. After a sent batch, the second value is the backlog that built up during the wait. After a flush it is 0, so the gauge does not keep a stale backlog while the predictor rebuilds. When the accumulator returns because the inference thread is gone, it emits 0 as well.
 
-A panic in the observability hooks is observed by `PanicGuard` and the accumulators state is set to `WorkerStatus::Crashed` when the `PanicGuard` is dropped. The `PredictorStatus` is also set to `Dead` as the `Predictor` is no longer reachable.
+A panic in the observability hooks is observed by `PanicGuard`, which sets the `PredictorStatus` to `Dead` and wakes waiting callers. It does not write the worker status, which only the accumulator writes.
 
 ## Inference thread
 
@@ -148,13 +155,28 @@ Spawned once per worker as `batchinf-inference-worker-{id}`:
    - `filter_canceled` removes requests whose caller has gone when batch is non-empty.
    - Run `predict_batch` inside `catch_unwind`, timing only the call.
    - On success or error, send results or error and emit `on_batch_complete_ok` / `_err`.
-3. **Panic**: set the `Predictor` state to`Rebuilding`, emit `on_worker_panic`, and send `InternalError` to the batch
+3. **Panic**: set the `Predictor` state to `Rebuilding`, emit `on_worker_panic`, send `InternalError` to the batch, and fail the batch waiting in the job slot, if any.
     - The old crashed `Predictor` is then dropped and rebuilt from the factory. Retries stop early if the job channel has closed by polling every 20 ms. 
-    - On a success rebuild, the `Predictor` state is set to `Alive` and `notify_waiters`
+    - On a successful rebuild, fail any batch that landed in the job slot during the rebuild, then set the `Predictor` state to `Alive` and `notify_waiters`.
     - On a failure the `Predictor` state is set to `Dead`, `notify_waiters` so they can get a `NoAvailableWorkers` error, and exit the loop.
 4. When the job channel closes, exit the loop and shutdown.
 
-Panics outside `predict_batch` are not caught. This is limited to user define observability hooks, thus the documented contract is that those must not panic.
+Panics outside `predict_batch` are not caught. This is limited to user defined observability hooks, thus the documented contract is that those must not panic. If one does, `PanicGuard` marks the predictor `Dead`, the thread exits, and the accumulator sees the closed job channel and fails what it holds.
+
+## Failing queued requests
+
+When a predictor panics, every request already queued on that worker fails with `InternalError` straight away instead of waiting for the rebuild, whose length depends on the factory and its retries. The same applies when the predictor goes `Dead`. New requests are not affected: the router stops sending requests to a worker whose predictor is not `Alive`.
+
+A queued request can be in one of four places, and each is covered:
+
+| Where the request is | Failed by |
+|---|---|
+| The batch running on the predictor | The inference thread, after `catch_unwind` (step 3 above). |
+| The batch in the job slot | The inference thread, right after the panic. |
+| The batch the accumulator is handing off | The accumulator, which checks the predictor after `reserve` and before `permit.send`. |
+| The accumulating batch, and the request channel | The accumulator, when the batch ends (full, timeout, or `job_tx.closed()`). |
+
+Checking after `reserve` rather than before matters: an accumulator can wait in `reserve` for a long time, and a check made before the wait can be stale by the time the batch is sent. One narrow race remains, between that check and `permit.send`, with no `.await` in between. A batch that slips through it lands in the job slot after the post-panic flush, and the inference thread fails it once the rebuild finishes.
 
 ## WorkerBuffer
 
@@ -191,7 +213,7 @@ A fixed-size slice and a slot's sender is always valid as `Predictors` are rebui
 **Waiting for room** (`predict`): on `QueueFullError`, a `Notify` waiter is registered before retrying `try_push`, then await it, so a slot freed in between is not missed. 
 On wakeups:
 - `notify_one` is called on every dequeue in all accumulators to notify a caller waiting for capacity.
-- `notify_waiters` when a rebuild finishes to indicate another worker can accept work, and when a worker dies to bubble up a `NoAvailableWorkers` if there are no workers currently available after the `Predictor` panic/panic in observability hook in the accumulator.
+- `notify_waiters` when a rebuild finishes to indicate another worker can accept work, and when a worker dies to bubble up a `NoAvailableWorkers` if there are no workers currently available after a failed rebuild or a panic in an observability hook.
 
 ## Startup
 
