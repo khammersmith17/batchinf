@@ -328,7 +328,14 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
                 // passed the accumulator's `Alive` check just before the panic can get here. Done
                 // before setting `Alive`, so no batch checked after the rebuild is caught by it.
                 flush_batch(&mut batch_recv);
-                worker_state.set_predictor_state(PredictorStatus::Alive);
+
+                // Observability hooks may have panicked during the rebuild.
+                // Errs when the current state is not rebuilding, meaning the worker is dead as a
+                // result of a panic.
+                if worker_state.set_alive_after_rebuild().is_err() {
+                    return;
+                }
+
                 // This worker can accept work again.
                 signal.notify_waiters();
                 continue;

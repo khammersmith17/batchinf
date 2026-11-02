@@ -55,6 +55,10 @@ enum BatchStatus<P: Predictor> {
     /// The request channel closed, so the worker is shutting down. Any requests left in the
     /// batch were already cancelled, since a live request holds a handle that keeps the channel
     /// open.
+    ///
+    /// Also occurs when the predictor crashes, but no requests have been queued.
+    /// To a caller, it means that work cannot continue on this worker, either due to a graceful
+    /// or forced shutdown.
     Exit,
 }
 
@@ -244,7 +248,14 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
                 // worker can accept a new batch.
                 worker.state.reset_batch_len();
             }
-            BatchStatus::Flushed => continue,
+            BatchStatus::Flushed => {
+                worker.emit_empty_queue();
+                // Set crashed and exit if the predictor is dead.
+                if worker.state.get_predictor_state() == PredictorStatus::Dead {
+                    worker.state.set_worker_state(WorkerStatus::Crashed);
+                    return;
+                }
+            }
             BatchStatus::Exit => return,
         }
     }
@@ -257,6 +268,8 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
 /// returned as [`BatchStatus::Ready`], or failed and reported as [`BatchStatus::Flushed`] if the
 /// predictor is not `Alive`. Returns [`BatchStatus::Exit`], with the state set to Exit, when the
 /// request channel closes. `buffer` is left empty in every case.
+///
+/// [`BatchStatus::Exit`] may also be returned when the predictor crashes.
 #[must_use]
 async fn accumulate_next_batch<P: Predictor + 'static>(
     receiver: &mut InputReceiver<P>,
@@ -266,17 +279,30 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
     job_tx: &JobSender<P>,
 ) -> BatchStatus<P> {
     // Wait for first item in batch to start batch timer.
-    if let Some((request, sender)) = receiver.recv().await {
-        debug!("Received first item in batch, starting timer");
-        worker.notify_one();
-        buffer.push(request, sender);
-        worker.state.increment_len();
-        worker.reset_next_inf(next_inf);
-    } else {
-        debug!("Receiver closed, setting state to WorkerStatus::Exit");
-        // None indicates the channel is closed. In this case set the state to exit.
-        worker.state.set_worker_state(WorkerStatus::Exit);
-        return BatchStatus::Exit;
+    select! {
+        user_input = receiver.recv() => {
+            if let Some((request, sender)) = user_input {
+                debug!("Received first item in batch, starting timer");
+                worker.notify_one();
+                buffer.push(request, sender);
+                worker.state.increment_len();
+                worker.reset_next_inf(next_inf);
+            } else {
+                debug!("Receiver closed, setting state to WorkerStatus::Exit");
+                // None indicates the channel is closed. In this case set the state to exit.
+                worker.state.set_worker_state(WorkerStatus::Exit);
+                return BatchStatus::Exit;
+            }
+        }
+        // Wake when the predictor is dead due to a crash.
+        _ = job_tx.closed() => {
+            worker.emit_empty_queue();
+            // In this case, the predictor is crashed.
+            // In a graceful exit, the request queues close first. If the batch queue closed
+            // before, it closed due to a crash.
+            worker.state.set_worker_state(WorkerStatus::Crashed);
+            return BatchStatus::Exit;
+        }
     }
 
     // Batch size 1 is satisfied on first read.

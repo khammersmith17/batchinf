@@ -199,6 +199,18 @@ impl WorkerStateInner {
         }
     }
 
+    // Only set alive when the current state is rebuilding.
+    fn set_alive_after_rebuild(&self) -> Result<u8, u8> {
+        let alive = PredictorStatus::Alive.to_u8();
+        let rebuilding = PredictorStatus::Rebuilding.to_u8();
+        self.predictor_state.compare_exchange(
+            rebuilding,
+            alive,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+    }
+
     fn reset_batch_len(&self) {
         self.worker_state.store(0_u64, Ordering::Release);
     }
@@ -272,6 +284,10 @@ impl WorkerState {
 
     pub(crate) fn set_worker_state(&self, state: WorkerStatus) {
         self.inner.set_worker_state(state);
+    }
+
+    pub(crate) fn set_alive_after_rebuild(&self) -> Result<u8, u8> {
+        self.inner.set_alive_after_rebuild()
     }
 
     pub(crate) fn set_predictor_state(&self, state: PredictorStatus) {
