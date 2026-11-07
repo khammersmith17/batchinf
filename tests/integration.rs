@@ -3312,3 +3312,153 @@ async fn test_idle_worker_is_crashed_when_its_predictor_dies() {
         "no request should be routed to the dead worker"
     );
 }
+
+// A request waiting in a batch that is still filling fails as soon as the predictor panics, not
+// when the batch would have run. The batch timeout never fires here, and the batch never fills,
+// so without being woken by the panic the request would wait for good.
+//
+// Timeline (ms), batch size 8: batch A (8 requests, sent at 0) fills and runs, and predict_batch
+// panics at ~200. Request R (sent at 20) waits alone in the next batch. The rebuild takes 500ms, so
+// it finishes at ~700.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_filling_batch_fails_when_predictor_panics() {
+    let batcher = get_batcher(
+        slow_rebuild_factory(Duration::from_millis(500), Duration::from_millis(200)),
+        // A batch timeout that never fires: batches only run once full.
+        config_builder(8, u64::MAX, 1)
+            .queue_size(NonZeroU32::new(16).unwrap())
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let batch_a: Vec<_> = (0..8u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { b.predict(i).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let b = batcher.clone();
+    let sent = Instant::now();
+    let request_r = tokio::spawn(async move { b.predict(100).await });
+
+    let result = tokio::time::timeout(Duration::from_secs(2), request_r)
+        .await
+        .expect("a request in a filling batch should not wait once the predictor panics")
+        .unwrap();
+    let waited = sent.elapsed();
+    assert!(
+        matches!(result, Err(BatchinfError::InternalError)),
+        "a request in a filling batch should fail with InternalError: {result:?}"
+    );
+    // The panic comes ~180ms after R is sent. Failing at the end of the rebuild would take ~680ms.
+    assert!(
+        waited < Duration::from_millis(450),
+        "the request should fail when the predictor panics, not after the rebuild: took {waited:?}"
+    );
+    assert!(
+        join(batch_a)
+            .await
+            .iter()
+            .all(|r| matches!(r, Err(BatchinfError::InternalError))),
+        "the batch that panicked should fail with InternalError"
+    );
+
+    // Once the rebuild finishes, a full batch runs on the rebuilt predictor.
+    let after: Vec<_> = (200..208u64)
+        .map(|i| {
+            let b = batcher.clone();
+            tokio::spawn(async move { (i, b.predict(i).await) })
+        })
+        .collect();
+    let after = tokio::time::timeout(Duration::from_secs(3), join(after))
+        .await
+        .expect("a full batch should run once the rebuild finishes");
+    assert!(
+        after.iter().all(|(i, r)| matches!(r, Ok(v) if v == i)),
+        "the worker should serve a full batch after the rebuild: {after:?}"
+    );
+}
+
+/// Records the size and trigger of every batch trigger.
+#[derive(Default)]
+struct TriggerLog(std::sync::Mutex<Vec<(usize, BatchTrigger)>>);
+
+impl BatcherMetrics for TriggerLog {
+    fn on_batch_trigger(&self, batch_size: usize, trigger: BatchTrigger) {
+        self.0.lock().unwrap().push((batch_size, trigger));
+    }
+}
+
+// The wake-up a predictor panic sends the accumulator is only for batches that cannot run. When
+// the panic happens while the accumulator is busy handing off a batch, the wake-up waits for its
+// next batch. By then the rebuild may have finished, and the first batch after it must still fill
+// or time out as usual, not run straight away with a single request.
+//
+// Timeline (ms), batch size 4, batch timeout 300: batch A (sent at 0) runs until it panics at ~200.
+// Batch B (20) fills the job slot, and batch C (40) blocks in `reserve`, so the accumulator is busy
+// when the panic happens. The rebuild runs until ~400. Request R is sent once the predictor is
+// Alive again, and its batch should wait the full 300ms timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_first_batch_after_rebuild_waits_for_its_timeout() {
+    let triggers = Arc::new(TriggerLog::default());
+    let batcher = get_batcher(
+        slow_rebuild_factory(Duration::from_millis(200), Duration::from_millis(200)),
+        config_builder(4, 300, 1)
+            .queue_size(NonZeroU32::new(16).unwrap())
+            .metrics(triggers.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let send = |inputs: std::ops::Range<u64>| -> Vec<_> {
+        inputs
+            .map(|i| {
+                let b = batcher.clone();
+                tokio::spawn(async move { b.predict(i).await })
+            })
+            .collect()
+    };
+    let gap = Duration::from_millis(20);
+    let mut queued = send(0..4);
+    tokio::time::sleep(gap).await;
+    queued.extend(send(10..14));
+    tokio::time::sleep(gap).await;
+    queued.extend(send(20..24));
+    let results = tokio::time::timeout(Duration::from_secs(2), join(queued))
+        .await
+        .expect("every request queued at the panic should complete");
+    assert!(
+        results
+            .iter()
+            .all(|r| matches!(r, Err(BatchinfError::InternalError))),
+        "every request queued at the panic should fail with InternalError: {results:?}"
+    );
+
+    assert!(
+        wait_for_predictor_status(&batcher, 0, PredictorStatus::Alive, Duration::from_secs(2))
+            .await,
+        "the predictor should finish its rebuild"
+    );
+    let before = triggers.0.lock().unwrap().len();
+
+    let sent = Instant::now();
+    let result = batcher.predict(100).await;
+    let waited = sent.elapsed();
+    assert_eq!(result.unwrap(), 100, "the rebuilt predictor should serve");
+    assert!(
+        waited >= Duration::from_millis(250),
+        "a lone request after the rebuild should wait for its batch timeout, but its batch ran \
+         after {waited:?}"
+    );
+
+    let log = triggers.0.lock().unwrap();
+    let after_rebuild = &log[before..];
+    assert!(
+        matches!(after_rebuild, [(1, BatchTrigger::Timeout)]),
+        "the first batch after the rebuild should report one Timeout trigger of size 1, got \
+         {after_rebuild:?}"
+    );
+}

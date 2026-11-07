@@ -9,7 +9,7 @@
 - Additional tests to cover the failure modes mentioned above.
 - `BatchinfError::InferenceError(e)` is now exposed through `Error::source()`. Fixes potential double display when printed.
 - Add harness benchmarks on simulated predictor.
-- Update CI to use `cargo nextest` given time based tests.
+- Update CI to use `cargo nextest` given timing based tests.
 - Observability fixes:
     - `on_batch_trigger` only fires when the inference batch is handed off to the predictor. Canceled requests due to `Predictor` crash do not emit.
     - `on_queue_depth` now reports 0 when all inference requests that are queued are failed due to a `Predictor` crash.

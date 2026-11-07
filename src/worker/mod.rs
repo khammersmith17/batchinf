@@ -155,6 +155,7 @@ pub(crate) struct RunnerHandoff<P: Predictor, E> {
 fn make_runner<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
     worker: &InferenceWorker,
     handoff: RunnerHandoff<P, E>,
+    predictor_panic_signal: Arc<Notify>,
 ) -> JobSender<P> {
     let RunnerHandoff {
         factory,
@@ -175,6 +176,7 @@ fn make_runner<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static>(
             obs: worker.obs.clone(),
             ready_tx,
             signal: Arc::clone(&worker.signal),
+            predictor_panic_signal,
         },
         shutdown_tx,
     );
@@ -200,7 +202,8 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
     let cap = worker.state.batch_size() as usize;
     let mut next_inf = Instant::now();
     let mut buffer = WorkerBuffer::new(cap);
-    let job_tx = make_runner(&worker, handoff);
+    let predictor_panic_singal = Arc::new(Notify::new());
+    let job_tx = make_runner(&worker, handoff, Arc::clone(&predictor_panic_singal));
 
     loop {
         let batch_result = accumulate_next_batch(
@@ -209,6 +212,7 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
             &mut buffer,
             &mut next_inf,
             &job_tx,
+            predictor_panic_singal.as_ref(),
         )
         .await;
         match batch_result {
@@ -261,6 +265,41 @@ async fn worker_loop<P: Predictor + 'static, E: std::fmt::Debug + Send + 'static
     }
 }
 
+/// Wait for the first request in a batch.
+/// If the batch cannot continue, then a branch status is returned.
+/// Wakes early when the predictor crashes and is unrecoverable.
+async fn recv_first_request_in_batch<P: Predictor>(
+    receiver: &mut InputReceiver<P>,
+    worker: &InferenceWorker,
+    buffer: &mut WorkerBuffer<P>,
+    next_inf: &mut Instant,
+    job_tx: &JobSender<P>,
+) -> Option<BatchStatus<P>> {
+    select! {
+        user_input = receiver.recv() => {
+            if let Some((request, sender)) = user_input {
+                debug!("Received first item in batch, starting timer");
+                worker.notify_one();
+                buffer.push(request, sender);
+                worker.state.increment_len();
+                worker.reset_next_inf(next_inf);
+                None
+            } else {
+                debug!("Receiver closed, setting state to WorkerStatus::Exit");
+                // None indicates the channel is closed. In this case set the state to exit.
+                worker.state.set_worker_state(WorkerStatus::Exit);
+                Some(BatchStatus::Exit)
+            }
+        }
+        // Wake when the predictor is dead due to a crash, leaving the worker in a crashed state.
+        _ = job_tx.closed() => {
+            worker.emit_empty_queue();
+            worker.state.set_worker_state(WorkerStatus::Crashed);
+            Some(BatchStatus::Exit)
+            }
+    }
+}
+
 /// Accumulate the next batch of inference data.
 /// Starts timer for the batch upon receiving the first record for the batch.
 ///
@@ -277,32 +316,13 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
     buffer: &mut WorkerBuffer<P>,
     next_inf: &mut Instant,
     job_tx: &JobSender<P>,
+    predictor_panic_signal: &Notify,
 ) -> BatchStatus<P> {
     // Wait for first item in batch to start batch timer.
-    select! {
-        user_input = receiver.recv() => {
-            if let Some((request, sender)) = user_input {
-                debug!("Received first item in batch, starting timer");
-                worker.notify_one();
-                buffer.push(request, sender);
-                worker.state.increment_len();
-                worker.reset_next_inf(next_inf);
-            } else {
-                debug!("Receiver closed, setting state to WorkerStatus::Exit");
-                // None indicates the channel is closed. In this case set the state to exit.
-                worker.state.set_worker_state(WorkerStatus::Exit);
-                return BatchStatus::Exit;
-            }
-        }
-        // Wake when the predictor is dead due to a crash.
-        _ = job_tx.closed() => {
-            worker.emit_empty_queue();
-            // In this case, the predictor is crashed.
-            // In a graceful exit, the request queues close first. If the batch queue closed
-            // before, it closed due to a crash.
-            worker.state.set_worker_state(WorkerStatus::Crashed);
-            return BatchStatus::Exit;
-        }
+    if let Some(status) =
+        recv_first_request_in_batch(receiver, worker, buffer, next_inf, job_tx).await
+    {
+        return status;
     }
 
     // Batch size 1 is satisfied on first read.
@@ -359,7 +379,15 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
             }
             // The inference thread exited (its predictor is Dead), so this batch can never run.
             // End it now so its requests fail straight away rather than at the batch timeout.
-            _ = job_tx.closed() => break
+            _ = job_tx.closed() => break,
+            // The predictor panicked.
+            _ = predictor_panic_signal.notified() => {
+                // Handle spurious wakeup OR a very fast rebuild, which could happen for small
+                // models or cheap model state.
+                if worker.state.get_predictor_state() != PredictorStatus::Alive {
+                    break;
+                }
+            }
 
         }
     }

@@ -29,6 +29,7 @@ pub(super) struct InferenceRunnerArgs<P: Predictor, E> {
     pub(super) obs: Option<Arc<dyn BatcherMetrics>>,
     pub(super) ready_tx: StartAckSender<E>,
     pub(super) signal: Arc<Notify>,
+    pub(super) predictor_panic_signal: Arc<Notify>,
 }
 
 fn construct_panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -194,6 +195,7 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
         obs,
         ready_tx,
         signal,
+        predictor_panic_signal,
     } = args;
 
     // Panics in predict_batch are caught below. Anything else that panics on this thread, such as
@@ -272,12 +274,15 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
         let (metrics, inf_result) = match panic_signal {
             Ok((m, ir)) => (m, ir),
             Err(e) => {
+                // Only one waiter.
                 warn!(
                     panic = construct_panic_message(&*e),
                     "predict_batch panic, rebuilding worker"
                 );
                 // Mark the predictor as rebuilding, so new requests are routed elsewhere.
                 worker_state.set_predictor_state(PredictorStatus::Rebuilding);
+
+                predictor_panic_signal.notify_one();
 
                 // Emit a worker panic.
                 emitters::emit_worker_panic(obs.clone());
