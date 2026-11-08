@@ -42,6 +42,12 @@ const JOB_QUEUE_DEPTH: usize = 1;
 // This is a valid design choice by a user: only perform inference once the batch size is reached.
 const ONE_YEAR: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 
+#[derive(PartialEq)]
+enum BatchEarlyReturnType {
+    Crash,
+    Shutdown,
+}
+
 /// How accumulating a batch ended.
 enum BatchStatus<P: Predictor> {
     /// The batch is ready to hand to the inference thread.
@@ -49,8 +55,8 @@ enum BatchStatus<P: Predictor> {
         buffer: WorkerBuffer<P>,
         trigger: BatchTrigger,
     },
-    /// The predictor was not `Alive` when the batch triggered, so the batch and every request
-    /// waiting in the request channel were failed with `InternalError`.
+    /// All requests are flushed back to the caller as Err when the batch cannot be processed
+    /// successfully. This will be due to a predictor crash.
     Flushed,
     /// The request channel closed, so the worker is shutting down. Any requests left in the
     /// batch were already cancelled, since a live request holds a handle that keeps the channel
@@ -274,7 +280,7 @@ async fn recv_first_request_in_batch<P: Predictor>(
     buffer: &mut WorkerBuffer<P>,
     next_inf: &mut Instant,
     job_tx: &JobSender<P>,
-) -> Option<BatchStatus<P>> {
+) -> Result<(), BatchStatus<P>> {
     select! {
         user_input = receiver.recv() => {
             if let Some((request, sender)) = user_input {
@@ -283,20 +289,86 @@ async fn recv_first_request_in_batch<P: Predictor>(
                 buffer.push(request, sender);
                 worker.state.increment_len();
                 worker.reset_next_inf(next_inf);
-                None
+                Ok(())
             } else {
                 debug!("Receiver closed, setting state to WorkerStatus::Exit");
                 // None indicates the channel is closed. In this case set the state to exit.
                 worker.state.set_worker_state(WorkerStatus::Exit);
-                Some(BatchStatus::Exit)
+                Err(BatchStatus::Exit)
             }
         }
         // Wake when the predictor is dead due to a crash, leaving the worker in a crashed state.
         _ = job_tx.closed() => {
             worker.emit_empty_queue();
             worker.state.set_worker_state(WorkerStatus::Crashed);
-            Some(BatchStatus::Exit)
+            Err(BatchStatus::Exit)
+        }
+    }
+}
+
+/// Fill a batch based on the defined batch constraints. Returns the
+/// [BatchTrigger] when the batch finishes successfully, and
+/// [BatchEarlyReturnType] when the batch is unable to be filled due to a
+/// predictor crash, or the application is shutting down.
+async fn fill_batch<P: Predictor>(
+    receiver: &mut InputReceiver<P>,
+    worker: &InferenceWorker,
+    buffer: &mut WorkerBuffer<P>,
+    next_inf: &Instant,
+    job_tx: &JobSender<P>,
+    predictor_panic_signal: &Notify,
+) -> Result<BatchTrigger, BatchEarlyReturnType> {
+    // Batch size 1 is satisfied on first read.
+    if worker.state.batch_size() == 1 {
+        return Ok(BatchTrigger::Capacity);
+    }
+
+    let batch_start = Instant::now();
+
+    // Set the timer for a batch accumulation timeout.
+    let timer = sleep_until(*next_inf);
+    tokio::pin!(timer);
+
+    loop {
+        // Evaluate the winner between an inference request being queued and the batch timeout.
+        select! {
+            user_input = receiver.recv() => {
+                if let Some((request, sender)) = user_input {
+                    // Only one requester gets notified when a slot opens.
+                    worker.notify_one();
+                    buffer.push(request, sender);
+                    worker.state.increment_len();
+
+                    // Check the batch size condition to trigger inference.
+                    if buffer.len() == (worker.state.batch_size() as usize) {
+                        debug!("batch triggered by size in {} milliseconds",
+                        batch_start.elapsed().as_millis());
+                        return Ok(BatchTrigger::Capacity);
+                    }
+
+                } else {
+                    worker.state.set_worker_state(WorkerStatus::Exit);
+                    return Err(BatchEarlyReturnType::Shutdown);
+                };
+
             }
+            _ = &mut timer  => {
+                debug!("batch triggered by timeout with {} items", buffer.len());
+                return Ok(BatchTrigger::Timeout);
+            }
+            // The inference thread exited (its predictor is Dead), so this batch can never run.
+            // End it now so its requests fail straight away rather than at the batch timeout.
+            _ = job_tx.closed() => return Err(BatchEarlyReturnType::Crash),
+            // The predictor panicked.
+            _ = predictor_panic_signal.notified() => {
+                // Handle spurious wakeup OR a very fast rebuild, which could happen for small
+                // models or cheap model state.
+                if worker.state.get_predictor_state() != PredictorStatus::Alive {
+                    return Err(BatchEarlyReturnType::Crash);
+                }
+            }
+
+        }
     }
 }
 
@@ -305,7 +377,7 @@ async fn recv_first_request_in_batch<P: Predictor>(
 ///
 /// The batch ends when it is full, its timeout fires, or the inference thread exits. It is then
 /// returned as [`BatchStatus::Ready`], or failed and reported as [`BatchStatus::Flushed`] if the
-/// predictor is not `Alive`. Returns [`BatchStatus::Exit`], with the state set to Exit, when the
+/// batch is not successfully filled. Returns [`BatchStatus::Exit`], with the state set to Exit, when the
 /// request channel closes. `buffer` is left empty in every case.
 ///
 /// [`BatchStatus::Exit`] may also be returned when the predictor crashes.
@@ -319,110 +391,56 @@ async fn accumulate_next_batch<P: Predictor + 'static>(
     predictor_panic_signal: &Notify,
 ) -> BatchStatus<P> {
     // Wait for first item in batch to start batch timer.
-    if let Some(status) =
+    if let Err(status) =
         recv_first_request_in_batch(receiver, worker, buffer, next_inf, job_tx).await
     {
         return status;
     }
 
-    // Batch size 1 is satisfied on first read.
-    if worker.state.batch_size() == 1 {
-        let predictor_state = check_predictor_alive(&worker.state, receiver, buffer);
-        return if matches!(predictor_state, PredictorStatus::Alive) {
+    let batch_outcome = fill_batch(
+        receiver,
+        worker,
+        buffer,
+        next_inf,
+        job_tx,
+        predictor_panic_signal,
+    )
+    .await;
+
+    match batch_outcome {
+        Ok(trigger) => {
             let live_buffer = buffer.swap_replace();
             BatchStatus::Ready {
                 buffer: live_buffer,
-                trigger: BatchTrigger::Capacity,
+                trigger,
             }
-        } else {
-            BatchStatus::Flushed
-        };
-    }
-
-    let batch_start = Instant::now();
-
-    // Set the timer for a batch accumulation timeout.
-    let timer = sleep_until(*next_inf);
-    tokio::pin!(timer);
-
-    let mut trigger = BatchTrigger::Capacity;
-
-    loop {
-        // Evaluate the winner between an inference request being queued and the batch timeout.
-        select! {
-            user_input = receiver.recv() => {
-                if let Some((request, sender)) = user_input {
-                    // Only one requester gets notified when a slot opens.
-                    worker.notify_one();
-                    buffer.push(request, sender);
-
-                    worker.state.increment_len();
-
-                    // Check the batch size condition to trigger inference.
-                    if buffer.len() == (worker.state.batch_size() as usize) {
-
-                        debug!("batch triggered by size in {} milliseconds",
-                            batch_start.elapsed().as_millis());
-                        break;
-                    }
-
-                } else {
-                    worker.state.set_worker_state(WorkerStatus::Exit);
-                    return BatchStatus::Exit;
-                };
-
-            }
-            _ = &mut timer  => {
-                    trigger = BatchTrigger::Timeout;
-                    debug!("batch triggered by timeout with {} items", buffer.len());
-                    break;
-            }
-            // The inference thread exited (its predictor is Dead), so this batch can never run.
-            // End it now so its requests fail straight away rather than at the batch timeout.
-            _ = job_tx.closed() => break,
-            // The predictor panicked.
-            _ = predictor_panic_signal.notified() => {
-                // Handle spurious wakeup OR a very fast rebuild, which could happen for small
-                // models or cheap model state.
-                if worker.state.get_predictor_state() != PredictorStatus::Alive {
-                    break;
-                }
-            }
-
         }
-    }
-
-    let predictor_state = check_predictor_alive(&worker.state, receiver, buffer);
-    if matches!(predictor_state, PredictorStatus::Alive) {
-        let live_buffer = buffer.swap_replace();
-        BatchStatus::Ready {
-            buffer: live_buffer,
-            trigger,
+        Err(early_return_reason) => {
+            handle_batch_early_exit(worker, receiver, buffer, early_return_reason)
         }
-    } else {
-        BatchStatus::Flushed
     }
 }
 
-/// Returns the predictor's status. If it is not `Alive`, first fails the current batch and every
-/// request waiting in the request channel with `InternalError`, and resets the batch length.
-fn check_predictor_alive<P: Predictor>(
-    state: &WorkerState,
+/// Handle the case where a batch cannot be successfully completed.
+///
+/// The behavior diverges between a shutdown and a crash, and different statuses are reported back
+/// upstream.
+#[inline]
+fn handle_batch_early_exit<P: Predictor>(
+    worker: &InferenceWorker,
     receiver: &mut InputReceiver<P>,
     buffer: &mut WorkerBuffer<P>,
-) -> PredictorStatus {
-    let predictor_state = state.get_predictor_state();
-    // The predictor went down after these requests were routed to this worker.
-    if matches!(
-        predictor_state,
-        PredictorStatus::Rebuilding | PredictorStatus::Dead
-    ) {
+    exit_type: BatchEarlyReturnType,
+) -> BatchStatus<P> {
+    if exit_type == BatchEarlyReturnType::Crash {
         debug!("Inference worker crashed draining the receiver and dispatching errors");
         handle_crashed_inf(receiver, buffer);
-        state.reset_batch_len();
+        worker.state.reset_batch_len();
+        BatchStatus::Flushed
+    } else {
+        debug!("Batch closed early due to shutdown");
+        BatchStatus::Exit
     }
-
-    predictor_state
 }
 
 /// Fails the current batch and every request waiting in the request channel with `InternalError`,
@@ -459,16 +477,19 @@ async fn run_inference<P: Predictor>(
         return BatchHandoffResult::Sent;
     }
 
+    // First attempt to acquire permit.
     let Ok(permit) = job_sender.reserve().await else {
         return BatchHandoffResult::Dead;
     };
 
+    // Ensure the predictor is still alive.
     if state.get_predictor_state() != PredictorStatus::Alive {
         drop(permit);
         handle_crashed_inf(recv, &mut buffer);
         return BatchHandoffResult::Flushed;
     };
 
+    // Only send when alive.
     permit.send(buffer);
     BatchHandoffResult::Sent
 }

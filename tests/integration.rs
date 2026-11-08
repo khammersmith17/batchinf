@@ -2481,6 +2481,60 @@ async fn test_shutdown_mid_batch_reports_no_trigger() {
     assert_eq!(predictor.call_count(), 0, "predict_batch should never run");
 }
 
+// A shutdown in the middle of a batch is not a predictor crash. The worker exits without treating
+// the batch as failed, so it reports nothing at all: no trigger, no queue depth and no completion.
+// Here no batch ever runs, so any metric reported during shutdown comes from the shutdown itself.
+//
+// As in `test_shutdown_mid_batch_reports_no_trigger`, the batch is left holding a request that timed
+// out, because a request that is still waiting keeps the request channel open.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shutdown_mid_batch_reports_no_metrics() {
+    let metrics = Arc::new(QueueMetrics::default());
+    let batcher = get_batcher(
+        factory(EchoPredictor),
+        config_builder(8, 10_000, 1)
+            .metrics(metrics.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+    let waiter = batcher.shutdown_waiter();
+
+    let result = batcher
+        .predict_with_timeout(1, Duration::from_millis(50))
+        .await;
+    assert!(
+        matches!(result, Err(BatchinfError::TimeoutError)),
+        "the request should time out while its batch accumulates: {result:?}"
+    );
+    assert_eq!(
+        batcher.worker_status(0).unwrap().batch_len,
+        1,
+        "the timed out request should still be in the accumulating batch"
+    );
+
+    drop(batcher);
+    tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+        .await
+        .expect("the worker should shut down once the last handle is dropped");
+
+    let depths = metrics.depths();
+    assert!(
+        depths.is_empty(),
+        "shutting down should not report a queue depth, got {depths:?}"
+    );
+    assert_eq!(
+        metrics.triggers.load(Ordering::SeqCst),
+        0,
+        "shutting down should not report a trigger"
+    );
+    assert_eq!(
+        metrics.err_completions.load(Ordering::SeqCst),
+        0,
+        "shutting down should not report a failed batch"
+    );
+}
+
 /// Panics in its first `on_batch_complete_ok` call, which runs on the inference thread.
 #[derive(Default)]
 struct PanicOnFirstCompletion(AtomicBool);
