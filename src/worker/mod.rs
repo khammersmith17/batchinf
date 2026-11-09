@@ -352,7 +352,7 @@ async fn fill_batch<P: Predictor>(
                 };
 
             }
-            _ = &mut timer  => {
+            _ = &mut timer => {
                 debug!("batch triggered by timeout with {} items", buffer.len());
                 return Ok(BatchTrigger::Timeout);
             }
