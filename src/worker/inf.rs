@@ -29,6 +29,7 @@ pub(super) struct InferenceRunnerArgs<P: Predictor, E> {
     pub(super) obs: Option<Arc<dyn BatcherMetrics>>,
     pub(super) ready_tx: StartAckSender<E>,
     pub(super) signal: Arc<Notify>,
+    pub(super) predictor_panic_signal: Arc<Notify>,
 }
 
 fn construct_panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -171,8 +172,8 @@ pub(super) fn spawn_inference_runner<
     drop(ready_tx);
 }
 
-/// Flush a batch in the queue, returning errors to callers when the predictor is unable to serve
-/// inference on these items to due a crash.
+/// Fails the batch waiting in the job channel, if there is one, with `InternalError`. Used after a
+/// predict_batch panic, when the predictor cannot serve it.
 fn flush_batch<P: Predictor>(recv: &mut JobReceiver<P>) {
     if let Ok(batch) = recv.try_recv() {
         let (_, senders) = batch.split();
@@ -194,8 +195,12 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
         obs,
         ready_tx,
         signal,
+        predictor_panic_signal,
     } = args;
 
+    // Panics in predict_batch are caught below. Anything else that panics on this thread, such as
+    // the metrics callbacks that report a batch's outcome, ends it, and the guard then marks the
+    // predictor Dead.
     let _panic_guard = PanicGuard::new(worker_state.clone(), Arc::clone(&signal));
 
     let _span = info_span!("batchinf_inference", worker_id).entered();
@@ -269,12 +274,15 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
         let (metrics, inf_result) = match panic_signal {
             Ok((m, ir)) => (m, ir),
             Err(e) => {
+                // Only one waiter.
                 warn!(
                     panic = construct_panic_message(&*e),
                     "predict_batch panic, rebuilding worker"
                 );
                 // Mark the predictor as rebuilding, so new requests are routed elsewhere.
                 worker_state.set_predictor_state(PredictorStatus::Rebuilding);
+
+                predictor_panic_signal.notify_one();
 
                 // Emit a worker panic.
                 emitters::emit_worker_panic(obs.clone());
@@ -283,7 +291,9 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
                 // They will not be retried here.
                 dispatch::send_errors_on_crash::<P>(senders);
 
-                // If there is a batched queued, flush it as well.
+                // Fail the batch waiting in the job slot as well, rather than make it wait out the
+                // rebuild. Freeing the slot wakes an accumulator blocked in `reserve`, which then
+                // sees `Rebuilding` and fails its own batch.
                 flush_batch(&mut batch_recv);
 
                 // Drop predictor while new one is being rebuilt.
@@ -319,9 +329,18 @@ fn inference_runner<P: Predictor, E: std::fmt::Debug>(args: InferenceRunnerArgs<
                 info!("Successfully rebuilt predictor");
                 predictor = new_predictor;
 
-                // Flush a batch the may have queued during predictor rebuild.
+                // Fail a batch that landed in the job slot during the rebuild. Only a batch that
+                // passed the accumulator's `Alive` check just before the panic can get here. Done
+                // before setting `Alive`, so no batch checked after the rebuild is caught by it.
                 flush_batch(&mut batch_recv);
-                worker_state.set_predictor_state(PredictorStatus::Alive);
+
+                // Observability hooks may have panicked during the rebuild.
+                // Errs when the current state is not rebuilding, meaning the worker is dead as a
+                // result of a panic.
+                if worker_state.set_alive_after_rebuild().is_err() {
+                    return;
+                }
+
                 // This worker can accept work again.
                 signal.notify_waiters();
                 continue;

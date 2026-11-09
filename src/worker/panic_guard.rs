@@ -3,6 +3,13 @@ use std::{sync::Arc, thread::panicking};
 use tokio::sync::Notify;
 use tracing::error;
 
+/// Marks a worker's predictor `Dead` if the accumulator task or the inference thread holding it
+/// panics.
+///
+/// Neither should panic on its own; this covers the user's metrics callbacks, which run inline on
+/// both. Only the predictor status is written. It is a plain store, so either side can write it
+/// safely, unlike the worker status, which only the accumulator may write. `Dead` alone stops the
+/// router from sending this worker requests.
 pub(super) struct PanicGuard {
     state: WorkerState,
     signal: Arc<Notify>,
@@ -17,10 +24,7 @@ impl PanicGuard {
 impl Drop for PanicGuard {
     fn drop(&mut self) {
         if panicking() {
-            // Setting the state to crashed, if there is a panic
-            // This should not happen. There should not be anything that can panic here, but to be
-            // safe this guard will make sure no requests get routed.
-            error!("batching task panicked, marking worker as WorkerStatus::Crashed");
+            error!("worker panicked, marking predictor as PredictorStatus::Dead");
             self.state.set_dead();
             // Notify waiters in the case this is the only worker and messages can no longer be serviced.
             self.signal.notify_waiters();

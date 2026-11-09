@@ -148,6 +148,9 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    // Get reference to shutdown waiter.
+    let shutdown_waiter = batcher.shutdown_waiter();
+
     let app = Router::new()
         .route("/embed", post(embed))
         // Wire the batcher into axum state.
@@ -155,7 +158,14 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     println!("Listening on http://0.0.0.0:3000");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+
+    // Let predictors gracefully shutdown.
+    shutdown_waiter.wait().await;
 
     Ok(())
 }

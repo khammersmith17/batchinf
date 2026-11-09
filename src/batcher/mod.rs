@@ -149,7 +149,9 @@ where
     /// - [`BatchinfError::NoAvailableWorkersError`] — all workers have exited or crashed.
     /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`](`crate::Predictor`) returned an error.
     /// - [`BatchinfError::InvalidPredictorOutput`] — [`Predictor::predict_batch`](`crate::Predictor`) returned a different number of outputs than inputs.
-    /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
+    /// - [`BatchinfError::InternalError`] — the predictor panicked on this request's batch, or
+    ///   panicked or died while the request was queued, or the worker exited before returning a
+    ///   result.
     pub async fn try_predict(&self, input: Input) -> Result<Output, BatchinfError<Error>> {
         let (tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         self.inner.pool.push((input, tx))?;
@@ -177,7 +179,9 @@ where
     ///   immediately, and also to callers already waiting for room when the last worker stops.
     /// - [`BatchinfError::InferenceError`] — [`Predictor::predict_batch`](`crate::Predictor`) returned an error.
     /// - [`BatchinfError::InvalidPredictorOutput`] — [`Predictor::predict_batch`](`crate::Predictor`) returned a different number of outputs than inputs.
-    /// - [`BatchinfError::InternalError`] — the worker exited before returning a result (e.g. after a panic).
+    /// - [`BatchinfError::InternalError`] — the predictor panicked on this request's batch, or
+    ///   panicked or died while the request was queued, or the worker exited before returning a
+    ///   result.
     pub async fn predict(&self, mut input: Input) -> Result<Output, BatchinfError<Error>> {
         let (mut tx, rx) = oneshot_channel::<Result<Output, BatchinfError<Error>>>();
         (input, tx) = match self.inner.pool.try_push((input, tx)) {
